@@ -15,6 +15,11 @@ namespace DspFindSeed
     public static  int[]                                veinModelIndexs;
     public static  int[]                                veinModelCounts;
     public static  VeinProto[]                          veinProtos;
+
+    // 只用于“矿点堆数统计”（不生成具体矿点位置/矿脉组），避免每颗行星重复分配数组导致 GC
+    [ThreadStatic] private static int[] _veinSpotCountsBuffer;
+    // 实验用途：把随机数比较也“强制 FP32”（将 NextDouble 截断到 float 后再比较）
+    [ThreadStatic] private static int[] _veinSpotCountsBufferF32;
     
     private static Vector3[] verts200;
     private static Vector3[] verts80;
@@ -111,41 +116,224 @@ namespace DspFindSeed
 
     public static int[] RefreshPlanetData (PlanetData planetData)
     {
-       PlanetAlgorithm planetAlgorithm = PlanetModelingManager.Algorithm(planetData);
-       if (planetAlgorithm != null)
-       {
-         if (planetData.type != EPlanetType.Gas)
-           return planetAlgorithm.MyGenerateVeins();
-         // HighStopwatch highStopwatch = new HighStopwatch();
-         // double        num2          = 0.0;
-         // double        num3          = 0.0;
-         // double        num4          = 0.0;
-         // if (planetData.data == null)
-         // {
-         //   planetData.data    = new PlanetRawData(planetData.precision);
-         //   planetData.modData = planetData.data.InitModData(planetData.modData);
-         //   CalcVerts(planetData.data);
-         //   planetData.aux = new PlanetAuxData(planetData);
-         //   highStopwatch.Begin();
-         //   //planetAlgorithm.GenerateTerrain(planetData.mod_x, planetData.mod_y);
-         //   num2 = highStopwatch.duration;
-         //   highStopwatch.Begin();
-         //   planetAlgorithm.CalcWaterPercent();
-         // }
-         // if (planetData.factory == null)
-         // {
-         //   planetData.data.vegeCursor = 1;
-         //   num3 = highStopwatch.duration;
-         //   highStopwatch.Begin();
-         //   planetData.data.veinCursor = 1;
-         //   if (planetData.type != EPlanetType.Gas)
-         //     return planetAlgorithm.MyGenerateVeins();
-         //   planetData.CalculateVeinGroups();
-         //   num4 = highStopwatch.duration;
-         // }
-         // planetData.NotifyCalculated ();
-       }
-       return null;
+      // 这里用于“种子筛选”的最小信息：只计算每种矿在该行星上的“矿点堆数（vein spot counts）”
+      // 不生成具体矿点位置/矿脉组分布，从而避免地形/QueryHeight 等重逻辑。
+      if (planetData == null)
+        return null;
+      if (planetData.type == EPlanetType.Gas)
+        return null;
+
+      ThemeProto themeProto = LDB.themes.Select(planetData.theme);
+      if (themeProto == null)
+        return null;
+
+      // 缓冲区：长度按 veinProtos（由 PrepareWorks() 初始化）对齐
+      int len = veinProtos != null ? veinProtos.Length : 0;
+      if (len <= 0)
+        return null;
+
+      int[] counts = _veinSpotCountsBuffer;
+      if (counts == null || counts.Length != len)
+      {
+        counts = new int[len];
+        _veinSpotCountsBuffer = counts;
+      }
+      else
+      {
+        Array.Clear(counts, 0, counts.Length);
+      }
+
+      // 基础矿堆数来自主题表（索引从 1 开始，0 号不用）
+      if (themeProto.VeinSpot != null)
+        Array.Copy((Array)themeProto.VeinSpot, 0, (Array)counts, 1, Math.Min(themeProto.VeinSpot.Length, counts.Length - 1));
+
+      // RNG 消费顺序对 determinism 至关重要：复制 PlanetAlgorithm.MyGenerateVeins 的“前半段”
+      DotNet35Random rng = new DotNet35Random(planetData.seed);
+      rng.Next();
+      rng.Next();
+      rng.Next();
+      rng.Next();
+      rng.Next(); // _birthSeed（这里只为保持消费顺序）
+      _ = new DotNet35Random(rng.Next()); // dotNet35Random2（这里只为保持消费顺序）
+
+      // 星系类型对稀有矿概率的 p 修正（float/Mathf，等价于原版路径）
+      float p = 1f;
+      ESpectrType spectr = planetData.star.spectr;
+      switch (planetData.star.type)
+      {
+        case EStarType.MainSeqStar:
+          switch (spectr)
+          {
+            case ESpectrType.M: p = 2.5f; break;
+            case ESpectrType.K: p = 1f; break;
+            case ESpectrType.G: p = 0.7f; break;
+            case ESpectrType.F: p = 0.6f; break;
+            case ESpectrType.A: p = 1f; break;
+            case ESpectrType.B: p = 0.4f; break;
+            case ESpectrType.O: p = 1.6f; break;
+          }
+          break;
+        case EStarType.GiantStar:
+          p = 2.5f;
+          break;
+        case EStarType.WhiteDwarf:
+          p = 3.5f;
+          ++counts[9];
+          ++counts[9];
+          for (int i = 1; i < 12 && rng.NextDouble() < 0.449999988079071; ++i)
+            ++counts[9];
+          ++counts[10];
+          ++counts[10];
+          for (int i = 1; i < 12 && rng.NextDouble() < 0.449999988079071; ++i)
+            ++counts[10];
+          ++counts[12];
+          for (int i = 1; i < 12 && rng.NextDouble() < 0.5; ++i)
+            ++counts[12];
+          break;
+        case EStarType.NeutronStar:
+          p = 4.5f;
+          ++counts[14];
+          for (int i = 1; i < 12 && rng.NextDouble() < 0.649999976158142; ++i)
+            ++counts[14];
+          break;
+        case EStarType.BlackHole:
+          p = 5f;
+          ++counts[14];
+          for (int i = 1; i < 12 && rng.NextDouble() < 0.649999976158142; ++i)
+            ++counts[14];
+          break;
+      }
+
+      // 主题稀有矿：只需要更新 counts（不需要 count/opacity，也不需要落点）
+      if (themeProto.RareVeins != null && themeProto.RareSettings != null)
+      {
+        for (int idx = 0; idx < themeProto.RareVeins.Length; ++idx)
+        {
+          int rareVein = themeProto.RareVeins[idx];
+          float appearBase = planetData.star.index == 0 ? themeProto.RareSettings[idx * 4] : themeProto.RareSettings[idx * 4 + 1];
+          float chainProb = themeProto.RareSettings[idx * 4 + 2];
+
+          float appearProb = 1f - Mathf.Pow(1f - appearBase, p);
+          // 注意：这里的 NextDouble 比较如果强制改成“float 随机数”，会改变极少量边界情况，从而可能漏种子
+          if (rng.NextDouble() < (double)appearProb)
+          {
+            ++counts[rareVein];
+            for (int i = 1; i < 12 && rng.NextDouble() < (double)chainProb; ++i)
+              ++counts[rareVein];
+          }
+        }
+      }
+
+      return counts;
+    }
+
+    /// <summary>
+    /// 实验用途：把“概率分支的随机数比较”也强制 FP32（将 NextDouble() 截断成 float 再比较）。
+    /// 这会导致极少量边界 case 的分支不同，因此仅用于评估 mismatch 比例，不保证 100% 不漏种子。
+    /// </summary>
+    public static int[] RefreshPlanetData_F32 (PlanetData planetData)
+    {
+      if (planetData == null)
+        return null;
+      if (planetData.type == EPlanetType.Gas)
+        return null;
+
+      ThemeProto themeProto = LDB.themes.Select(planetData.theme);
+      if (themeProto == null)
+        return null;
+
+      int len = veinProtos != null ? veinProtos.Length : 0;
+      if (len <= 0)
+        return null;
+
+      int[] counts = _veinSpotCountsBufferF32;
+      if (counts == null || counts.Length != len)
+      {
+        counts = new int[len];
+        _veinSpotCountsBufferF32 = counts;
+      }
+      else
+      {
+        Array.Clear(counts, 0, counts.Length);
+      }
+
+      if (themeProto.VeinSpot != null)
+        Array.Copy((Array)themeProto.VeinSpot, 0, (Array)counts, 1, Math.Min(themeProto.VeinSpot.Length, counts.Length - 1));
+
+      DotNet35Random rng = new DotNet35Random(planetData.seed);
+      rng.Next();
+      rng.Next();
+      rng.Next();
+      rng.Next();
+      rng.Next();
+      _ = new DotNet35Random(rng.Next());
+
+      float p = 1f;
+      ESpectrType spectr = planetData.star.spectr;
+      switch (planetData.star.type)
+      {
+        case EStarType.MainSeqStar:
+          switch (spectr)
+          {
+            case ESpectrType.M: p = 2.5f; break;
+            case ESpectrType.K: p = 1f; break;
+            case ESpectrType.G: p = 0.7f; break;
+            case ESpectrType.F: p = 0.6f; break;
+            case ESpectrType.A: p = 1f; break;
+            case ESpectrType.B: p = 0.4f; break;
+            case ESpectrType.O: p = 1.6f; break;
+          }
+          break;
+        case EStarType.GiantStar:
+          p = 2.5f;
+          break;
+        case EStarType.WhiteDwarf:
+          p = 3.5f;
+          ++counts[9];
+          ++counts[9];
+          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.449999988079071f; ++i)
+            ++counts[9];
+          ++counts[10];
+          ++counts[10];
+          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.449999988079071f; ++i)
+            ++counts[10];
+          ++counts[12];
+          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.5f; ++i)
+            ++counts[12];
+          break;
+        case EStarType.NeutronStar:
+          p = 4.5f;
+          ++counts[14];
+          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.649999976158142f; ++i)
+            ++counts[14];
+          break;
+        case EStarType.BlackHole:
+          p = 5f;
+          ++counts[14];
+          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.649999976158142f; ++i)
+            ++counts[14];
+          break;
+      }
+
+      if (themeProto.RareVeins != null && themeProto.RareSettings != null)
+      {
+        for (int idx = 0; idx < themeProto.RareVeins.Length; ++idx)
+        {
+          int rareVein = themeProto.RareVeins[idx];
+          float appearBase = planetData.star.index == 0 ? themeProto.RareSettings[idx * 4] : themeProto.RareSettings[idx * 4 + 1];
+          float chainProb = themeProto.RareSettings[idx * 4 + 2];
+
+          float appearProb = 1f - Mathf.Pow(1f - appearBase, p);
+          if ((float)rng.NextDouble() < appearProb)
+          {
+            ++counts[rareVein];
+            for (int i = 1; i < 12 && (float)rng.NextDouble() < chainProb; ++i)
+              ++counts[rareVein];
+          }
+        }
+      }
+
+      return counts;
     }
 
     public static void CalcVerts (PlanetRawData planetRawData)

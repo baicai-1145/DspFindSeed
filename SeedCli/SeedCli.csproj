@@ -1,0 +1,63 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <!-- 显式 include 了跨目录源码文件，禁用默认 Compile 项避免重复 -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 复用现有算法/数据结构代码（不包含 WPF UI） -->
+    <Compile Include="..\DspFindSeed\UniverseGen.cs" Link="UniverseGen.cs" />
+    <Compile Include="..\DspFindSeed\StarGen.cs" Link="StarGen.cs" />
+    <Compile Include="..\DspFindSeed\PlanetGen.cs" Link="PlanetGen.cs" />
+    <Compile Include="..\DspFindSeed\GameDesc.cs" Link="GameDesc.cs" />
+    <Compile Include="..\DspFindSeed\PlanetManager\PlanetAlgorithm.cs" Link="PlanetManager\PlanetAlgorithm.cs" />
+    <Compile Include="..\DspFindSeed\PlanetManager\PlanetModelingManager.cs" Link="PlanetManager\PlanetModelingManager.cs" />
+    <Compile Include="..\DspFindSeed\LDB\ThemeProtoSet.cs" Link="LDB\ThemeProtoSet.cs" />
+    <Compile Include="..\DspFindSeed\LDB\LDB.cs" Link="LDB\LDB.cs" />
+    <Compile Include="UniverseGenF32.cs" />
+    <Compile Include="UniverseGenPlanetsF32.cs" />
+    <Compile Include="UniverseGenPipelineF32.cs" />
+    <Compile Include="UniverseGenPipelineMix.cs" />
+    <Compile Include="StarGenPlanetsF32.cs" />
+    <Compile Include="PlanetGenF32.cs" />
+    <Compile Include="Program.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 依赖游戏 Managed DLL（仓库已带 Release 副本，避免要求本机安装路径） -->
+    <Reference Include="Assembly-CSharp">
+      <HintPath>..\DspFindSeed\bin\Release\Assembly-CSharp.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>..\DspFindSeed\bin\Release\UnityEngine.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>..\DspFindSeed\bin\Release\UnityEngine.CoreModule.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="UnityEngine.SharedInternalsModule">
+      <HintPath>..\DspFindSeed\bin\Release\UnityEngine.SharedInternalsModule.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>..\DspFindSeed\bin\Release\Newtonsoft.Json.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48" Version="1.0.3">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+</Project>
+
