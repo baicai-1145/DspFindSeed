@@ -14,6 +14,9 @@ namespace SeedCli
     {
         private static readonly List<VectorLF3> _tmpPoses = new List<VectorLF3>();
         private static readonly List<VectorLF3> _tmpDrunk = new List<VectorLF3>();
+        private static bool _printedCudaPoseDiff;
+        private static bool _printedCudaRngDiff;
+        private static bool _printedCudaRngStateDiff;
 
         public static GalaxyData CreateGalaxy(DspFindSeed.GameDesc gameDesc)
         {
@@ -529,6 +532,32 @@ namespace SeedCli
             return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(gameDesc, collisionFp64: true);
         }
 
+        public static int GenerateTempPosesOnly_ParamsFp64_Cpu(
+            int galaxySeed,
+            int starCount,
+            bool collisionFp64,
+            List<VectorLF3> outPoses)
+        {
+            var rng = new DotNet35Random(galaxySeed);
+            int tempPoses = GenerateTempPoses_ParamsFp64_CpuCore(
+                rng.Next(),
+                starCount,
+                iterCount: 4,
+                minDist: 2.0,
+                minStepLen: 2.3,
+                maxStepLen: 3.5,
+                flatten: 0.18,
+                collisionFp64: collisionFp64);
+
+            if (outPoses != null)
+            {
+                outPoses.Clear();
+                outPoses.AddRange(_tmpPoses);
+            }
+
+            return tempPoses;
+        }
+
         private static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(DspFindSeed.GameDesc gameDesc, bool collisionFp64)
         {
             int galaxyAlgo = gameDesc.galaxyAlgo;
@@ -679,7 +708,34 @@ namespace SeedCli
             if (iterCount < 1) iterCount = 1;
             else if (iterCount > 16) iterCount = 16;
 
-            RandomPoses_ParamsFp64(seed, targetCount * iterCount, minDist, minStepLen, maxStepLen, flatten, collisionFp64);
+            int maxCount = targetCount * iterCount;
+            bool usedCuda = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64(
+                seed,
+                maxCount,
+                minDist,
+                minStepLen,
+                maxStepLen,
+                flatten,
+                collisionFp64,
+                _tmpPoses,
+                out _);
+            if (usedCuda && CudaGalaxyNative.IsDebugRngEnabled())
+            {
+                DebugCompareCpuAndGpuRng(seed, 256);
+            }
+            if (usedCuda && CudaGalaxyNative.IsDebugRngStateEnabled())
+            {
+                DebugCompareCpuAndGpuRngStateAfterCtor(seed);
+            }
+            if (!usedCuda)
+            {
+                return GenerateTempPoses_ParamsFp64_CpuCore(seed, targetCount, iterCount, minDist, minStepLen, maxStepLen, flatten, collisionFp64);
+            }
+            else if (CudaGalaxyNative.IsDebugPoseDiffEnabled())
+            {
+                DebugCompareCpuAndGpuPoses_ParamsFp64(seed, maxCount, minDist, minStepLen, maxStepLen, flatten, collisionFp64);
+            }
+
             for (int i = _tmpPoses.Count - 1; i >= 0; --i)
             {
                 if (i % iterCount != 0)
@@ -688,6 +744,184 @@ namespace SeedCli
                     break;
             }
             return _tmpPoses.Count;
+        }
+
+        private static int GenerateTempPoses_ParamsFp64_CpuCore(
+            int seed,
+            int targetCount,
+            int iterCount,
+            double minDist,
+            double minStepLen,
+            double maxStepLen,
+            double flatten,
+            bool collisionFp64)
+        {
+            _tmpPoses.Clear();
+            _tmpDrunk.Clear();
+            if (iterCount < 1) iterCount = 1;
+            else if (iterCount > 16) iterCount = 16;
+
+            int maxCount = targetCount * iterCount;
+            RandomPoses_ParamsFp64(seed, maxCount, minDist, minStepLen, maxStepLen, flatten, collisionFp64);
+
+            for (int i = _tmpPoses.Count - 1; i >= 0; --i)
+            {
+                if (i % iterCount != 0)
+                    _tmpPoses.RemoveAt(i);
+                if (_tmpPoses.Count <= targetCount)
+                    break;
+            }
+            return _tmpPoses.Count;
+        }
+
+        private static void DebugCompareCpuAndGpuPoses_ParamsFp64(
+            int seed,
+            int maxCount,
+            double minDist,
+            double minStepLen,
+            double maxStepLen,
+            double flatten,
+            bool collisionFp64)
+        {
+            var gpuPoses = new List<VectorLF3>(_tmpPoses);
+
+            _tmpPoses.Clear();
+            _tmpDrunk.Clear();
+            RandomPoses_ParamsFp64(seed, maxCount, minDist, minStepLen, maxStepLen, flatten, collisionFp64);
+            var cpuPoses = new List<VectorLF3>(_tmpPoses);
+
+            int compareCount = Math.Min(cpuPoses.Count, gpuPoses.Count);
+            int diffIndex = -1;
+            string diffKind = null;
+            for (int i = 0; i < compareCount; ++i)
+            {
+                var c = cpuPoses[i];
+                var g = gpuPoses[i];
+                if (BitConverter.DoubleToInt64Bits(c.x) != BitConverter.DoubleToInt64Bits(g.x))
+                {
+                    diffIndex = i;
+                    diffKind = "x";
+                    break;
+                }
+                if (BitConverter.DoubleToInt64Bits(c.y) != BitConverter.DoubleToInt64Bits(g.y))
+                {
+                    diffIndex = i;
+                    diffKind = "y";
+                    break;
+                }
+                if (BitConverter.DoubleToInt64Bits(c.z) != BitConverter.DoubleToInt64Bits(g.z))
+                {
+                    diffIndex = i;
+                    diffKind = "z";
+                    break;
+                }
+            }
+
+            if (diffIndex < 0 && cpuPoses.Count != gpuPoses.Count)
+            {
+                diffIndex = compareCount;
+                diffKind = "count";
+            }
+
+            if (diffIndex >= 0 && !_printedCudaPoseDiff)
+            {
+                _printedCudaPoseDiff = true;
+                Console.WriteLine($"[cuda-galaxy] pose diff seed={seed} idx={diffIndex} field={diffKind} cpuCount={cpuPoses.Count} gpuCount={gpuPoses.Count}");
+                if (diffIndex < cpuPoses.Count)
+                {
+                    var c = cpuPoses[diffIndex];
+                    Console.WriteLine($"  cpu=({c.x:R}, {c.y:R}, {c.z:R})");
+                }
+                if (diffIndex < gpuPoses.Count)
+                {
+                    var g = gpuPoses[diffIndex];
+                    Console.WriteLine($"  gpu=({g.x:R}, {g.y:R}, {g.z:R})");
+                }
+            }
+
+            _tmpPoses.Clear();
+            _tmpPoses.AddRange(gpuPoses);
+            _tmpDrunk.Clear();
+        }
+
+        private static void DebugCompareCpuAndGpuRng(int seed, int count)
+        {
+            if (_printedCudaRngDiff)
+                return;
+
+            if (!CudaGalaxyNative.TryGetGpuRngSequence(seed, count, out var gpuVals) || gpuVals == null)
+                return;
+
+            var cpuRng = new DotNet35Random(seed);
+            int diffIndex = -1;
+            for (int i = 0; i < count; ++i)
+            {
+                double c = cpuRng.NextDouble();
+                double g = gpuVals[i];
+                if (BitConverter.DoubleToInt64Bits(c) != BitConverter.DoubleToInt64Bits(g))
+                {
+                    diffIndex = i;
+                    Console.WriteLine($"[cuda-galaxy] rng diff seed={seed} idx={i}");
+                    Console.WriteLine($"  cpu={c:R}");
+                    Console.WriteLine($"  gpu={g:R}");
+                    break;
+                }
+            }
+
+            if (diffIndex < 0)
+            {
+                Console.WriteLine($"[cuda-galaxy] rng match seed={seed} count={count}");
+            }
+            _printedCudaRngDiff = true;
+        }
+
+        private static void DebugCompareCpuAndGpuRngStateAfterCtor(int seed)
+        {
+            if (_printedCudaRngStateDiff)
+                return;
+
+            if (!CudaGalaxyNative.TryGetGpuRngStateAfterCtor(seed, out var gpuSeedArray, out var gpuInext, out var gpuInextp) || gpuSeedArray == null)
+                return;
+
+            var cpuRng = new DotNet35Random(seed);
+            var t = typeof(DotNet35Random);
+            var saField = t.GetField("SeedArray", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var inextField = t.GetField("inext", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            var inextpField = t.GetField("inextp", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (saField == null || inextField == null || inextpField == null)
+                return;
+
+            var cpuSeedArray = (int[])saField.GetValue(cpuRng);
+            int cpuInext = (int)inextField.GetValue(cpuRng);
+            int cpuInextp = (int)inextpField.GetValue(cpuRng);
+
+            if (cpuInext != gpuInext || cpuInextp != gpuInextp)
+            {
+                Console.WriteLine($"[cuda-galaxy] rng-state ctor diff seed={seed} inext cpu={cpuInext} gpu={gpuInext} inextp cpu={cpuInextp} gpu={gpuInextp}");
+                _printedCudaRngStateDiff = true;
+                return;
+            }
+
+            int diffIdx = -1;
+            for (int i = 0; i < 56; ++i)
+            {
+                if (cpuSeedArray[i] != gpuSeedArray[i])
+                {
+                    diffIdx = i;
+                    break;
+                }
+            }
+
+            if (diffIdx >= 0)
+            {
+                Console.WriteLine($"[cuda-galaxy] rng-state ctor diff seed={seed} idx={diffIdx} cpu={cpuSeedArray[diffIdx]} gpu={gpuSeedArray[diffIdx]}");
+            }
+            else
+            {
+                Console.WriteLine($"[cuda-galaxy] rng-state ctor match seed={seed}");
+            }
+
+            _printedCudaRngStateDiff = true;
         }
 
         private static void RandomPoses_ParamsFp64(
@@ -929,4 +1163,3 @@ namespace SeedCli
         }
     }
 }
-

@@ -26,6 +26,7 @@
     <Compile Include="UniverseGenPipelineMix.cs" />
     <Compile Include="StarGenPlanetsF32.cs" />
     <Compile Include="PlanetGenF32.cs" />
+    <Compile Include="CudaGalaxyNative.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 
@@ -60,4 +61,3 @@
     </PackageReference>
   </ItemGroup>
 </Project>
-

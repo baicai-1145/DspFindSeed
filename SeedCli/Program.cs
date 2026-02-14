@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 
@@ -29,6 +30,10 @@ namespace SeedCli
             bool compareF32Pt64Rand64Coll64 = HasFlag(args, "--compare-f32-pt64-rand64-coll64");
             bool compareF32Pt64Rand64Params64 = HasFlag(args, "--compare-f32-pt64-rand64-params64");
             bool compareF32Pt64Rand64Params64Coll64 = HasFlag(args, "--compare-f32-pt64-rand64-params64-coll64");
+            bool benchGalaxyOnly = HasFlag(args, "--bench-galaxy-only");
+            bool collisionFp64 = HasFlag(args, "--collision-fp64");
+            bool useCudaGalaxy = HasFlag(args, "--use-cuda-galaxy");
+            int batchSize = GetIntArg(args, "--batch-size", 1024);
             int showMismatches = GetIntArg(args, "--show-mismatches", 0);
 
             if (seed <= 0)
@@ -41,12 +46,22 @@ namespace SeedCli
                 Console.WriteLine("端到端 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-f32");
                 Console.WriteLine("端到端 Mix 实验（星系 0 mismatch 变体）：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix");
                 Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32");
+                Console.WriteLine("启用 CUDA 星系点位（仅 ParamsFp64 路线）：追加 --use-cuda-galaxy（或环境变量 DSP_USE_CUDA_GALAXY=1）");
+                Console.WriteLine("仅星系生成并行基准：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --bench-galaxy-only [--batch-size 1024] [--collision-fp64]");
                 Console.WriteLine("差异打印：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-f32 --show-mismatches <最多打印条数>");
                 return 2;
             }
 
             try
             {
+                if (benchGalaxyOnly)
+                {
+                    CudaGalaxyNative.EnableByCli(true);
+                    BenchGalaxyOnly(seed, stars, count, batchSize, collisionFp64);
+                    return 0;
+                }
+
+                CudaGalaxyNative.EnableByCli(useCudaGalaxy);
                 InitForSearch();
                 if (comparePipelineMix || comparePipelineMixVeinsF32)
                 {
@@ -103,6 +118,218 @@ namespace SeedCli
                 Console.WriteLine("运行失败：");
                 Console.WriteLine(ex);
                 return 1;
+            }
+        }
+
+        private static void BenchGalaxyOnly(int startSeed, int starCount, int count, int batchSize, bool collisionFp64)
+        {
+            if (count < 1) count = 1;
+            if (batchSize < 1) batchSize = 1;
+
+            const ulong FNV_OFFSET = 14695981039346656037UL;
+            const ulong FNV_PRIME = 1099511628211UL;
+
+            ulong cpuAgg = FNV_OFFSET;
+            ulong gpuAgg = FNV_OFFSET;
+            int total = 0;
+            int mismatch = 0;
+            bool gpuAvailable = true;
+
+            long cpuTicks = 0;
+            long gpuTicks = 0;
+
+            int maxCount = Math.Max(1, starCount * 4);
+            var cpuPoses = new List<VectorLF3>(maxCount);
+            int endSeed = startSeed + count;
+
+            for (int seedBase = startSeed; seedBase < endSeed; seedBase += batchSize)
+            {
+                int chunk = Math.Min(batchSize, endSeed - seedBase);
+                var galaxySeeds = new int[chunk];
+                var poseSeeds = new int[chunk];
+                var cpuSig = new ulong[chunk];
+
+                for (int i = 0; i < chunk; ++i)
+                {
+                    int galaxySeed = seedBase + i;
+                    galaxySeeds[i] = galaxySeed;
+                    poseSeeds[i] = CalcTempPoseSeed(galaxySeed);
+                }
+
+                for (int i = 0; i < chunk; ++i)
+                {
+                    long t0 = Stopwatch.GetTimestamp();
+                    int poseCount = UniverseGenF32.GenerateTempPosesOnly_ParamsFp64_Cpu(galaxySeeds[i], starCount, collisionFp64, cpuPoses);
+                    long t1 = Stopwatch.GetTimestamp();
+                    cpuTicks += (t1 - t0);
+
+                    ulong sig = PoseSignature(cpuPoses, poseCount);
+                    cpuSig[i] = sig;
+                    cpuAgg ^= sig;
+                    cpuAgg *= FNV_PRIME;
+                }
+
+                if (gpuAvailable)
+                {
+                    long t0 = Stopwatch.GetTimestamp();
+                    bool ok = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64Batch(
+                        poseSeeds,
+                        maxCount,
+                        minDist: 2.0,
+                        minStepLen: 2.3,
+                        maxStepLen: 3.5,
+                        flatten: 0.18,
+                        collisionFp64: collisionFp64,
+                        out var gpuPoses,
+                        out var gpuCounts,
+                        out var outStride);
+                    long t1 = Stopwatch.GetTimestamp();
+                    gpuTicks += (t1 - t0);
+
+                    if (!ok || gpuPoses == null || gpuCounts == null)
+                    {
+                        gpuAvailable = false;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < chunk; ++i)
+                        {
+                            int pc = gpuCounts[i];
+                            ulong sig = PoseSignatureAfterCpuTrim(
+                                gpuPoses,
+                                i * outStride,
+                                pc,
+                                starCount,
+                                iterCount: 4);
+                            gpuAgg ^= sig;
+                            gpuAgg *= FNV_PRIME;
+                            if (sig != cpuSig[i])
+                                mismatch++;
+                        }
+                    }
+                }
+
+                total += chunk;
+            }
+
+            double cpuMs = cpuTicks * 1000.0 / Stopwatch.Frequency;
+            double gpuMs = gpuTicks * 1000.0 / Stopwatch.Frequency;
+            Console.WriteLine($"bench-galaxy-only startSeed={startSeed} stars={starCount} count={count} batchSize={batchSize} collisionFp64={collisionFp64}");
+            Console.WriteLine($"cpuTimeMs={cpuMs:F3}");
+            if (gpuAvailable)
+            {
+                Console.WriteLine($"gpuTimeMs={gpuMs:F3}");
+                Console.WriteLine($"speedup={((gpuMs > 0.0) ? (cpuMs / gpuMs) : 0.0):F3}x");
+                Console.WriteLine($"poseMismatch={mismatch}/{total} ({(total > 0 ? mismatch * 100.0 / total : 0):F6}%)");
+                Console.WriteLine($"cpuPoseSig=0x{cpuAgg:X16} gpuPoseSig=0x{gpuAgg:X16}");
+            }
+            else
+            {
+                Console.WriteLine("gpuTimeMs=N/A (CUDA path unavailable, fallback/disabled)");
+            }
+        }
+
+        private static int CalcTempPoseSeed(int galaxySeed)
+        {
+            var rng = new DotNet35Random(galaxySeed);
+            return rng.Next();
+        }
+
+        private static ulong PoseSignature(List<VectorLF3> poses, int count)
+        {
+            unchecked
+            {
+                const ulong FNV_OFFSET = 14695981039346656037UL;
+                const ulong FNV_PRIME = 1099511628211UL;
+                ulong h = FNV_OFFSET;
+                h ^= (uint)count;
+                h *= FNV_PRIME;
+                int c = Math.Min(count, poses != null ? poses.Count : 0);
+                for (int i = 0; i < c; ++i)
+                {
+                    var p = poses[i];
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.x);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.y);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.z);
+                    h *= FNV_PRIME;
+                }
+                return h;
+            }
+        }
+
+        private static ulong PoseSignature(CudaGalaxyNative.NativeVec3d[] poses, int offset, int count)
+        {
+            unchecked
+            {
+                const ulong FNV_OFFSET = 14695981039346656037UL;
+                const ulong FNV_PRIME = 1099511628211UL;
+                ulong h = FNV_OFFSET;
+                h ^= (uint)count;
+                h *= FNV_PRIME;
+                if (poses == null || offset < 0 || count < 0 || offset >= poses.Length)
+                    return h;
+                int end = Math.Min(offset + count, poses.Length);
+                for (int i = offset; i < end; ++i)
+                {
+                    var p = poses[i];
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.x);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.y);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.z);
+                    h *= FNV_PRIME;
+                }
+                return h;
+            }
+        }
+
+        private static ulong PoseSignatureAfterCpuTrim(
+            CudaGalaxyNative.NativeVec3d[] poses,
+            int offset,
+            int rawCount,
+            int targetCount,
+            int iterCount)
+        {
+            if (iterCount < 1) iterCount = 1;
+            if (iterCount > 16) iterCount = 16;
+            if (targetCount < 0) targetCount = 0;
+
+            if (poses == null || offset < 0 || rawCount <= 0 || offset >= poses.Length)
+                return PoseSignature(poses, 0, 0);
+
+            int end = Math.Min(offset + rawCount, poses.Length);
+            var tmp = new List<CudaGalaxyNative.NativeVec3d>(end - offset);
+            for (int i = offset; i < end; ++i)
+                tmp.Add(poses[i]);
+
+            for (int i = tmp.Count - 1; i >= 0; --i)
+            {
+                if (i % iterCount != 0)
+                    tmp.RemoveAt(i);
+                if (tmp.Count <= targetCount)
+                    break;
+            }
+
+            unchecked
+            {
+                const ulong FNV_OFFSET = 14695981039346656037UL;
+                const ulong FNV_PRIME = 1099511628211UL;
+                ulong h = FNV_OFFSET;
+                h ^= (uint)tmp.Count;
+                h *= FNV_PRIME;
+                for (int i = 0; i < tmp.Count; ++i)
+                {
+                    var p = tmp[i];
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.x);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.y);
+                    h *= FNV_PRIME;
+                    h ^= (ulong)BitConverter.DoubleToInt64Bits(p.z);
+                    h *= FNV_PRIME;
+                }
+                return h;
             }
         }
 
@@ -971,4 +1198,3 @@ namespace SeedCli
         }
     }
 }
-
