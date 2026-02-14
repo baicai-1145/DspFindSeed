@@ -33,6 +33,8 @@ namespace SeedCli
             bool benchGalaxyOnly = HasFlag(args, "--bench-galaxy-only");
             bool collisionFp64 = HasFlag(args, "--collision-fp64");
             bool useCudaGalaxy = HasFlag(args, "--use-cuda-galaxy");
+            bool useCudaPlanet = HasFlag(args, "--use-cuda-planet");
+            bool useCudaPlanetCore = HasFlag(args, "--use-cuda-planet-core");
             int batchSize = GetIntArg(args, "--batch-size", 1024);
             int showMismatches = GetIntArg(args, "--show-mismatches", 0);
 
@@ -47,6 +49,8 @@ namespace SeedCli
                 Console.WriteLine("端到端 Mix 实验（星系 0 mismatch 变体）：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix");
                 Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32");
                 Console.WriteLine("启用 CUDA 星系点位（仅 ParamsFp64 路线）：追加 --use-cuda-galaxy（或环境变量 DSP_USE_CUDA_GALAXY=1）");
+                Console.WriteLine("启用 CUDA 行星矿堆数批量统计：追加 --use-cuda-planet（或环境变量 DSP_USE_CUDA_PLANET=1）");
+                Console.WriteLine("启用 CUDA 行星核心计算（PlanetGenF32 主体）：追加 --use-cuda-planet-core（或环境变量 DSP_USE_CUDA_PLANET_CORE=1）");
                 Console.WriteLine("仅星系生成并行基准：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --bench-galaxy-only [--batch-size 1024] [--collision-fp64]");
                 Console.WriteLine("差异打印：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-f32 --show-mismatches <最多打印条数>");
                 return 2;
@@ -57,11 +61,15 @@ namespace SeedCli
                 if (benchGalaxyOnly)
                 {
                     CudaGalaxyNative.EnableByCli(true);
+                    CudaPlanetNative.EnableByCli(useCudaPlanet);
+                    CudaPlanetNative.EnableCoreByCli(useCudaPlanetCore);
                     BenchGalaxyOnly(seed, stars, count, batchSize, collisionFp64);
                     return 0;
                 }
 
                 CudaGalaxyNative.EnableByCli(useCudaGalaxy);
+                CudaPlanetNative.EnableByCli(useCudaPlanet);
+                CudaPlanetNative.EnableCoreByCli(useCudaPlanetCore);
                 InitForSearch();
                 if (comparePipelineMix || comparePipelineMixVeinsF32)
                 {
@@ -140,14 +148,17 @@ namespace SeedCli
 
             int maxCount = Math.Max(1, starCount * 4);
             var cpuPoses = new List<VectorLF3>(maxCount);
+            var galaxySeeds = new int[batchSize];
+            var poseSeeds = new int[batchSize];
+            var cpuSig = new ulong[batchSize];
+            var gpuPoses = new CudaGalaxyNative.NativeVec3d[batchSize * maxCount];
+            var gpuCounts = new int[batchSize];
+            int outStride = maxCount;
             int endSeed = startSeed + count;
 
             for (int seedBase = startSeed; seedBase < endSeed; seedBase += batchSize)
             {
                 int chunk = Math.Min(batchSize, endSeed - seedBase);
-                var galaxySeeds = new int[chunk];
-                var poseSeeds = new int[chunk];
-                var cpuSig = new ulong[chunk];
 
                 for (int i = 0; i < chunk; ++i)
                 {
@@ -172,21 +183,22 @@ namespace SeedCli
                 if (gpuAvailable)
                 {
                     long t0 = Stopwatch.GetTimestamp();
-                    bool ok = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64Batch(
+                    bool ok = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64BatchInto(
                         poseSeeds,
+                        chunk,
                         maxCount,
                         minDist: 2.0,
                         minStepLen: 2.3,
                         maxStepLen: 3.5,
                         flatten: 0.18,
                         collisionFp64: collisionFp64,
-                        out var gpuPoses,
-                        out var gpuCounts,
-                        out var outStride);
+                        poses: gpuPoses,
+                        outStride: outStride,
+                        counts: gpuCounts);
                     long t1 = Stopwatch.GetTimestamp();
                     gpuTicks += (t1 - t0);
 
-                    if (!ok || gpuPoses == null || gpuCounts == null)
+                    if (!ok)
                     {
                         gpuAvailable = false;
                     }
@@ -754,6 +766,9 @@ namespace SeedCli
                 if (g == null || g.stars == null)
                     return 0;
 
+                bool useCudaPlanetCounts = TryGetCudaPlanetCounts(g, useFp32Veins, out var cudaCountsFlat, out var cudaStride);
+                int cudaPlanetIdx = 0;
+
                 Mix(g.starCount);
                 Mix(g.birthStarId);
                 Mix(g.birthPlanetId);
@@ -783,14 +798,24 @@ namespace SeedCli
                         Mix(p.orbitAround);
 
                         if (p.type == EPlanetType.Gas) continue;
-                        var counts = useFp32Veins
-                            ? global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(p)
-                            : global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(p);
-                        if (counts == null) { Mix(-3); continue; }
-                        // 只混入前 32 个 id（已覆盖 DSP 常见矿种，且更快）
-                        int max = Math.Min(counts.Length, 32);
-                        for (int vid = 1; vid < max; vid++)
-                            Mix(counts[vid]);
+                        if (useCudaPlanetCounts)
+                        {
+                            int off = cudaPlanetIdx * cudaStride;
+                            cudaPlanetIdx++;
+                            int max = Math.Min(cudaStride, 32);
+                            for (int vid = 1; vid < max; vid++)
+                                Mix(cudaCountsFlat[off + vid]);
+                        }
+                        else
+                        {
+                            var counts = useFp32Veins
+                                ? global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(p)
+                                : global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(p);
+                            if (counts == null) { Mix(-3); continue; }
+                            int max = Math.Min(counts.Length, 32);
+                            for (int vid = 1; vid < max; vid++)
+                                Mix(counts[vid]);
+                        }
                     }
                 }
 
@@ -835,6 +860,8 @@ namespace SeedCli
                 void Mix(int v) { h ^= (uint)v; h *= FNV_PRIME; }
 
                 if (g == null || g.stars == null) return 0;
+                bool useCudaPlanetCounts = TryGetCudaPlanetCounts(g, useFp32Veins, out var cudaCountsFlat, out var cudaStride);
+                int cudaPlanetIdx = 0;
                 Mix(g.starCount);
                 for (int si = 0; si < g.stars.Length; si++)
                 {
@@ -847,17 +874,56 @@ namespace SeedCli
                         if (p == null) { Mix(-2); continue; }
                         Mix(p.id);
                         if (p.type == EPlanetType.Gas) { Mix(0); continue; }
-                        var counts = useFp32Veins
-                            ? global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(p)
-                            : global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(p);
-                        if (counts == null) { Mix(-3); continue; }
-                        int max = Math.Min(counts.Length, 32);
-                        for (int vid = 1; vid < max; vid++)
-                            Mix(counts[vid]);
+                        if (useCudaPlanetCounts)
+                        {
+                            int off = cudaPlanetIdx * cudaStride;
+                            cudaPlanetIdx++;
+                            int max = Math.Min(cudaStride, 32);
+                            for (int vid = 1; vid < max; vid++)
+                                Mix(cudaCountsFlat[off + vid]);
+                        }
+                        else
+                        {
+                            var counts = useFp32Veins
+                                ? global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(p)
+                                : global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(p);
+                            if (counts == null) { Mix(-3); continue; }
+                            int max = Math.Min(counts.Length, 32);
+                            for (int vid = 1; vid < max; vid++)
+                                Mix(counts[vid]);
+                        }
                     }
                 }
                 return h;
             }
+        }
+
+        private static bool TryGetCudaPlanetCounts(GalaxyData g, bool useFp32Veins, out int[] countsFlat, out int stride)
+        {
+            countsFlat = null;
+            stride = 0;
+            if (g == null || g.stars == null)
+                return false;
+
+            var planets = new List<PlanetData>();
+            for (int si = 0; si < g.stars.Length; ++si)
+            {
+                var star = g.stars[si];
+                if (star?.planets == null)
+                    continue;
+                for (int pi = 0; pi < star.planets.Length; ++pi)
+                {
+                    var p = star.planets[pi];
+                    if (p == null || p.type == EPlanetType.Gas)
+                        continue;
+                    planets.Add(p);
+                }
+            }
+
+            if (planets.Count == 0)
+                return false;
+
+            return CudaPlanetNative.TryRefreshPlanetVeinSpotsBatch(planets, useFp32Veins, out countsFlat, out stride);
         }
 
         private static string DescribeFirstDifferenceWithVeins(GalaxyData g64, GalaxyData g32)

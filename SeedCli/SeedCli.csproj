@@ -27,6 +27,7 @@
     <Compile Include="StarGenPlanetsF32.cs" />
     <Compile Include="PlanetGenF32.cs" />
     <Compile Include="CudaGalaxyNative.cs" />
+    <Compile Include="CudaPlanetNative.cs" />
     <Compile Include="Program.cs" />
   </ItemGroup>
 

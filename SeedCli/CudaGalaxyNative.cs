@@ -14,6 +14,7 @@ namespace SeedCli
         private static string _nativeBrokenReason;
         private static bool _printedFallback;
         private static bool _printedForceColl64;
+        [ThreadStatic] private static NativeVec3d[] _singlePoseScratch;
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct NativeVec3d
@@ -121,7 +122,7 @@ namespace SeedCli
             if (maxCount <= 0)
                 return false;
 
-            var nativePoses = new NativeVec3d[maxCount];
+            var nativePoses = EnsureSinglePoseScratch(maxCount);
             int deviceId = GetDeviceIdFromEnv();
             bool effectiveCollisionFp64 = collisionFp64 || ForceCollisionFp64FromEnv();
             if (effectiveCollisionFp64 && !collisionFp64 && !_printedForceColl64)
@@ -201,6 +202,60 @@ namespace SeedCli
             if (maxCount <= 0)
                 return false;
 
+            outStride = maxCount;
+            poses = new NativeVec3d[seeds.Length * outStride];
+            counts = new int[seeds.Length];
+
+            bool ok = TryGenerateRandomPosesParamsFp64BatchInto(
+                seeds,
+                seeds.Length,
+                maxCount,
+                minDist,
+                minStepLen,
+                maxStepLen,
+                flatten,
+                collisionFp64,
+                poses,
+                outStride,
+                counts);
+            if (!ok)
+            {
+                poses = null;
+                counts = null;
+                outStride = 0;
+                return false;
+            }
+            return true;
+        }
+
+        public static bool TryGenerateRandomPosesParamsFp64BatchInto(
+            int[] seeds,
+            int seedCount,
+            int maxCount,
+            double minDist,
+            double minStepLen,
+            double maxStepLen,
+            double flatten,
+            bool collisionFp64,
+            NativeVec3d[] poses,
+            int outStride,
+            int[] counts)
+        {
+            if (!IsEnabled())
+                return false;
+            if (seeds == null || poses == null || counts == null)
+                return false;
+            if (seedCount <= 0 || seedCount > seeds.Length)
+                return false;
+            if (maxCount <= 0 || outStride < maxCount)
+                return false;
+            if (counts.Length < seedCount)
+                return false;
+            if (poses.Length < seedCount * outStride)
+                return false;
+            if (_nativeBroken)
+                return false;
+
             int deviceId = GetDeviceIdFromEnv();
             bool effectiveCollisionFp64 = collisionFp64 || ForceCollisionFp64FromEnv();
             if (effectiveCollisionFp64 && !collisionFp64 && !_printedForceColl64)
@@ -209,16 +264,12 @@ namespace SeedCli
                 Console.WriteLine("[cuda-galaxy] force collisionFp64 by env DSP_CUDA_FORCE_COLL64=1");
             }
 
-            outStride = maxCount;
-            poses = new NativeVec3d[seeds.Length * outStride];
-            counts = new int[seeds.Length];
-
             int rc;
             try
             {
                 rc = NativeGenerateTempPosesParamsFp64Batch(
                     seeds,
-                    seeds.Length,
+                    seedCount,
                     maxCount,
                     minDist,
                     minStepLen,
@@ -233,22 +284,23 @@ namespace SeedCli
             catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
             {
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
-                poses = null;
-                counts = null;
-                outStride = 0;
                 return false;
             }
 
             if (rc != Ok)
             {
                 MarkNativeBroken("batch native return code=" + rc);
-                poses = null;
-                counts = null;
-                outStride = 0;
                 return false;
             }
 
             return true;
+        }
+
+        private static NativeVec3d[] EnsureSinglePoseScratch(int needed)
+        {
+            if (_singlePoseScratch == null || _singlePoseScratch.Length < needed)
+                _singlePoseScratch = new NativeVec3d[needed];
+            return _singlePoseScratch;
         }
 
         private static int GetDeviceIdFromEnv()

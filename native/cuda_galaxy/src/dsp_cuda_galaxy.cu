@@ -10,6 +10,123 @@ namespace
 constexpr int kMBig = 2147483647;
 constexpr int kMSeed = 161803398;
 
+struct BatchDeviceBuffers
+{
+    int device_id;
+    int* d_seeds;
+    int* d_counts;
+    dsp_vec3d_t* d_poses;
+    dsp_vec3d_t* d_drunk;
+    size_t seeds_capacity_bytes;
+    size_t counts_capacity_bytes;
+    size_t poses_capacity_bytes;
+    size_t drunk_capacity_bytes;
+
+    BatchDeviceBuffers()
+        : device_id(-2),
+          d_seeds(nullptr),
+          d_counts(nullptr),
+          d_poses(nullptr),
+          d_drunk(nullptr),
+          seeds_capacity_bytes(0),
+          counts_capacity_bytes(0),
+          poses_capacity_bytes(0),
+          drunk_capacity_bytes(0)
+    {
+    }
+};
+
+thread_local BatchDeviceBuffers g_batch_buffers;
+
+void ReleaseBatchDeviceBuffers(BatchDeviceBuffers& buffers)
+{
+    if (buffers.d_drunk != nullptr)
+    {
+        cudaFree(buffers.d_drunk);
+        buffers.d_drunk = nullptr;
+    }
+    if (buffers.d_poses != nullptr)
+    {
+        cudaFree(buffers.d_poses);
+        buffers.d_poses = nullptr;
+    }
+    if (buffers.d_counts != nullptr)
+    {
+        cudaFree(buffers.d_counts);
+        buffers.d_counts = nullptr;
+    }
+    if (buffers.d_seeds != nullptr)
+    {
+        cudaFree(buffers.d_seeds);
+        buffers.d_seeds = nullptr;
+    }
+    buffers.seeds_capacity_bytes = 0;
+    buffers.counts_capacity_bytes = 0;
+    buffers.poses_capacity_bytes = 0;
+    buffers.drunk_capacity_bytes = 0;
+}
+
+cudaError_t EnsureCudaBuffer(void** ptr, size_t* capacity_bytes, size_t required_bytes)
+{
+    if (*capacity_bytes >= required_bytes)
+        return cudaSuccess;
+
+    if (*ptr != nullptr)
+    {
+        cudaError_t free_rc = cudaFree(*ptr);
+        if (free_rc != cudaSuccess)
+            return free_rc;
+        *ptr = nullptr;
+    }
+
+    cudaError_t alloc_rc = cudaMalloc(ptr, required_bytes);
+    if (alloc_rc != cudaSuccess)
+    {
+        *capacity_bytes = 0;
+        return alloc_rc;
+    }
+
+    *capacity_bytes = required_bytes;
+    return cudaSuccess;
+}
+
+cudaError_t EnsureBatchBuffers(
+    int device_id,
+    size_t seeds_bytes,
+    size_t counts_bytes,
+    size_t poses_bytes,
+    int** d_seeds,
+    int** d_counts,
+    dsp_vec3d_t** d_poses,
+    dsp_vec3d_t** d_drunk)
+{
+    BatchDeviceBuffers& buffers = g_batch_buffers;
+    if (buffers.device_id != device_id)
+    {
+        ReleaseBatchDeviceBuffers(buffers);
+        buffers.device_id = device_id;
+    }
+
+    cudaError_t rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_seeds), &buffers.seeds_capacity_bytes, seeds_bytes);
+    if (rc != cudaSuccess)
+        return rc;
+    rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_counts), &buffers.counts_capacity_bytes, counts_bytes);
+    if (rc != cudaSuccess)
+        return rc;
+    rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_poses), &buffers.poses_capacity_bytes, poses_bytes);
+    if (rc != cudaSuccess)
+        return rc;
+    rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_drunk), &buffers.drunk_capacity_bytes, poses_bytes);
+    if (rc != cudaSuccess)
+        return rc;
+
+    *d_seeds = buffers.d_seeds;
+    *d_counts = buffers.d_counts;
+    *d_poses = buffers.d_poses;
+    *d_drunk = buffers.d_drunk;
+    return cudaSuccess;
+}
+
 __device__ __forceinline__ int SubWrapI32(int a, int b)
 {
     unsigned int ua = static_cast<unsigned int>(a);
@@ -275,6 +392,405 @@ __global__ void DebugRngStateAfterCtorKernel(int seed, int* out_seed_array_56, i
     *out_inext = rng.inext;
     *out_inextp = rng.inextp;
 }
+
+__device__ __forceinline__ bool ProbHit(DotNet35RandomDevice& rng, float threshold, bool use_fp32_prob_compare)
+{
+    double rv = rng.NextDouble();
+    if (use_fp32_prob_compare)
+        return static_cast<float>(rv) < threshold;
+    return rv < static_cast<double>(threshold);
+}
+
+constexpr int kPlanetTypeGas = 0;
+constexpr int kPlanetTypeOcean = 1;
+constexpr int kPlanetTypeVocano = 2;
+constexpr int kPlanetTypeDesert = 3;
+constexpr int kPlanetTypeIce = 4;
+
+constexpr int kSingularityLaySide = 1;
+constexpr int kSingularityTidal1 = 2;
+constexpr int kSingularityTidal2 = 4;
+constexpr int kSingularityTidal4 = 8;
+constexpr int kSingularityClockwise = 16;
+
+__global__ void EvalPlanetCoreF32Kernel(
+    int info_seed,
+    int orbit_around,
+    int orbit_index,
+    int gas_giant,
+    int star_index,
+    int galaxy_star_count,
+    int galaxy_habitable_count,
+    int boost_inclination_ns,
+    int compact_type_case,
+    float star_orbit_scaler,
+    double star_mass,
+    float star_habitable_radius,
+    float star_light_balance_radius,
+    float orbit_around_planet_real_radius,
+    float orbit_around_planet_orbit_radius,
+    double orbit_around_planet_orbital_period,
+    dsp_planet_core_f32_out_t* out_result)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0 || out_result == nullptr)
+        return;
+
+    DotNet35RandomDevice rng(info_seed);
+    float num3 = static_cast<float>(rng.NextDouble());
+    float num4 = static_cast<float>(rng.NextDouble());
+    float num5 = static_cast<float>(rng.NextDouble());
+    float num6 = static_cast<float>(rng.NextDouble());
+    float num7 = static_cast<float>(rng.NextDouble());
+    float num8 = static_cast<float>(rng.NextDouble());
+    float num9 = static_cast<float>(rng.NextDouble());
+    float num10 = static_cast<float>(rng.NextDouble());
+    float num11 = static_cast<float>(rng.NextDouble());
+    float num12 = static_cast<float>(rng.NextDouble());
+    float num13 = static_cast<float>(rng.NextDouble());
+    float num14 = static_cast<float>(rng.NextDouble());
+    float rand1 = static_cast<float>(rng.NextDouble());
+    float num15 = static_cast<float>(rng.NextDouble());
+    float rand2 = static_cast<float>(rng.NextDouble());
+    float rand3 = static_cast<float>(rng.NextDouble());
+    float rand4 = static_cast<float>(rng.NextDouble());
+    int theme_seed = rng.InternalSample();
+
+    float a = powf(1.2f, num3 * (num4 - 0.5f) * 0.5f);
+    float orbit_radius = 0.0f;
+    if (orbit_around == 0)
+    {
+        if (orbit_index < 0 || orbit_index >= 18)
+            return;
+        const float orbit_radius_table[18] = {
+            0.0f, 0.4f, 0.7f, 1.0f, 1.4f, 1.9f, 2.5f, 3.3f, 4.3f,
+            5.5f, 6.9f, 8.4f, 10.0f, 11.7f, 13.5f, 15.4f, 17.5f, 19.7f};
+        float b = orbit_radius_table[orbit_index] * star_orbit_scaler;
+        float num16 = (a - 1.0f) / fmaxf(1.0f, b) + 1.0f;
+        orbit_radius = b * num16;
+    }
+    else
+    {
+        orbit_radius = static_cast<float>(
+            ((1600.0 * static_cast<double>(orbit_index) + 200.0) *
+                 static_cast<double>(powf(star_orbit_scaler, 0.3f)) *
+                 static_cast<double>(a * 0.5f + 0.5f) +
+             static_cast<double>(orbit_around_planet_real_radius)) /
+            40000.0);
+    }
+
+    float orbit_inclination = num5 * 16.0f - 8.0f;
+    if (orbit_around > 0)
+        orbit_inclination *= 2.2f;
+    float orbit_longitude = num6 * 360.0f;
+    if (boost_inclination_ns != 0)
+        orbit_inclination += (orbit_inclination > 0.0f) ? 3.0f : -3.0f;
+
+    double f1 = static_cast<double>(orbit_radius);
+    double f1_3 = f1 * f1 * f1;
+    double orbital_period = 0.0;
+    if (orbit_around > 0)
+    {
+        orbital_period = sqrt(39.4784176043574 * f1_3 / 1.08308421068537E-08);
+    }
+    else
+    {
+        orbital_period = sqrt(39.4784176043574 * f1_3 / (1.35385519905204E-06 * star_mass));
+    }
+
+    float orbit_phase = num7 * 360.0f;
+    float obliquity = 0.0f;
+    int singularity_flags = 0;
+    if (num15 < 0.04f)
+    {
+        obliquity = num8 * (num9 - 0.5f) * 39.9f;
+        obliquity += (obliquity < 0.0f) ? -70.0f : 70.0f;
+        singularity_flags |= kSingularityLaySide;
+    }
+    else if (num15 < 0.1f)
+    {
+        obliquity = num8 * (num9 - 0.5f) * 80.0f;
+        obliquity += (obliquity < 0.0f) ? -30.0f : 30.0f;
+    }
+    else
+    {
+        obliquity = num8 * (num9 - 0.5f) * 60.0f;
+    }
+
+    double rotation_period = (num10 * num11 * 1000.0 + 400.0) *
+                             (orbit_around == 0 ? static_cast<double>(powf(orbit_radius, 0.25f)) : 1.0) *
+                             (gas_giant != 0 ? 0.2 : 1.0);
+    if (gas_giant == 0)
+    {
+        if (compact_type_case == 1)
+            rotation_period *= 0.5;
+        else if (compact_type_case == 2)
+            rotation_period *= 0.2;
+        else if (compact_type_case == 3)
+            rotation_period *= 0.15;
+    }
+    float rotation_phase = num12 * 360.0f;
+    float sun_distance = (orbit_around == 0) ? orbit_radius : orbit_around_planet_orbit_radius;
+    float scale = 1.0f;
+
+    double num17 = (orbit_around == 0) ? orbital_period : orbit_around_planet_orbital_period;
+    rotation_period = 1.0 / (1.0 / num17 + 1.0 / rotation_period);
+
+    if (orbit_around == 0 && orbit_index <= 4 && gas_giant == 0)
+    {
+        if (num15 > 0.96f)
+        {
+            obliquity *= 0.01f;
+            rotation_period = orbital_period;
+            singularity_flags |= kSingularityTidal1;
+        }
+        else if (num15 > 0.93f)
+        {
+            obliquity *= 0.1f;
+            rotation_period = orbital_period * 0.5;
+            singularity_flags |= kSingularityTidal2;
+        }
+        else if (num15 > 0.9f)
+        {
+            obliquity *= 0.2f;
+            rotation_period = orbital_period * 0.25;
+            singularity_flags |= kSingularityTidal4;
+        }
+    }
+
+    if (num15 > 0.85f && num15 <= 0.9f)
+    {
+        rotation_period = -rotation_period;
+        singularity_flags |= kSingularityClockwise;
+    }
+
+    float habitable_bias = 0.0f;
+    float temperature_bias = 0.0f;
+    float radius = 0.0f;
+    int type_case = kPlanetTypeDesert;
+    int habitable_count_delta = 0;
+
+    if (gas_giant != 0)
+    {
+        type_case = kPlanetTypeGas;
+        radius = 80.0f;
+        scale = 10.0f;
+        habitable_bias = 100.0f;
+    }
+    else
+    {
+        float num18 = ceilf(static_cast<float>(galaxy_star_count) * 0.29f);
+        if (num18 < 11.0f)
+            num18 = 11.0f;
+        float num19 = num18 - static_cast<float>(galaxy_habitable_count);
+        float num20 = static_cast<float>(galaxy_star_count - star_index);
+        float f2 = 1000.0f;
+        float num21 = 1000.0f;
+        if (star_habitable_radius > 0.0f && sun_distance > 0.0f)
+        {
+            f2 = sun_distance / star_habitable_radius;
+            num21 = fabsf(logf(f2));
+        }
+
+        float num22 = fminf(fmaxf(sqrtf(star_habitable_radius), 1.0f), 2.0f) - 0.04f;
+        float num24 = fminf(fmaxf(((num19 / fmaxf(1.0f, num20)) * (1.0f - 0.5f) + 0.5f) * 0.35f + ((num19 / fmaxf(1.0f, num20)) * 0.5f), 0.08f), 0.8f);
+        // 上面等价于 Mathf.Lerp(num19/num20, 0.35f, 0.5f) 再 clamp
+        num24 = fminf(fmaxf((num19 / fmaxf(1.0f, num20)) * 0.5f + 0.175f, 0.08f), 0.8f);
+
+        habitable_bias = num21 * num22;
+        temperature_bias = static_cast<float>(1.20000004768372 / (f2 + 0.2f) - 1.0);
+        float num25 = powf(fminf(fmaxf(habitable_bias / num24, 0.0f), 1.0f), num24 * 10.0f);
+
+        if ((num13 > num25 && star_index > 0) || (orbit_around > 0 && orbit_index == 1 && star_index == 0))
+        {
+            type_case = kPlanetTypeOcean;
+            habitable_count_delta = 1;
+        }
+        else if (f2 < 0.833333f)
+        {
+            float num26 = fmaxf(0.15f, f2 * 2.5f - 0.85f);
+            type_case = (num14 >= num26) ? kPlanetTypeVocano : kPlanetTypeDesert;
+        }
+        else if (f2 < 1.2f)
+        {
+            type_case = kPlanetTypeDesert;
+        }
+        else
+        {
+            float num27 = 0.9f / f2 - 0.1f;
+            type_case = (num14 >= num27) ? kPlanetTypeIce : kPlanetTypeDesert;
+        }
+
+        radius = 200.0f;
+    }
+
+    int precision = (type_case == kPlanetTypeGas) ? 64 : 200;
+    int segment = (type_case == kPlanetTypeGas) ? 2 : 5;
+
+    float luminosity = powf(star_light_balance_radius / (sun_distance + 0.01f), 0.6f);
+    if (luminosity > 1.0f)
+    {
+        luminosity = logf(luminosity) + 1.0f;
+        luminosity = logf(luminosity) + 1.0f;
+        luminosity = logf(luminosity) + 1.0f;
+    }
+    luminosity = roundf(luminosity * 100.0f) / 100.0f;
+
+    out_result->orbit_radius = orbit_radius;
+    out_result->orbit_inclination = orbit_inclination;
+    out_result->orbit_longitude = orbit_longitude;
+    out_result->orbital_period = orbital_period;
+    out_result->orbit_phase = orbit_phase;
+    out_result->obliquity = obliquity;
+    out_result->rotation_period = rotation_period;
+    out_result->rotation_phase = rotation_phase;
+    out_result->sun_distance = sun_distance;
+    out_result->scale = scale;
+    out_result->habitable_bias = habitable_bias;
+    out_result->temperature_bias = temperature_bias;
+    out_result->radius = radius;
+    out_result->luminosity = luminosity;
+    out_result->rand1 = rand1;
+    out_result->rand2 = rand2;
+    out_result->rand3 = rand3;
+    out_result->rand4 = rand4;
+    out_result->theme_seed = theme_seed;
+    out_result->type_case = type_case;
+    out_result->singularity_flags = singularity_flags;
+    out_result->habitable_count_delta = habitable_count_delta;
+    out_result->precision = precision;
+    out_result->segment = segment;
+}
+
+__global__ void EvalPlanetGasDetailsF32Kernel(
+    int theme_seed,
+    float gas_coef,
+    float resource_coef,
+    const float* in_gas_speeds,
+    const float* in_gas_heat_values,
+    int gas_len,
+    float* out_gas_speeds,
+    double* out_total_heat)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+
+    DotNet35RandomDevice rng(theme_seed);
+    float resource_scale = powf(resource_coef, 0.3f);
+    double total_heat = 0.0;
+    for (int i = 0; i < gas_len; ++i)
+    {
+        float rand_factor = static_cast<float>(rng.NextDouble() * 0.190909147262573 + 0.909090876579285);
+        float speed = in_gas_speeds[i] * rand_factor * gas_coef;
+        float scaled_speed = speed * resource_scale;
+        out_gas_speeds[i] = scaled_speed;
+        total_heat += static_cast<double>(in_gas_heat_values[i] * scaled_speed);
+    }
+    *out_total_heat = total_heat;
+}
+
+__global__ void RefreshPlanetVeinSpotsBatchKernel(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* vein_spot_lens,
+    const int* rare_vein_lens,
+    const int* vein_spot_values,
+    int vein_spot_stride,
+    const int* rare_vein_values,
+    int rare_vein_stride,
+    const float* rare_settings_values,
+    int rare_settings_stride,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int* out_counts)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= planet_count)
+        return;
+
+    int* out_seg = out_counts + static_cast<long long>(idx) * out_vein_len;
+    for (int i = 0; i < out_vein_len; ++i)
+        out_seg[i] = 0;
+
+    const int vlen = vein_spot_lens[idx];
+    const int* vspot = vein_spot_values + static_cast<long long>(idx) * vein_spot_stride;
+    for (int i = 0; i < vlen; ++i)
+    {
+        int out_idx = i + 1;
+        if (out_idx >= 0 && out_idx < out_vein_len)
+            out_seg[out_idx] = vspot[i];
+    }
+
+    DotNet35RandomDevice rng(planet_seeds[idx]);
+    rng.InternalSample();
+    rng.InternalSample();
+    rng.InternalSample();
+    rng.InternalSample();
+    DotNet35RandomDevice rng2(rng.InternalSample());
+    (void)rng2;
+
+    const bool use_fp32 = use_fp32_prob_compare != 0;
+    const int bonus_case = bonus_cases[idx];
+    if (bonus_case == 1)
+    {
+        if (9 < out_vein_len)
+        {
+            ++out_seg[9];
+            ++out_seg[9];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.449999988079071f, use_fp32); ++i)
+                ++out_seg[9];
+        }
+        if (10 < out_vein_len)
+        {
+            ++out_seg[10];
+            ++out_seg[10];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.449999988079071f, use_fp32); ++i)
+                ++out_seg[10];
+        }
+        if (12 < out_vein_len)
+        {
+            ++out_seg[12];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.5f, use_fp32); ++i)
+                ++out_seg[12];
+        }
+    }
+    else if (bonus_case == 2)
+    {
+        if (14 < out_vein_len)
+        {
+            ++out_seg[14];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.649999976158142f, use_fp32); ++i)
+                ++out_seg[14];
+        }
+    }
+
+    const int rare_len = rare_vein_lens[idx];
+    const int* rveins = rare_vein_values + static_cast<long long>(idx) * rare_vein_stride;
+    const float* rsettings = rare_settings_values + static_cast<long long>(idx) * rare_settings_stride;
+    const bool is_birth = is_birth_stars[idx] != 0;
+    const float p = p_values[idx];
+    for (int ri = 0; ri < rare_len; ++ri)
+    {
+        int vein_id = rveins[ri];
+        int sbase = ri * 4;
+        float appear_base = is_birth ? rsettings[sbase] : rsettings[sbase + 1];
+        float chain_prob = rsettings[sbase + 2];
+        float appear_prob = 1.0f - powf(1.0f - appear_base, p);
+
+        if (ProbHit(rng, appear_prob, use_fp32))
+        {
+            if (vein_id > 0 && vein_id < out_vein_len)
+                ++out_seg[vein_id];
+            for (int i = 1; i < 12 && ProbHit(rng, chain_prob, use_fp32); ++i)
+            {
+                if (vein_id > 0 && vein_id < out_vein_len)
+                    ++out_seg[vein_id];
+            }
+        }
+    }
+}
 } // namespace
 
 extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
@@ -312,40 +828,21 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
 
-    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_seeds), seeds_bytes);
+    cudaError_t rc = EnsureBatchBuffers(
+        device_id,
+        seeds_bytes,
+        counts_bytes,
+        poses_bytes,
+        &d_seeds,
+        &d_counts,
+        &d_poses,
+        &d_drunk);
     if (rc != cudaSuccess)
         return DSP_CUDA_ERR_CUDA;
-    rc = cudaMalloc(reinterpret_cast<void**>(&d_counts), counts_bytes);
-    if (rc != cudaSuccess)
-    {
-        cudaFree(d_seeds);
-        return DSP_CUDA_ERR_CUDA;
-    }
-    rc = cudaMalloc(reinterpret_cast<void**>(&d_poses), poses_bytes);
-    if (rc != cudaSuccess)
-    {
-        cudaFree(d_counts);
-        cudaFree(d_seeds);
-        return DSP_CUDA_ERR_CUDA;
-    }
-    rc = cudaMalloc(reinterpret_cast<void**>(&d_drunk), poses_bytes);
-    if (rc != cudaSuccess)
-    {
-        cudaFree(d_poses);
-        cudaFree(d_counts);
-        cudaFree(d_seeds);
-        return DSP_CUDA_ERR_CUDA;
-    }
 
     rc = cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice);
     if (rc != cudaSuccess)
-    {
-        cudaFree(d_drunk);
-        cudaFree(d_poses);
-        cudaFree(d_counts);
-        cudaFree(d_seeds);
         return DSP_CUDA_ERR_CUDA;
-    }
 
     int block_size = 128;
     int grid_size = (seed_count + block_size - 1) / block_size;
@@ -365,16 +862,9 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
 
     rc = cudaGetLastError();
     if (rc == cudaSuccess)
-        rc = cudaDeviceSynchronize();
-    if (rc == cudaSuccess)
         rc = cudaMemcpy(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost);
     if (rc == cudaSuccess)
         rc = cudaMemcpy(out_poses, d_poses, poses_bytes, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_drunk);
-    cudaFree(d_poses);
-    cudaFree(d_counts);
-    cudaFree(d_seeds);
 
     if (rc != cudaSuccess)
         return DSP_CUDA_ERR_CUDA;
@@ -502,6 +992,327 @@ extern "C" int dsp_cuda_debug_rng_state_after_ctor(
     cudaFree(d_inextp);
     cudaFree(d_inext);
     cudaFree(d_seed_array);
+
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_refresh_planet_vein_spots_batch(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* vein_spot_lens,
+    const int* rare_vein_lens,
+    const int* vein_spot_values,
+    int vein_spot_stride,
+    const int* rare_vein_values,
+    int rare_vein_stride,
+    const float* rare_settings_values,
+    int rare_settings_stride,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int device_id,
+    int* out_counts)
+{
+    if (planet_seeds == nullptr || p_values == nullptr || bonus_cases == nullptr || is_birth_stars == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (vein_spot_lens == nullptr || rare_vein_lens == nullptr || vein_spot_values == nullptr || rare_vein_values == nullptr || rare_settings_values == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (out_counts == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (planet_count <= 0 || out_vein_len <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (vein_spot_stride <= 0 || rare_vein_stride <= 0 || rare_settings_stride <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+            return DSP_CUDA_ERR_CUDA;
+    }
+
+    const size_t n = static_cast<size_t>(planet_count);
+    const size_t seeds_bytes = n * sizeof(int);
+    const size_t p_values_bytes = n * sizeof(float);
+    const size_t bonus_bytes = n * sizeof(int);
+    const size_t birth_bytes = n * sizeof(int);
+    const size_t vlen_bytes = n * sizeof(int);
+    const size_t rlen_bytes = n * sizeof(int);
+    const size_t vspot_bytes = n * static_cast<size_t>(vein_spot_stride) * sizeof(int);
+    const size_t rvein_bytes = n * static_cast<size_t>(rare_vein_stride) * sizeof(int);
+    const size_t rset_bytes = n * static_cast<size_t>(rare_settings_stride) * sizeof(float);
+    const size_t out_bytes = n * static_cast<size_t>(out_vein_len) * sizeof(int);
+
+    int* d_planet_seeds = nullptr;
+    float* d_p_values = nullptr;
+    int* d_bonus_cases = nullptr;
+    int* d_is_birth_stars = nullptr;
+    int* d_vein_spot_lens = nullptr;
+    int* d_rare_vein_lens = nullptr;
+    int* d_vein_spot_values = nullptr;
+    int* d_rare_vein_values = nullptr;
+    float* d_rare_settings_values = nullptr;
+    int* d_out_counts = nullptr;
+
+    auto fail = [&]() {
+        cudaFree(d_out_counts);
+        cudaFree(d_rare_settings_values);
+        cudaFree(d_rare_vein_values);
+        cudaFree(d_vein_spot_values);
+        cudaFree(d_rare_vein_lens);
+        cudaFree(d_vein_spot_lens);
+        cudaFree(d_is_birth_stars);
+        cudaFree(d_bonus_cases);
+        cudaFree(d_p_values);
+        cudaFree(d_planet_seeds);
+        return DSP_CUDA_ERR_CUDA;
+    };
+
+    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_planet_seeds), seeds_bytes);
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_p_values), p_values_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_bonus_cases), bonus_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_is_birth_stars), birth_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_vein_spot_lens), vlen_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_rare_vein_lens), rlen_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_vein_spot_values), vspot_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_rare_vein_values), rvein_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_rare_settings_values), rset_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_out_counts), out_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+
+    rc = cudaMemcpy(d_planet_seeds, planet_seeds, seeds_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_p_values, p_values, p_values_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_bonus_cases, bonus_cases, bonus_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_is_birth_stars, is_birth_stars, birth_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_vein_spot_lens, vein_spot_lens, vlen_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_rare_vein_lens, rare_vein_lens, rlen_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_vein_spot_values, vein_spot_values, vspot_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_rare_vein_values, rare_vein_values, rvein_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_rare_settings_values, rare_settings_values, rset_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+
+    int block_size = 128;
+    int grid_size = (planet_count + block_size - 1) / block_size;
+    RefreshPlanetVeinSpotsBatchKernel<<<grid_size, block_size>>>(
+        d_planet_seeds,
+        d_p_values,
+        d_bonus_cases,
+        d_is_birth_stars,
+        d_vein_spot_lens,
+        d_rare_vein_lens,
+        d_vein_spot_values,
+        vein_spot_stride,
+        d_rare_vein_values,
+        rare_vein_stride,
+        d_rare_settings_values,
+        rare_settings_stride,
+        planet_count,
+        out_vein_len,
+        use_fp32_prob_compare,
+        d_out_counts);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_counts, d_out_counts, out_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_out_counts);
+    cudaFree(d_rare_settings_values);
+    cudaFree(d_rare_vein_values);
+    cudaFree(d_vein_spot_values);
+    cudaFree(d_rare_vein_lens);
+    cudaFree(d_vein_spot_lens);
+    cudaFree(d_is_birth_stars);
+    cudaFree(d_bonus_cases);
+    cudaFree(d_p_values);
+    cudaFree(d_planet_seeds);
+
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_planet_eval_core_f32(
+    int info_seed,
+    int orbit_around,
+    int orbit_index,
+    int gas_giant,
+    int star_index,
+    int galaxy_star_count,
+    int galaxy_habitable_count,
+    int boost_inclination_ns,
+    int compact_type_case,
+    float star_orbit_scaler,
+    double star_mass,
+    float star_habitable_radius,
+    float star_light_balance_radius,
+    float orbit_around_planet_real_radius,
+    float orbit_around_planet_orbit_radius,
+    double orbit_around_planet_orbital_period,
+    int device_id,
+    dsp_planet_core_f32_out_t* out_result)
+{
+    if (out_result == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+            return DSP_CUDA_ERR_CUDA;
+    }
+
+    dsp_planet_core_f32_out_t* d_out = nullptr;
+    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_out), sizeof(dsp_planet_core_f32_out_t));
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+
+    EvalPlanetCoreF32Kernel<<<1, 1>>>(
+        info_seed,
+        orbit_around,
+        orbit_index,
+        gas_giant,
+        star_index,
+        galaxy_star_count,
+        galaxy_habitable_count,
+        boost_inclination_ns,
+        compact_type_case,
+        star_orbit_scaler,
+        star_mass,
+        star_habitable_radius,
+        star_light_balance_radius,
+        orbit_around_planet_real_radius,
+        orbit_around_planet_orbit_radius,
+        orbit_around_planet_orbital_period,
+        d_out);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_result, d_out, sizeof(dsp_planet_core_f32_out_t), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_out);
+
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_planet_eval_gas_details_f32(
+    int theme_seed,
+    float gas_coef,
+    float resource_coef,
+    const float* in_gas_speeds,
+    const float* in_gas_heat_values,
+    int gas_len,
+    int device_id,
+    float* out_gas_speeds,
+    double* out_total_heat)
+{
+    if (in_gas_speeds == nullptr || in_gas_heat_values == nullptr || out_gas_speeds == nullptr || out_total_heat == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (gas_len <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+            return DSP_CUDA_ERR_CUDA;
+    }
+
+    size_t bytes = static_cast<size_t>(gas_len) * sizeof(float);
+    float* d_in_speeds = nullptr;
+    float* d_in_heat = nullptr;
+    float* d_out_speeds = nullptr;
+    double* d_out_total = nullptr;
+
+    auto fail = [&]() {
+        cudaFree(d_out_total);
+        cudaFree(d_out_speeds);
+        cudaFree(d_in_heat);
+        cudaFree(d_in_speeds);
+        return DSP_CUDA_ERR_CUDA;
+    };
+
+    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_in_speeds), bytes);
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_in_heat), bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_out_speeds), bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_out_total), sizeof(double));
+    if (rc != cudaSuccess)
+        return fail();
+
+    rc = cudaMemcpy(d_in_speeds, in_gas_speeds, bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_in_heat, in_gas_heat_values, bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+
+    EvalPlanetGasDetailsF32Kernel<<<1, 1>>>(
+        theme_seed,
+        gas_coef,
+        resource_coef,
+        d_in_speeds,
+        d_in_heat,
+        gas_len,
+        d_out_speeds,
+        d_out_total);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_gas_speeds, d_out_speeds, bytes, cudaMemcpyDeviceToHost);
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_total_heat, d_out_total, sizeof(double), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_out_total);
+    cudaFree(d_out_speeds);
+    cudaFree(d_in_heat);
+    cudaFree(d_in_speeds);
 
     if (rc != cudaSuccess)
         return DSP_CUDA_ERR_CUDA;

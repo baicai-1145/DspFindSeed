@@ -63,6 +63,43 @@ namespace SeedCli
             string roman = star.planetCount > 20 ? (index + 1).ToString() : NameGen.roman[index + 1];
             planet.name = star.name + " " + roman + "号星";
 
+            if (CudaPlanetNative.TryEvalPlanetCoreF32(
+                info_seed,
+                orbitAround,
+                orbitIndex,
+                gasGiant,
+                star,
+                planet.orbitAroundPlanet,
+                star.galaxy.habitableCount,
+                out var core))
+            {
+                planet.orbitRadius = core.orbit_radius;
+                planet.orbitInclination = core.orbit_inclination;
+                planet.orbitLongitude = core.orbit_longitude;
+                planet.orbitalPeriod = core.orbital_period;
+                planet.orbitPhase = core.orbit_phase;
+                planet.obliquity = core.obliquity;
+                planet.rotationPeriod = core.rotation_period;
+                planet.rotationPhase = core.rotation_phase;
+                planet.sunDistance = core.sun_distance;
+                planet.scale = core.scale;
+                planet.habitableBias = core.habitable_bias;
+                planet.temperatureBias = core.temperature_bias;
+                planet.radius = core.radius;
+                planet.luminosity = core.luminosity;
+                planet.precision = core.precision;
+                planet.segment = core.segment;
+                planet.singularity |= CudaPlanetNative.BuildSingularityFromFlags(core.singularity_flags);
+                planet.type = (EPlanetType)CudaPlanetNative.MapTypeCaseToPlanetType(core.type_case);
+
+                if (core.habitable_count_delta > 0)
+                    ++star.galaxy.habitableCount;
+
+                SetPlanetTheme(planet, themeIds, core.rand1, core.rand2, core.rand3, core.rand4, core.theme_seed);
+                star.galaxy.astrosData[planet.id].uRadius = planet.realRadius;
+                return planet;
+            }
+
             // 随机输入仍消费 NextDouble，但这里提前截断到 float，模拟“更 FP32”
             float num3  = (float)rng.NextDouble();
             float num4  = (float)rng.NextDouble();
@@ -370,14 +407,31 @@ namespace SeedCli
             for (int i = 0; i < lenItems; ++i) gasItems[i] = themeProto1.GasItems[i];
 
             double totalHeat = 0.0;
-            DotNet35Random r = new DotNet35Random(theme_seed);
-            for (int i = 0; i < lenSpeeds; ++i)
+            for (int i = 0; i < lenItems; ++i)
             {
-                float speed = themeProto1.GasSpeeds[i] * (float)(r.NextDouble() * 0.190909147262573 + 0.909090876579285) * GasCoef;
-                gasSpeeds[i] = speed * Mathf.Pow(planet.star.resourceCoef, 0.3f);
                 var itemProto = global::DspFindSeed.LDB.items.Select(gasItems[i]);
                 gasHeatValues[i] = (float)itemProto.HeatValue;
-                totalHeat += gasHeatValues[i] * gasSpeeds[i];
+            }
+
+            bool usedCudaGas = CudaPlanetNative.TryEvalPlanetGasDetailsF32(
+                theme_seed,
+                GasCoef,
+                planet.star.resourceCoef,
+                themeProto1.GasSpeeds,
+                gasHeatValues,
+                gasSpeeds,
+                out totalHeat);
+
+            if (!usedCudaGas)
+            {
+                DotNet35Random r = new DotNet35Random(theme_seed);
+                int gasLoop = Math.Min(lenSpeeds, gasHeatValues.Length);
+                for (int i = 0; i < gasLoop; ++i)
+                {
+                    float speed = themeProto1.GasSpeeds[i] * (float)(r.NextDouble() * 0.190909147262573 + 0.909090876579285) * GasCoef;
+                    gasSpeeds[i] = speed * Mathf.Pow(planet.star.resourceCoef, 0.3f);
+                    totalHeat += gasHeatValues[i] * gasSpeeds[i];
+                }
             }
 
             planet.gasItems = gasItems;
@@ -387,4 +441,3 @@ namespace SeedCli
         }
     }
 }
-
