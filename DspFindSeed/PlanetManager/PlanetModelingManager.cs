@@ -229,7 +229,9 @@ namespace DspFindSeed
 
     /// <summary>
     /// 实验用途：把“概率分支的随机数比较”也强制 FP32（将 NextDouble() 截断成 float 再比较）。
-    /// 这会导致极少量边界 case 的分支不同，因此仅用于评估 mismatch 比例，不保证 100% 不漏种子。
+    /// 为避免边界值因截断触发分支翻转，增加 tie-break：
+    /// 当 (float)rv == threshold 时，回退使用 rv(double) 与 threshold(double) 比较。
+    /// 这样可保持大部分 F32 行为，同时消除边界漏种子。
     /// </summary>
     public static int[] RefreshPlanetData_F32 (PlanetData planetData)
     {
@@ -291,26 +293,26 @@ namespace DspFindSeed
           p = 3.5f;
           ++counts[9];
           ++counts[9];
-          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.449999988079071f; ++i)
+          for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, 0.449999988079071f); ++i)
             ++counts[9];
           ++counts[10];
           ++counts[10];
-          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.449999988079071f; ++i)
+          for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, 0.449999988079071f); ++i)
             ++counts[10];
           ++counts[12];
-          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.5f; ++i)
+          for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, 0.5f); ++i)
             ++counts[12];
           break;
         case EStarType.NeutronStar:
           p = 4.5f;
           ++counts[14];
-          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.649999976158142f; ++i)
+          for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, 0.649999976158142f); ++i)
             ++counts[14];
           break;
         case EStarType.BlackHole:
           p = 5f;
           ++counts[14];
-          for (int i = 1; i < 12 && (float)rng.NextDouble() < 0.649999976158142f; ++i)
+          for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, 0.649999976158142f); ++i)
             ++counts[14];
           break;
       }
@@ -324,16 +326,23 @@ namespace DspFindSeed
           float chainProb = themeProto.RareSettings[idx * 4 + 2];
 
           float appearProb = 1f - Mathf.Pow(1f - appearBase, p);
-          if ((float)rng.NextDouble() < appearProb)
+          if (ProbHitF32WithTieBreak(rng, appearProb))
           {
             ++counts[rareVein];
-            for (int i = 1; i < 12 && (float)rng.NextDouble() < chainProb; ++i)
+            for (int i = 1; i < 12 && ProbHitF32WithTieBreak(rng, chainProb); ++i)
               ++counts[rareVein];
           }
         }
       }
 
       return counts;
+    }
+
+    private static bool ProbHitF32WithTieBreak(DotNet35Random rng, float threshold)
+    {
+      double rv = rng.NextDouble();
+      float rvf = (float)rv;
+      return rvf < threshold || (rvf == threshold && rv < (double)threshold);
     }
 
     public static void CalcVerts (PlanetRawData planetRawData)

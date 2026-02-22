@@ -52,10 +52,10 @@ namespace SeedCli
             public float temperature_bias;
             public float radius;
             public float luminosity;
-            public float rand1;
-            public float rand2;
-            public float rand3;
-            public float rand4;
+            public double rand1;
+            public double rand2;
+            public double rand3;
+            public double rand4;
             public int theme_seed;
             public int type_case;
             public int singularity_flags;

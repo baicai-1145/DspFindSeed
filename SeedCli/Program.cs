@@ -23,6 +23,10 @@ namespace SeedCli
             bool comparePipelineF32 = HasFlag(args, "--compare-pipeline-f32");
             bool comparePipelineMix = HasFlag(args, "--compare-pipeline-mix");
             bool comparePipelineMixVeinsF32 = HasFlag(args, "--compare-pipeline-mix-veins-f32");
+            bool dumpCompareMix = HasFlag(args, "--dump-compare-mix");
+            bool dumpCompareMixVeinsF32 = HasFlag(args, "--dump-compare-mix-veins-f32");
+            bool debugVeinBranch = HasFlag(args, "--debug-vein-branch");
+            bool mixCollisionFp64 = HasFlag(args, "--mix-collision-fp64");
             bool compareF32 = HasFlag(args, "--compare-f32");
             bool compareF32Pt64 = HasFlag(args, "--compare-f32-pt64");
             bool compareF32Pt64Coll64 = HasFlag(args, "--compare-f32-pt64-coll64");
@@ -36,7 +40,9 @@ namespace SeedCli
             bool useCudaPlanet = HasFlag(args, "--use-cuda-planet");
             bool useCudaPlanetCore = HasFlag(args, "--use-cuda-planet-core");
             int batchSize = GetIntArg(args, "--batch-size", 1024);
+            int seedBatchSize = GetIntArg(args, "--seed-batch-size", 1);
             int showMismatches = GetIntArg(args, "--show-mismatches", 0);
+            int planetId = GetIntArg(args, "--planet-id", 0);
 
             if (seed <= 0)
             {
@@ -46,8 +52,12 @@ namespace SeedCli
                 Console.WriteLine("行星 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-planets-f32");
                 Console.WriteLine("矿堆数 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-veins-f32");
                 Console.WriteLine("端到端 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-f32");
-                Console.WriteLine("端到端 Mix 实验（星系 0 mismatch 变体）：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix");
-                Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32");
+                Console.WriteLine("端到端 Mix 实验（星系 0 mismatch 变体）：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix [--seed-batch-size 256]");
+                Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32 [--seed-batch-size 256]");
+                Console.WriteLine("Mix 路线强制星系碰撞 FP64：追加 --mix-collision-fp64");
+                Console.WriteLine("单行星矿脉概率分支定位：SeedCli.exe --seed <种子ID> --stars <星区数量> --planet-id <行星ID> --debug-vein-branch");
+                Console.WriteLine("单种子详细对照（FP64 vs Mix 严格矿）：SeedCli.exe --seed <种子ID> --stars <星区数量> --dump-compare-mix");
+                Console.WriteLine("单种子详细对照（FP64 vs Mix+矿FP32）：SeedCli.exe --seed <种子ID> --stars <星区数量> --dump-compare-mix-veins-f32");
                 Console.WriteLine("启用 CUDA 星系点位（仅 ParamsFp64 路线）：追加 --use-cuda-galaxy（或环境变量 DSP_USE_CUDA_GALAXY=1）");
                 Console.WriteLine("启用 CUDA 行星矿堆数批量统计：追加 --use-cuda-planet（或环境变量 DSP_USE_CUDA_PLANET=1）");
                 Console.WriteLine("启用 CUDA 行星核心计算（PlanetGenF32 主体）：追加 --use-cuda-planet-core（或环境变量 DSP_USE_CUDA_PLANET_CORE=1）");
@@ -71,9 +81,17 @@ namespace SeedCli
                 CudaPlanetNative.EnableByCli(useCudaPlanet);
                 CudaPlanetNative.EnableCoreByCli(useCudaPlanetCore);
                 InitForSearch();
-                if (comparePipelineMix || comparePipelineMixVeinsF32)
+                if (dumpCompareMix || dumpCompareMixVeinsF32)
                 {
-                    ComparePipelineMix(seed, stars, count, showMismatches, useFp32Veins: comparePipelineMixVeinsF32);
+                    DumpSeedCompareMix(seed, stars, useFp32Veins: dumpCompareMixVeinsF32, mixCollisionFp64: mixCollisionFp64);
+                }
+                else if (debugVeinBranch)
+                {
+                    DebugVeinBranch(seed, stars, planetId);
+                }
+                else if (comparePipelineMix || comparePipelineMixVeinsF32)
+                {
+                    ComparePipelineMix(seed, stars, count, showMismatches, useFp32Veins: comparePipelineMixVeinsF32, seedBatchSize: seedBatchSize, mixCollisionFp64: mixCollisionFp64);
                 }
                 else if (comparePipelineF32)
                 {
@@ -682,9 +700,10 @@ namespace SeedCli
             }
         }
 
-        private static void ComparePipelineMix(int startSeed, int starCount, int count, int showMismatches, bool useFp32Veins)
+        private static void ComparePipelineMix(int startSeed, int starCount, int count, int showMismatches, bool useFp32Veins, int seedBatchSize, bool mixCollisionFp64)
         {
             if (count < 1) count = 1;
+            if (seedBatchSize < 1) seedBatchSize = 1;
 
             int mismatchGalaxy = 0;
             int mismatchPlanets = 0;
@@ -692,47 +711,74 @@ namespace SeedCli
             int mismatchPipeline = 0;
             int total = 0;
             int shown = 0;
+            int batchChunkTotal = 0;
+            int batchChunkPrefetchOk = 0;
+            bool enableBatchPrefetch = seedBatchSize > 1;
 
-            for (int s = startSeed; s < startSeed + count; s++)
+            int endSeed = startSeed + count;
+            for (int seedBase = startSeed; seedBase < endSeed; seedBase += seedBatchSize)
             {
-                var gd = new global::DspFindSeed.GameDesc();
-                gd.SetForNewGame(global::DspFindSeed.UniverseGen.algoVersion, s, starCount, 1, 1f);
-
-                var g64 = global::DspFindSeed.UniverseGen.CreateGalaxy(gd);
-                var gMix = UniverseGenPipelineMix.CreateGalaxy(gd);
-
-                ulong hg64 = SignatureGalaxyOnly(g64);
-                ulong hg32 = SignatureGalaxyOnly(gMix);
-                if (hg64 != hg32) mismatchGalaxy++;
-
-                ulong hp64 = Signature(g64);
-                ulong hp32 = Signature(gMix);
-                if (hp64 != hp32) mismatchPlanets++;
-
-                ulong hv64 = SignatureVeinsOnly(g64, useFp32Veins: false);
-                ulong hv32 = SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins);
-                if (hv64 != hv32) mismatchVeins++;
-
-                ulong hall64 = SignaturePipeline(g64, useFp32Veins: false);
-                ulong hall32 = SignaturePipeline(gMix, useFp32Veins: useFp32Veins);
-                if (hall64 != hall32) mismatchPipeline++;
-
-                total++;
-                if (showMismatches > 0 && shown < showMismatches && hall64 != hall32)
+                int chunk = Math.Min(seedBatchSize, endSeed - seedBase);
+                bool prefetched = false;
+                if (enableBatchPrefetch)
                 {
-                    shown++;
-                    Console.WriteLine();
-                    Console.WriteLine($"--- mismatch #{shown} seed={s} stars={starCount} ---");
-                    Console.WriteLine($"galaxySig64=0x{hg64:X16} galaxySigMix=0x{hg32:X16}");
-                    Console.WriteLine($"planetSig64=0x{hp64:X16} planetSigMix=0x{hp32:X16}");
-                    Console.WriteLine($"veinSig64=0x{hv64:X16} veinSigMix=0x{hv32:X16}");
-                    Console.WriteLine($"pipeSig64=0x{hall64:X16} pipeSigMix=0x{hall32:X16}");
-                    Console.WriteLine(DescribeFirstDifferenceWithVeins(g64, gMix));
+                    var chunkSeeds = new int[chunk];
+                    for (int i = 0; i < chunk; ++i)
+                        chunkSeeds[i] = seedBase + i;
+                    prefetched = UniverseGenF32.PrecomputeTempPosesParamsFp64Batch(chunkSeeds, starCount, collisionFp64: mixCollisionFp64);
+                    batchChunkTotal++;
+                    if (prefetched)
+                        batchChunkPrefetchOk++;
                 }
+
+                for (int i = 0; i < chunk; i++)
+                {
+                    int s = seedBase + i;
+                    var gd = new global::DspFindSeed.GameDesc();
+                    gd.SetForNewGame(global::DspFindSeed.UniverseGen.algoVersion, s, starCount, 1, 1f);
+
+                    var g64 = global::DspFindSeed.UniverseGen.CreateGalaxy(gd);
+                    var gMix = UniverseGenPipelineMix.CreateGalaxy(gd, collisionFp64: mixCollisionFp64);
+
+                    ulong hg64 = SignatureGalaxyOnly(g64);
+                    ulong hg32 = SignatureGalaxyOnly(gMix);
+                    if (hg64 != hg32) mismatchGalaxy++;
+
+                    ulong hp64 = Signature(g64);
+                    ulong hp32 = Signature(gMix);
+                    if (hp64 != hp32) mismatchPlanets++;
+
+                    ulong hv64 = SignatureVeinsOnly(g64, useFp32Veins: false);
+                    ulong hv32 = SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins);
+                    if (hv64 != hv32) mismatchVeins++;
+
+                    ulong hall64 = SignaturePipeline(g64, useFp32Veins: false);
+                    ulong hall32 = SignaturePipeline(gMix, useFp32Veins: useFp32Veins);
+                    if (hall64 != hall32) mismatchPipeline++;
+
+                    total++;
+                    if (showMismatches > 0 && shown < showMismatches && hall64 != hall32)
+                    {
+                        shown++;
+                        Console.WriteLine();
+                        Console.WriteLine($"--- mismatch #{shown} seed={s} stars={starCount} ---");
+                        Console.WriteLine($"galaxySig64=0x{hg64:X16} galaxySigMix=0x{hg32:X16}");
+                        Console.WriteLine($"planetSig64=0x{hp64:X16} planetSigMix=0x{hp32:X16}");
+                        Console.WriteLine($"veinSig64=0x{hv64:X16} veinSigMix=0x{hv32:X16}");
+                        Console.WriteLine($"pipeSig64=0x{hall64:X16} pipeSigMix=0x{hall32:X16}");
+                        Console.WriteLine(DescribeFirstDifferenceWithVeins(g64, gMix));
+                    }
+                }
+
+                if (prefetched)
+                    UniverseGenF32.ClearPrefetchedTempPosesParamsFp64();
             }
 
             var label = useFp32Veins ? "compare-pipeline-mix-veins-f32" : "compare-pipeline-mix";
             Console.WriteLine($"{label} startSeed={startSeed} stars={starCount} count={count}");
+            Console.WriteLine($"mixCollisionFp64={mixCollisionFp64}");
+            if (enableBatchPrefetch)
+                Console.WriteLine($"seedBatchSize={seedBatchSize} prefetchChunks={batchChunkPrefetchOk}/{batchChunkTotal}");
             Console.WriteLine($"galaxyMismatch={mismatchGalaxy}/{total} ({(total > 0 ? (mismatchGalaxy * 100.0 / total) : 0):F6}%)");
             Console.WriteLine($"planetMismatch={mismatchPlanets}/{total} ({(total > 0 ? (mismatchPlanets * 100.0 / total) : 0):F6}%)");
             Console.WriteLine($"veinMismatch={mismatchVeins}/{total} ({(total > 0 ? (mismatchVeins * 100.0 / total) : 0):F6}%)");
@@ -1236,6 +1282,408 @@ namespace SeedCli
 
                 Console.WriteLine();
             }
+        }
+
+        private static void DumpSeedCompareMix(int seed, int starCount, bool useFp32Veins, bool mixCollisionFp64)
+        {
+            var algoVersion = global::DspFindSeed.UniverseGen.algoVersion;
+            var gd = new global::DspFindSeed.GameDesc();
+            gd.SetForNewGame(algoVersion, seed, starCount, 1, 1f);
+
+            var g64 = global::DspFindSeed.UniverseGen.CreateGalaxy(gd);
+            var gMix = UniverseGenPipelineMix.CreateGalaxy(gd, collisionFp64: mixCollisionFp64);
+            if (g64 == null || g64.stars == null)
+                throw new InvalidOperationException("FP64 CreateGalaxy 返回空。");
+            if (gMix == null || gMix.stars == null)
+                throw new InvalidOperationException("Mix CreateGalaxy 返回空。");
+
+            ulong hg64 = SignatureGalaxyOnly(g64);
+            ulong hgMix = SignatureGalaxyOnly(gMix);
+            ulong hp64 = Signature(g64);
+            ulong hpMix = Signature(gMix);
+            ulong hv64 = SignatureVeinsOnly(g64, useFp32Veins: false);
+            ulong hvMix = SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins);
+            ulong hall64 = SignaturePipeline(g64, useFp32Veins: false);
+            ulong hallMix = SignaturePipeline(gMix, useFp32Veins: useFp32Veins);
+
+            string mode = useFp32Veins ? "mix-veins-f32" : "mix";
+            Console.WriteLine($"dump-compare mode={mode} seed={seed} stars={starCount} algo={algoVersion}");
+            Console.WriteLine($"mixCollisionFp64={mixCollisionFp64}");
+            Console.WriteLine($"galaxySig64=0x{hg64:X16} galaxySigMix=0x{hgMix:X16}");
+            Console.WriteLine($"planetSig64=0x{hp64:X16} planetSigMix=0x{hpMix:X16}");
+            Console.WriteLine($"veinSig64=0x{hv64:X16} veinSigMix=0x{hvMix:X16}");
+            Console.WriteLine($"pipeSig64=0x{hall64:X16} pipeSigMix=0x{hallMix:X16}");
+            Console.WriteLine();
+
+            int starLen64 = g64.stars != null ? g64.stars.Length : 0;
+            int starLenMix = gMix.stars != null ? gMix.stars.Length : 0;
+            Console.WriteLine($"galaxy.starCount FP64={g64.starCount} MIX={gMix.starCount}");
+            Console.WriteLine($"galaxy.birthStarId FP64={g64.birthStarId} MIX={gMix.birthStarId}");
+            Console.WriteLine($"galaxy.birthPlanetId FP64={g64.birthPlanetId} MIX={gMix.birthPlanetId}");
+            Console.WriteLine($"stars.Length FP64={starLen64} MIX={starLenMix}");
+            Console.WriteLine();
+
+            int sc = Math.Max(starLen64, starLenMix);
+            for (int si = 0; si < sc; si++)
+            {
+                var s64 = si < starLen64 ? g64.stars[si] : null;
+                var sMix = si < starLenMix ? gMix.stars[si] : null;
+
+                Console.WriteLine($"[Star {si}]");
+                Console.WriteLine($"  FP64: {FormatStarLine(s64)}");
+                Console.WriteLine($"  MIX : {FormatStarLine(sMix)}");
+
+                if (s64 == null || sMix == null)
+                {
+                    Console.WriteLine("  DIFF: star null 状态不同");
+                    Console.WriteLine();
+                    continue;
+                }
+
+                bool starFieldDiff = false;
+                if (s64.id != sMix.id) { Console.WriteLine($"  DIFF: id FP64={s64.id} MIX={sMix.id}"); starFieldDiff = true; }
+                if (s64.type != sMix.type) { Console.WriteLine($"  DIFF: type FP64={s64.type} MIX={sMix.type}"); starFieldDiff = true; }
+                if (s64.spectr != sMix.spectr) { Console.WriteLine($"  DIFF: spectr FP64={s64.spectr} MIX={sMix.spectr}"); starFieldDiff = true; }
+                if (s64.planetCount != sMix.planetCount) { Console.WriteLine($"  DIFF: planetCount FP64={s64.planetCount} MIX={sMix.planetCount}"); starFieldDiff = true; }
+
+                int x64 = (int)Math.Round(s64.uPosition.x * 0.001);
+                int y64 = (int)Math.Round(s64.uPosition.y * 0.001);
+                int z64 = (int)Math.Round(s64.uPosition.z * 0.001);
+                int xMix = (int)Math.Round(sMix.uPosition.x * 0.001);
+                int yMix = (int)Math.Round(sMix.uPosition.y * 0.001);
+                int zMix = (int)Math.Round(sMix.uPosition.z * 0.001);
+                if (x64 != xMix || y64 != yMix || z64 != zMix)
+                {
+                    Console.WriteLine($"  DIFF: uPosition(×1e-3量化) FP64=({x64},{y64},{z64}) MIX=({xMix},{yMix},{zMix})");
+                    starFieldDiff = true;
+                }
+
+                if (!starFieldDiff)
+                    Console.WriteLine("  DIFF: (none)");
+
+                var p64 = s64.planets;
+                var pMix = sMix.planets;
+                int pLen64 = p64 != null ? p64.Length : 0;
+                int pLenMix = pMix != null ? pMix.Length : 0;
+                int pc = Math.Max(pLen64, pLenMix);
+                for (int pi = 0; pi < pc; pi++)
+                {
+                    var a = pi < pLen64 ? p64[pi] : null;
+                    var b = pi < pLenMix ? pMix[pi] : null;
+
+                    Console.WriteLine($"  [Planet {pi}]");
+                    Console.WriteLine($"    FP64: {FormatPlanetLine(a)}");
+                    Console.WriteLine($"    MIX : {FormatPlanetLine(b)}");
+
+                    if (a == null || b == null)
+                    {
+                        Console.WriteLine("    DIFF: planet null 状态不同");
+                        continue;
+                    }
+
+                    bool planetFieldDiff = false;
+                    if (a.type != b.type) { Console.WriteLine($"    DIFF: type FP64={a.type} MIX={b.type}"); planetFieldDiff = true; }
+                    if (a.theme != b.theme) { Console.WriteLine($"    DIFF: theme FP64={a.theme} MIX={b.theme}"); planetFieldDiff = true; }
+                    if (a.waterItemId != b.waterItemId) { Console.WriteLine($"    DIFF: waterItemId FP64={a.waterItemId} MIX={b.waterItemId}"); planetFieldDiff = true; }
+                    if (a.orbitIndex != b.orbitIndex) { Console.WriteLine($"    DIFF: orbitIndex FP64={a.orbitIndex} MIX={b.orbitIndex}"); planetFieldDiff = true; }
+                    if (a.orbitAround != b.orbitAround) { Console.WriteLine($"    DIFF: orbitAround FP64={a.orbitAround} MIX={b.orbitAround}"); planetFieldDiff = true; }
+                    if (a.singularity != b.singularity) { Console.WriteLine($"    DIFF: singularity FP64={a.singularity} MIX={b.singularity}"); planetFieldDiff = true; }
+                    if (!planetFieldDiff)
+                        Console.WriteLine("    DIFF: (none)");
+
+                    if (a.type == EPlanetType.Gas || b.type == EPlanetType.Gas)
+                        continue;
+
+                    var c64 = global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(a);
+                    var cMix = useFp32Veins
+                        ? global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(b)
+                        : global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(b);
+                    DumpVeinCountsCompare(c64, cMix);
+                }
+
+                Console.WriteLine();
+            }
+        }
+
+        private static string FormatStarLine(StarData star)
+        {
+            if (star == null)
+                return "(null)";
+            int x = (int)Math.Round(star.uPosition.x * 0.001);
+            int y = (int)Math.Round(star.uPosition.y * 0.001);
+            int z = (int)Math.Round(star.uPosition.z * 0.001);
+            return $"id={star.id} name={star.displayName ?? star.name} type={star.type} spectr={star.spectr} planets={star.planetCount} uPosQ=({x},{y},{z})";
+        }
+
+        private static string FormatPlanetLine(PlanetData p)
+        {
+            if (p == null)
+                return "(null)";
+            var theme = global::DspFindSeed.LDB.themes.Select(p.theme);
+            string themeName = theme != null ? theme.DisplayName : $"themeId={p.theme}";
+            return $"id={p.id} name={p.displayName ?? p.name} type={p.type} theme={themeName}({p.theme}) orbitIndex={p.orbitIndex} orbitAround={p.orbitAround} singularity={p.singularity} waterItemId={p.waterItemId} tempBias={p.temperatureBias.ToString("R", CultureInfo.InvariantCulture)} habBias={p.habitableBias.ToString("R", CultureInfo.InvariantCulture)}";
+        }
+
+        private static void DumpVeinCountsCompare(int[] c64, int[] cMix)
+        {
+            int len64 = c64 != null ? c64.Length : 0;
+            int lenMix = cMix != null ? cMix.Length : 0;
+            int len = Math.Max(len64, lenMix);
+            if (len <= 1)
+            {
+                Console.WriteLine("      veinSpot: (none)");
+                return;
+            }
+
+            bool any = false;
+            for (int vid = 1; vid < len; vid++)
+            {
+                int a = vid < len64 ? c64[vid] : 0;
+                int b = vid < lenMix ? cMix[vid] : 0;
+                if (a == 0 && b == 0)
+                    continue;
+
+                var vp = global::DspFindSeed.LDB.veins.Select(vid);
+                string name = vp != null ? vp.Name : $"veinId={vid}";
+                string marker = a == b ? "" : "  <DIFF>";
+                Console.WriteLine($"      veinSpot {name} (id={vid}) FP64={a} MIX={b}{marker}");
+                any = true;
+            }
+
+            if (!any)
+                Console.WriteLine("      veinSpot: (none)");
+        }
+
+        private static void DebugVeinBranch(int seed, int starCount, int planetId)
+        {
+            if (planetId <= 0)
+            {
+                Console.WriteLine("请提供 --planet-id <行星ID>。");
+                return;
+            }
+
+            var gd = new global::DspFindSeed.GameDesc();
+            gd.SetForNewGame(global::DspFindSeed.UniverseGen.algoVersion, seed, starCount, 1, 1f);
+            var galaxy = global::DspFindSeed.UniverseGen.CreateGalaxy(gd);
+            if (galaxy?.stars == null)
+            {
+                Console.WriteLine("星系生成失败。");
+                return;
+            }
+
+            PlanetData target = null;
+            StarData star = null;
+            for (int si = 0; si < galaxy.stars.Length && target == null; ++si)
+            {
+                var s = galaxy.stars[si];
+                if (s?.planets == null)
+                    continue;
+                for (int pi = 0; pi < s.planets.Length; ++pi)
+                {
+                    var planetCandidate = s.planets[pi];
+                    if (planetCandidate != null && planetCandidate.id == planetId)
+                    {
+                        target = planetCandidate;
+                        star = s;
+                        break;
+                    }
+                }
+            }
+
+            if (target == null || star == null)
+            {
+                Console.WriteLine($"未找到 planetId={planetId}。");
+                return;
+            }
+            if (target.type == EPlanetType.Gas)
+            {
+                Console.WriteLine($"planetId={planetId} 是气态行星，矿脉统计路径不适用。");
+                return;
+            }
+
+            var theme = global::DspFindSeed.LDB.themes.Select(target.theme);
+            if (theme == null)
+            {
+                Console.WriteLine($"themeId={target.theme} 不存在。");
+                return;
+            }
+
+            var strictCounts = global::DspFindSeed.PlanetModelingManager.RefreshPlanetData(target);
+            var f32Counts = global::DspFindSeed.PlanetModelingManager.RefreshPlanetData_F32(target);
+
+            Console.WriteLine($"debug-vein-branch seed={seed} stars={starCount} planetId={planetId}");
+            Console.WriteLine($"starId={star.id} starIndex={star.index} starType={star.type} spectr={star.spectr}");
+            Console.WriteLine($"planet={target.displayName ?? target.name} type={target.type} theme={target.theme}({theme.DisplayName})");
+
+            bool anyCountDiff = false;
+            int maxLen = Math.Max(strictCounts?.Length ?? 0, f32Counts?.Length ?? 0);
+            for (int vid = 1; vid < maxLen; ++vid)
+            {
+                int a = strictCounts != null && vid < strictCounts.Length ? strictCounts[vid] : 0;
+                int b = f32Counts != null && vid < f32Counts.Length ? f32Counts[vid] : 0;
+                if (a == b)
+                    continue;
+                var vp = global::DspFindSeed.LDB.veins.Select(vid);
+                string name = vp != null ? vp.Name : $"veinId={vid}";
+                Console.WriteLine($"veinDiff {name}(id={vid}) strict={a} f32={b}");
+                anyCountDiff = true;
+            }
+            if (!anyCountDiff)
+            {
+                Console.WriteLine("该行星严格版与F32版矿脉统计一致，无分支翻转。");
+                return;
+            }
+
+            float p = CalcVeinP(star);
+            Console.WriteLine($"p={p.ToString("R", CultureInfo.InvariantCulture)}");
+            if (theme.RareVeins != null && theme.RareSettings != null)
+            {
+                for (int idx = 0; idx < theme.RareVeins.Length; ++idx)
+                {
+                    int veinId = theme.RareVeins[idx];
+                    float appearBase = star.index == 0 ? theme.RareSettings[idx * 4] : theme.RareSettings[idx * 4 + 1];
+                    float chainProb = theme.RareSettings[idx * 4 + 2];
+                    float appearProb = 1f - global::UnityEngine.Mathf.Pow(1f - appearBase, p);
+                    Console.WriteLine(
+                        $"rare[{idx}] veinId={veinId} appearBase={appearBase.ToString("R", CultureInfo.InvariantCulture)} " +
+                        $"appearProb={appearProb.ToString("R", CultureInfo.InvariantCulture)} chainProb={chainProb.ToString("R", CultureInfo.InvariantCulture)}");
+                }
+            }
+
+            string firstDivergence = FindFirstVeinProbBranchDivergence(target, theme, star, p);
+            Console.WriteLine(firstDivergence ?? "未定位到概率比较分支翻转（请检查是否由更上游星系/行星差异引起）。");
+        }
+
+        private static float CalcVeinP(StarData star)
+        {
+            float p = 1f;
+            if (star == null)
+                return p;
+
+            switch (star.type)
+            {
+                case EStarType.MainSeqStar:
+                    switch (star.spectr)
+                    {
+                        case ESpectrType.M: p = 2.5f; break;
+                        case ESpectrType.K: p = 1f; break;
+                        case ESpectrType.G: p = 0.7f; break;
+                        case ESpectrType.F: p = 0.6f; break;
+                        case ESpectrType.A: p = 1f; break;
+                        case ESpectrType.B: p = 0.4f; break;
+                        case ESpectrType.O: p = 1.6f; break;
+                    }
+                    break;
+                case EStarType.GiantStar:
+                    p = 2.5f;
+                    break;
+                case EStarType.WhiteDwarf:
+                    p = 3.5f;
+                    break;
+                case EStarType.NeutronStar:
+                    p = 4.5f;
+                    break;
+                case EStarType.BlackHole:
+                    p = 5f;
+                    break;
+            }
+
+            return p;
+        }
+
+        private static string FindFirstVeinProbBranchDivergence(PlanetData planet, global::DspFindSeed.ThemeProto theme, StarData star, float p)
+        {
+            DotNet35Random rng64 = new DotNet35Random(planet.seed);
+            DotNet35Random rng32 = new DotNet35Random(planet.seed);
+
+            for (int i = 0; i < 5; ++i)
+            {
+                int a = rng64.Next();
+                int b = rng32.Next();
+                if (a != b)
+                    return $"RNG 预热阶段已不一致 i={i} strict={a} f32={b}";
+            }
+            int s1 = rng64.Next();
+            int s2 = rng32.Next();
+            if (s1 != s2)
+                return $"RNG 分叉前 seed 已不一致 strict={s1} f32={s2}";
+            _ = new DotNet35Random(s1);
+            _ = new DotNet35Random(s2);
+
+            string CompareOnce(string stage, int rareIdx, int chainStep, double threshold64, float threshold32, out bool hit)
+            {
+                double rv64 = rng64.NextDouble();
+                double rv32 = rng32.NextDouble();
+                float rv32f = (float)rv32;
+
+                bool hit64 = rv64 < threshold64;
+                bool hit32 = rv32f < threshold32;
+                hit = hit64;
+
+                if (hit64 == hit32)
+                    return null;
+
+                return
+                    $"firstDivergence stage={stage} rareIdx={rareIdx} chainStep={chainStep} " +
+                    $"rv={rv64.ToString("R", CultureInfo.InvariantCulture)} rvF32={rv32f.ToString("R", CultureInfo.InvariantCulture)} " +
+                    $"threshold64={threshold64.ToString("R", CultureInfo.InvariantCulture)} " +
+                    $"threshold32={threshold32.ToString("R", CultureInfo.InvariantCulture)} " +
+                    $"hit64={hit64} hit32={hit32}";
+            }
+
+            if (star.type == EStarType.WhiteDwarf)
+            {
+                for (int i = 1; i < 12; ++i)
+                {
+                    var diff = CompareOnce("bonus.whiteDwarf.vein9", -1, i, 0.449999988079071, 0.449999988079071f, out bool hit);
+                    if (diff != null) return diff;
+                    if (!hit) break;
+                }
+                for (int i = 1; i < 12; ++i)
+                {
+                    var diff = CompareOnce("bonus.whiteDwarf.vein10", -1, i, 0.449999988079071, 0.449999988079071f, out bool hit);
+                    if (diff != null) return diff;
+                    if (!hit) break;
+                }
+                for (int i = 1; i < 12; ++i)
+                {
+                    var diff = CompareOnce("bonus.whiteDwarf.vein12", -1, i, 0.5, 0.5f, out bool hit);
+                    if (diff != null) return diff;
+                    if (!hit) break;
+                }
+            }
+            else if (star.type == EStarType.NeutronStar || star.type == EStarType.BlackHole)
+            {
+                for (int i = 1; i < 12; ++i)
+                {
+                    var diff = CompareOnce("bonus.compact.vein14", -1, i, 0.649999976158142, 0.649999976158142f, out bool hit);
+                    if (diff != null) return diff;
+                    if (!hit) break;
+                }
+            }
+
+            if (theme.RareVeins == null || theme.RareSettings == null)
+                return null;
+
+            for (int idx = 0; idx < theme.RareVeins.Length; ++idx)
+            {
+                float appearBase = star.index == 0 ? theme.RareSettings[idx * 4] : theme.RareSettings[idx * 4 + 1];
+                float chainProb = theme.RareSettings[idx * 4 + 2];
+                float appearProb = 1f - global::UnityEngine.Mathf.Pow(1f - appearBase, p);
+
+                var appearDiff = CompareOnce("rare.appear", idx, 0, (double)appearProb, appearProb, out bool appearHit);
+                if (appearDiff != null) return appearDiff;
+                if (!appearHit) continue;
+
+                for (int i = 1; i < 12; ++i)
+                {
+                    var chainDiff = CompareOnce("rare.chain", idx, i, (double)chainProb, chainProb, out bool chainHit);
+                    if (chainDiff != null) return chainDiff;
+                    if (!chainHit) break;
+                }
+            }
+
+            return null;
         }
 
         private static int GetIntArg(string[] args, string key, int defaultValue)

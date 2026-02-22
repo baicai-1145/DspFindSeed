@@ -11,7 +11,14 @@ namespace SeedCli
     {
         public static GalaxyData CreateGalaxy(global::DspFindSeed.GameDesc gameDesc)
         {
-            var g = UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64(gameDesc);
+            return CreateGalaxy(gameDesc, collisionFp64: false);
+        }
+
+        public static GalaxyData CreateGalaxy(global::DspFindSeed.GameDesc gameDesc, bool collisionFp64)
+        {
+            var g = collisionFp64
+                ? UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64(gameDesc)
+                : UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64(gameDesc);
             if (g == null || g.stars == null)
                 return g;
 
@@ -49,4 +56,3 @@ namespace SeedCli
         }
     }
 }
-

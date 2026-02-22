@@ -25,10 +25,10 @@ typedef struct dsp_planet_core_f32_out_t {
     float temperature_bias;
     float radius;
     float luminosity;
-    float rand1;
-    float rand2;
-    float rand3;
-    float rand4;
+    double rand1;
+    double rand2;
+    double rand3;
+    double rand4;
     int theme_seed;
     int type_case;
     int singularity_flags;

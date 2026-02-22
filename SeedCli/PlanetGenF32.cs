@@ -100,33 +100,33 @@ namespace SeedCli
                 return planet;
             }
 
-            // 随机输入仍消费 NextDouble，但这里提前截断到 float，模拟“更 FP32”
-            float num3  = (float)rng.NextDouble();
-            float num4  = (float)rng.NextDouble();
-            float num5  = (float)rng.NextDouble();
-            float num6  = (float)rng.NextDouble();
-            float num7  = (float)rng.NextDouble();
-            float num8  = (float)rng.NextDouble();
-            float num9  = (float)rng.NextDouble();
-            float num10 = (float)rng.NextDouble();
-            float num11 = (float)rng.NextDouble();
-            float num12 = (float)rng.NextDouble();
-            float num13 = (float)rng.NextDouble();
-            float num14 = (float)rng.NextDouble();
-            float rand1 = (float)rng.NextDouble();
-            float num15 = (float)rng.NextDouble();
-            float rand2 = (float)rng.NextDouble();
-            float rand3 = (float)rng.NextDouble();
-            float rand4 = (float)rng.NextDouble();
+            // 随机输入保持 double，避免在阈值分支前提前截断导致主题/类型漂移。
+            double num3  = rng.NextDouble();
+            double num4  = rng.NextDouble();
+            double num5  = rng.NextDouble();
+            double num6  = rng.NextDouble();
+            double num7  = rng.NextDouble();
+            double num8  = rng.NextDouble();
+            double num9  = rng.NextDouble();
+            double num10 = rng.NextDouble();
+            double num11 = rng.NextDouble();
+            double num12 = rng.NextDouble();
+            double num13 = rng.NextDouble();
+            double num14 = rng.NextDouble();
+            double rand1 = rng.NextDouble();
+            double num15 = rng.NextDouble();
+            double rand2 = rng.NextDouble();
+            double rand3 = rng.NextDouble();
+            double rand4 = rng.NextDouble();
             int theme_seed = rng.Next();
 
-            float a = Mathf.Pow(1.2f, num3 * (num4 - 0.5f) * 0.5f);
+            float a = Mathf.Pow(1.2f, (float)(num3 * (num4 - 0.5) * 0.5));
 
             float orbitRadius;
             if (orbitAround == 0)
             {
                 float b = global::DspFindSeed.StarGen.orbitRadius[orbitIndex] * star.orbitScaler;
-                float num16 = (a - 1f) / Mathf.Max(1f, b) + 1f;
+                float num16 = (float)(((double)a - 1.0) / (double)Mathf.Max(1f, b) + 1.0);
                 orbitRadius = b * num16;
             }
             else
@@ -138,9 +138,9 @@ namespace SeedCli
             }
 
             planet.orbitRadius = orbitRadius;
-            planet.orbitInclination = num5 * 16f - 8f;
+            planet.orbitInclination = (float)(num5 * 16.0 - 8.0);
             if (orbitAround > 0) planet.orbitInclination *= 2.2f;
-            planet.orbitLongitude = num6 * 360f;
+            planet.orbitLongitude = (float)(num6 * 360.0);
 
             if (star.type >= EStarType.NeutronStar)
                 planet.orbitInclination += planet.orbitInclination > 0f ? 3f : -3f;
@@ -152,22 +152,22 @@ namespace SeedCli
                 ? Math.Sqrt(39.4784176043574 * f1_3 / 1.08308421068537E-08)
                 : Math.Sqrt(39.4784176043574 * f1_3 / (global::DspFindSeed.PlanetGen.GRAVITY * star.mass));
 
-            planet.orbitPhase = num7 * 360f;
+            planet.orbitPhase = (float)(num7 * 360.0);
 
-            if (num15 < 0.04f)
+            if (num15 < 0.0399999991059303)
             {
-                planet.obliquity = num8 * (num9 - 0.5f) * 39.9f;
+                planet.obliquity = (float)(num8 * (num9 - 0.5) * 39.9);
                 planet.obliquity += planet.obliquity < 0f ? -70f : 70f;
                 planet.singularity |= EPlanetSingularity.LaySide;
             }
-            else if (num15 < 0.1f)
+            else if (num15 < 0.100000001490116)
             {
-                planet.obliquity = num8 * (num9 - 0.5f) * 80f;
+                planet.obliquity = (float)(num8 * (num9 - 0.5) * 80.0);
                 planet.obliquity += planet.obliquity < 0f ? -30f : 30f;
             }
             else
             {
-                planet.obliquity = num8 * (num9 - 0.5f) * 60f;
+                planet.obliquity = (float)(num8 * (num9 - 0.5) * 60.0);
             }
 
             // rotationPeriod 在 PlanetData 里是 double（原版如此）
@@ -179,7 +179,7 @@ namespace SeedCli
                 else if (star.type == EStarType.BlackHole) rotation *= 0.15;
             }
             planet.rotationPeriod = rotation;
-            planet.rotationPhase = num12 * 360f;
+            planet.rotationPhase = (float)(num12 * 360.0);
             planet.sunDistance = orbitAround == 0 ? planet.orbitRadius : planet.orbitAroundPlanet.orbitRadius;
             planet.scale = 1f;
 
@@ -188,19 +188,19 @@ namespace SeedCli
 
             if (orbitAround == 0 && orbitIndex <= 4 && !gasGiant)
             {
-                if (num15 > 0.96f)
+                if (num15 > 0.959999978542328)
                 {
                     planet.obliquity *= 0.01f;
                     planet.rotationPeriod = planet.orbitalPeriod;
                     planet.singularity |= EPlanetSingularity.TidalLocked;
                 }
-                else if (num15 > 0.93f)
+                else if (num15 > 0.930000007152557)
                 {
                     planet.obliquity *= 0.1f;
                     planet.rotationPeriod = planet.orbitalPeriod * 0.5;
                     planet.singularity |= EPlanetSingularity.TidalLocked2;
                 }
-                else if (num15 > 0.9f)
+                else if (num15 > 0.899999976158142)
                 {
                     planet.obliquity *= 0.2f;
                     planet.rotationPeriod = planet.orbitalPeriod * 0.25;
@@ -294,10 +294,10 @@ namespace SeedCli
         public static void SetPlanetTheme(
             PlanetData planet,
             int[] themeIds,
-            float rand1,
-            float rand2,
-            float rand3,
-            float rand4,
+            double rand1,
+            double rand2,
+            double rand3,
+            double rand4,
             int theme_seed)
         {
             if (_tmpTheme == null) _tmpTheme = new List<int>();
@@ -383,8 +383,8 @@ namespace SeedCli
             if (themeProto1 != null && themeProto1.Algos != null && themeProto1.Algos.Length != 0)
             {
                 planet.algoId = themeProto1.Algos[(int)(rand2 * themeProto1.Algos.Length) % themeProto1.Algos.Length];
-                planet.mod_x = themeProto1.ModX.x + (double)rand3 * (themeProto1.ModX.y - themeProto1.ModX.x);
-                planet.mod_y = themeProto1.ModY.x + (double)rand4 * (themeProto1.ModY.y - themeProto1.ModY.x);
+                planet.mod_x = themeProto1.ModX.x + rand3 * (themeProto1.ModX.y - themeProto1.ModX.x);
+                planet.mod_y = themeProto1.ModY.x + rand4 * (themeProto1.ModY.y - themeProto1.ModY.x);
             }
 
             if (themeProto1 == null) return;

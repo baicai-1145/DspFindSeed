@@ -204,14 +204,18 @@ struct DotNet35RandomDevice
 
 __device__ bool CheckCollisionF32(const dsp_vec3d_t* pts, int count, const dsp_vec3d_t& pt, double min_dist)
 {
-    float min2 = static_cast<float>(min_dist) * static_cast<float>(min_dist);
+    float min_dist_f = static_cast<float>(min_dist);
+    double min2 = static_cast<double>(min_dist_f) * static_cast<double>(min_dist_f);
     for (int i = 0; i < count; ++i)
     {
         const dsp_vec3d_t& p = pts[i];
         float dx = static_cast<float>(pt.x - p.x);
         float dy = static_cast<float>(pt.y - p.y);
         float dz = static_cast<float>(pt.z - p.z);
-        if (dx * dx + dy * dy + dz * dz < min2)
+        double dist2 = static_cast<double>(dx) * static_cast<double>(dx) +
+                       static_cast<double>(dy) * static_cast<double>(dy) +
+                       static_cast<double>(dz) * static_cast<double>(dz);
+        if (dist2 < min2)
             return true;
     }
     return false;
@@ -397,7 +401,10 @@ __device__ __forceinline__ bool ProbHit(DotNet35RandomDevice& rng, float thresho
 {
     double rv = rng.NextDouble();
     if (use_fp32_prob_compare)
-        return static_cast<float>(rv) < threshold;
+    {
+        float rvf = static_cast<float>(rv);
+        return rvf < threshold || (rvf == threshold && rv < static_cast<double>(threshold));
+    }
     return rv < static_cast<double>(threshold);
 }
 
@@ -436,26 +443,26 @@ __global__ void EvalPlanetCoreF32Kernel(
         return;
 
     DotNet35RandomDevice rng(info_seed);
-    float num3 = static_cast<float>(rng.NextDouble());
-    float num4 = static_cast<float>(rng.NextDouble());
-    float num5 = static_cast<float>(rng.NextDouble());
-    float num6 = static_cast<float>(rng.NextDouble());
-    float num7 = static_cast<float>(rng.NextDouble());
-    float num8 = static_cast<float>(rng.NextDouble());
-    float num9 = static_cast<float>(rng.NextDouble());
-    float num10 = static_cast<float>(rng.NextDouble());
-    float num11 = static_cast<float>(rng.NextDouble());
-    float num12 = static_cast<float>(rng.NextDouble());
-    float num13 = static_cast<float>(rng.NextDouble());
-    float num14 = static_cast<float>(rng.NextDouble());
-    float rand1 = static_cast<float>(rng.NextDouble());
-    float num15 = static_cast<float>(rng.NextDouble());
-    float rand2 = static_cast<float>(rng.NextDouble());
-    float rand3 = static_cast<float>(rng.NextDouble());
-    float rand4 = static_cast<float>(rng.NextDouble());
+    double num3 = rng.NextDouble();
+    double num4 = rng.NextDouble();
+    double num5 = rng.NextDouble();
+    double num6 = rng.NextDouble();
+    double num7 = rng.NextDouble();
+    double num8 = rng.NextDouble();
+    double num9 = rng.NextDouble();
+    double num10 = rng.NextDouble();
+    double num11 = rng.NextDouble();
+    double num12 = rng.NextDouble();
+    double num13 = rng.NextDouble();
+    double num14 = rng.NextDouble();
+    double rand1 = rng.NextDouble();
+    double num15 = rng.NextDouble();
+    double rand2 = rng.NextDouble();
+    double rand3 = rng.NextDouble();
+    double rand4 = rng.NextDouble();
     int theme_seed = rng.InternalSample();
 
-    float a = powf(1.2f, num3 * (num4 - 0.5f) * 0.5f);
+    float a = powf(1.2f, static_cast<float>(num3 * (num4 - 0.5) * 0.5));
     float orbit_radius = 0.0f;
     if (orbit_around == 0)
     {
@@ -478,10 +485,10 @@ __global__ void EvalPlanetCoreF32Kernel(
             40000.0);
     }
 
-    float orbit_inclination = num5 * 16.0f - 8.0f;
+    float orbit_inclination = static_cast<float>(num5 * 16.0 - 8.0);
     if (orbit_around > 0)
         orbit_inclination *= 2.2f;
-    float orbit_longitude = num6 * 360.0f;
+    float orbit_longitude = static_cast<float>(num6 * 360.0);
     if (boost_inclination_ns != 0)
         orbit_inclination += (orbit_inclination > 0.0f) ? 3.0f : -3.0f;
 
@@ -497,23 +504,23 @@ __global__ void EvalPlanetCoreF32Kernel(
         orbital_period = sqrt(39.4784176043574 * f1_3 / (1.35385519905204E-06 * star_mass));
     }
 
-    float orbit_phase = num7 * 360.0f;
+    float orbit_phase = static_cast<float>(num7 * 360.0);
     float obliquity = 0.0f;
     int singularity_flags = 0;
-    if (num15 < 0.04f)
+    if (num15 < 0.0399999991059303)
     {
-        obliquity = num8 * (num9 - 0.5f) * 39.9f;
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 39.9);
         obliquity += (obliquity < 0.0f) ? -70.0f : 70.0f;
         singularity_flags |= kSingularityLaySide;
     }
-    else if (num15 < 0.1f)
+    else if (num15 < 0.100000001490116)
     {
-        obliquity = num8 * (num9 - 0.5f) * 80.0f;
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 80.0);
         obliquity += (obliquity < 0.0f) ? -30.0f : 30.0f;
     }
     else
     {
-        obliquity = num8 * (num9 - 0.5f) * 60.0f;
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 60.0);
     }
 
     double rotation_period = (num10 * num11 * 1000.0 + 400.0) *
@@ -528,7 +535,7 @@ __global__ void EvalPlanetCoreF32Kernel(
         else if (compact_type_case == 3)
             rotation_period *= 0.15;
     }
-    float rotation_phase = num12 * 360.0f;
+    float rotation_phase = static_cast<float>(num12 * 360.0);
     float sun_distance = (orbit_around == 0) ? orbit_radius : orbit_around_planet_orbit_radius;
     float scale = 1.0f;
 
@@ -537,19 +544,19 @@ __global__ void EvalPlanetCoreF32Kernel(
 
     if (orbit_around == 0 && orbit_index <= 4 && gas_giant == 0)
     {
-        if (num15 > 0.96f)
+        if (num15 > 0.959999978542328)
         {
             obliquity *= 0.01f;
             rotation_period = orbital_period;
             singularity_flags |= kSingularityTidal1;
         }
-        else if (num15 > 0.93f)
+        else if (num15 > 0.930000007152557)
         {
             obliquity *= 0.1f;
             rotation_period = orbital_period * 0.5;
             singularity_flags |= kSingularityTidal2;
         }
-        else if (num15 > 0.9f)
+        else if (num15 > 0.899999976158142)
         {
             obliquity *= 0.2f;
             rotation_period = orbital_period * 0.25;
@@ -557,7 +564,7 @@ __global__ void EvalPlanetCoreF32Kernel(
         }
     }
 
-    if (num15 > 0.85f && num15 <= 0.9f)
+    if (num15 > 0.85 && num15 <= 0.9)
     {
         rotation_period = -rotation_period;
         singularity_flags |= kSingularityClockwise;

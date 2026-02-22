@@ -17,6 +17,7 @@ namespace SeedCli
         private static bool _printedCudaPoseDiff;
         private static bool _printedCudaRngDiff;
         private static bool _printedCudaRngStateDiff;
+        private static Dictionary<int, Queue<List<VectorLF3>>> _prefetchedPosesBySeed;
 
         public static GalaxyData CreateGalaxy(DspFindSeed.GameDesc gameDesc)
         {
@@ -558,6 +559,73 @@ namespace SeedCli
             return tempPoses;
         }
 
+        public static bool PrecomputeTempPosesParamsFp64Batch(IList<int> galaxySeeds, int starCount, bool collisionFp64)
+        {
+            ClearPrefetchedTempPosesParamsFp64();
+
+            if (galaxySeeds == null || galaxySeeds.Count <= 0)
+                return false;
+            if (!CudaGalaxyNative.IsEnabled())
+                return false;
+
+            int seedCount = galaxySeeds.Count;
+            int targetCount = Math.Max(0, starCount);
+            int iterCount = 4;
+            int maxCount = Math.Max(1, targetCount * iterCount);
+            int outStride = maxCount;
+
+            long poseCellCount = (long)seedCount * outStride;
+            if (poseCellCount <= 0 || poseCellCount > int.MaxValue)
+                return false;
+
+            var poseSeeds = new int[seedCount];
+            for (int i = 0; i < seedCount; ++i)
+            {
+                var rng = new DotNet35Random(galaxySeeds[i]);
+                poseSeeds[i] = rng.Next();
+            }
+
+            var poses = new CudaGalaxyNative.NativeVec3d[(int)poseCellCount];
+            var counts = new int[seedCount];
+            bool ok = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64BatchInto(
+                poseSeeds,
+                seedCount,
+                maxCount,
+                minDist: 2.0,
+                minStepLen: 2.3,
+                maxStepLen: 3.5,
+                flatten: 0.18,
+                collisionFp64: collisionFp64,
+                poses: poses,
+                outStride: outStride,
+                counts: counts);
+            if (!ok)
+                return false;
+
+            var map = new Dictionary<int, Queue<List<VectorLF3>>>(seedCount);
+            for (int i = 0; i < seedCount; ++i)
+            {
+                int rawCount = counts[i];
+                int offset = i * outStride;
+                var trimmed = TrimPrefetchedPoses(poses, offset, rawCount, targetCount, iterCount);
+                int poseSeed = poseSeeds[i];
+                if (!map.TryGetValue(poseSeed, out var q))
+                {
+                    q = new Queue<List<VectorLF3>>();
+                    map[poseSeed] = q;
+                }
+                q.Enqueue(trimmed);
+            }
+
+            _prefetchedPosesBySeed = map;
+            return true;
+        }
+
+        public static void ClearPrefetchedTempPosesParamsFp64()
+        {
+            _prefetchedPosesBySeed = null;
+        }
+
         private static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(DspFindSeed.GameDesc gameDesc, bool collisionFp64)
         {
             int galaxyAlgo = gameDesc.galaxyAlgo;
@@ -708,6 +776,12 @@ namespace SeedCli
             if (iterCount < 1) iterCount = 1;
             else if (iterCount > 16) iterCount = 16;
 
+            if (TryTakePrefetchedTempPoses(seed, out var prefetchedPoses))
+            {
+                _tmpPoses.AddRange(prefetchedPoses);
+                return _tmpPoses.Count;
+            }
+
             int maxCount = targetCount * iterCount;
             bool usedCuda = CudaGalaxyNative.TryGenerateRandomPosesParamsFp64(
                 seed,
@@ -744,6 +818,52 @@ namespace SeedCli
                     break;
             }
             return _tmpPoses.Count;
+        }
+
+        private static bool TryTakePrefetchedTempPoses(int poseSeed, out List<VectorLF3> poses)
+        {
+            poses = null;
+            if (_prefetchedPosesBySeed == null)
+                return false;
+            if (!_prefetchedPosesBySeed.TryGetValue(poseSeed, out var q) || q == null || q.Count <= 0)
+                return false;
+
+            poses = q.Dequeue();
+            if (q.Count == 0)
+                _prefetchedPosesBySeed.Remove(poseSeed);
+            return poses != null;
+        }
+
+        private static List<VectorLF3> TrimPrefetchedPoses(
+            CudaGalaxyNative.NativeVec3d[] poses,
+            int offset,
+            int rawCount,
+            int targetCount,
+            int iterCount)
+        {
+            if (iterCount < 1) iterCount = 1;
+            else if (iterCount > 16) iterCount = 16;
+            if (targetCount < 0) targetCount = 0;
+
+            if (poses == null || offset < 0 || rawCount <= 0 || offset >= poses.Length)
+                return new List<VectorLF3>(0);
+
+            int end = Math.Min(offset + rawCount, poses.Length);
+            var tmp = new List<VectorLF3>(Math.Max(0, end - offset));
+            for (int i = offset; i < end; ++i)
+            {
+                var p = poses[i];
+                tmp.Add(new VectorLF3(p.x, p.y, p.z));
+            }
+
+            for (int i = tmp.Count - 1; i >= 0; --i)
+            {
+                if (i % iterCount != 0)
+                    tmp.RemoveAt(i);
+                if (tmp.Count <= targetCount)
+                    break;
+            }
+            return tmp;
         }
 
         private static int GenerateTempPoses_ParamsFp64_CpuCore(
@@ -1134,14 +1254,17 @@ namespace SeedCli
 
         private static bool CheckCollisionF32(List<VectorLF3> pts, VectorLF3 pt, float minDist)
         {
-            float min2 = minDist * minDist;
+            // 保持输入与坐标差仍为 FP32，仅把“距离平方与阈值比较”提升到 FP64，
+            // 用于减少靠近阈值时的舍入翻转。
+            double min2 = (double)minDist * (double)minDist;
             for (int i = 0; i < pts.Count; i++)
             {
                 var p = pts[i];
                 float dx = (float)(pt.x - p.x);
                 float dy = (float)(pt.y - p.y);
                 float dz = (float)(pt.z - p.z);
-                if (dx * dx + dy * dy + dz * dz < min2)
+                double dist2 = (double)dx * (double)dx + (double)dy * (double)dy + (double)dz * (double)dz;
+                if (dist2 < min2)
                     return true;
             }
             return false;

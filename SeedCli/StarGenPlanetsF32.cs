@@ -16,14 +16,14 @@ namespace SeedCli
             rng1.Next(); rng1.Next(); rng1.Next();
             DotNet35Random rng2 = new DotNet35Random(rng1.Next());
 
-            // 随机输入仍消费 NextDouble，但截断成 float，模拟“更 FP32”
-            float num1 = (float)rng2.NextDouble();
-            float num2 = (float)rng2.NextDouble();
-            float num3 = (float)rng2.NextDouble();
-            float num4 = (float)rng2.NextDouble();
-            float num5 = (float)rng2.NextDouble();
-            float num6 = (float)rng2.NextDouble() * 0.2f + 0.9f;
-            float num7 = (float)rng2.NextDouble() * 0.2f + 0.9f;
+            // 关键门限判断改回 FP64（与原版一致），避免边界分支翻转。
+            double num1 = rng2.NextDouble();
+            double num2 = rng2.NextDouble();
+            double num3 = rng2.NextDouble();
+            double num4 = rng2.NextDouble();
+            double num5 = rng2.NextDouble();
+            double num6 = rng2.NextDouble() * 0.2 + 0.9;
+            double num7 = rng2.NextDouble() * 0.2 + 0.9;
 
             if (star.type == EStarType.BlackHole || star.type == EStarType.NeutronStar)
             {
@@ -35,7 +35,7 @@ namespace SeedCli
             }
             else if (star.type == EStarType.WhiteDwarf)
             {
-                if (num1 < 0.7f)
+                if (num1 < 0.7)
                 {
                     star.planetCount = 1;
                     star.planets = new PlanetData[1];
@@ -47,7 +47,7 @@ namespace SeedCli
                 {
                     star.planetCount = 2;
                     star.planets = new PlanetData[2];
-                    if (num2 < 0.30000002f)
+                    if (num2 < 0.30000001192092896)
                     {
                         int info_seed1 = rng2.Next();
                         int gen_seed1 = rng2.Next();
@@ -69,26 +69,26 @@ namespace SeedCli
             }
             else if (star.type == EStarType.GiantStar)
             {
-                if (num1 < 0.30000002f)
+                if (num1 < 0.30000001192092896)
                 {
                     star.planetCount = 1;
                     star.planets = new PlanetData[1];
                     int info_seed = rng2.Next();
                     int gen_seed = rng2.Next();
-                    star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5f ? 3 : 2, 1, false, info_seed, gen_seed);
+                    star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5 ? 3 : 2, 1, false, info_seed, gen_seed);
                 }
-                else if (num1 < 0.80000002f)
+                else if (num1 < 0.800000011920929)
                 {
                     star.planetCount = 2;
                     star.planets = new PlanetData[2];
-                    if (num2 < 0.25f)
+                    if (num2 < 0.25)
                     {
                         int info_seed5 = rng2.Next();
                         int gen_seed5 = rng2.Next();
-                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5f ? 3 : 2, 1, false, info_seed5, gen_seed5);
+                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5 ? 3 : 2, 1, false, info_seed5, gen_seed5);
                         int info_seed6 = rng2.Next();
                         int gen_seed6 = rng2.Next();
-                        star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 0, num3 > 0.5f ? 4 : 3, 2, false, info_seed6, gen_seed6);
+                        star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 0, num3 > 0.5 ? 4 : 3, 2, false, info_seed6, gen_seed6);
                     }
                     else
                     {
@@ -104,23 +104,23 @@ namespace SeedCli
                 {
                     star.planetCount = 3;
                     star.planets = new PlanetData[3];
-                    if (num2 < 0.15000001f)
+                    if (num2 < 0.15000000596046448)
                     {
                         int info_seed9 = rng2.Next();
                         int gen_seed9 = rng2.Next();
-                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5f ? 3 : 2, 1, false, info_seed9, gen_seed9);
+                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5 ? 3 : 2, 1, false, info_seed9, gen_seed9);
                         int info_seed10 = rng2.Next();
                         int gen_seed10 = rng2.Next();
-                        star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 0, num3 > 0.5f ? 4 : 3, 2, false, info_seed10, gen_seed10);
+                        star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 0, num3 > 0.5 ? 4 : 3, 2, false, info_seed10, gen_seed10);
                         int info_seed11 = rng2.Next();
                         int gen_seed11 = rng2.Next();
-                        star.planets[2] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 2, 0, num3 > 0.5f ? 5 : 4, 3, false, info_seed11, gen_seed11);
+                        star.planets[2] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 2, 0, num3 > 0.5 ? 5 : 4, 3, false, info_seed11, gen_seed11);
                     }
-                    else if (num2 < 0.75f)
+                    else if (num2 < 0.75)
                     {
                         int info_seed12 = rng2.Next();
                         int gen_seed12 = rng2.Next();
-                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5f ? 3 : 2, 1, false, info_seed12, gen_seed12);
+                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5 ? 3 : 2, 1, false, info_seed12, gen_seed12);
                         int info_seed13 = rng2.Next();
                         int gen_seed13 = rng2.Next();
                         star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 0, 4, 2, true, info_seed13, gen_seed13);
@@ -132,7 +132,7 @@ namespace SeedCli
                     {
                         int info_seed15 = rng2.Next();
                         int gen_seed15 = rng2.Next();
-                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5f ? 4 : 3, 1, true, info_seed15, gen_seed15);
+                        star.planets[0] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 0, 0, num3 > 0.5 ? 4 : 3, 1, true, info_seed15, gen_seed15);
                         int info_seed16 = rng2.Next();
                         int gen_seed16 = rng2.Next();
                         star.planets[1] = PlanetGenF32.CreatePlanet(galaxy, star, gameDesc.savedThemeIds, 1, 1, 1, 1, false, info_seed16, gen_seed16);
@@ -156,7 +156,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.M)
                 {
-                    star.planetCount = num1 >= 0.1f ? (num1 >= 0.3f ? (num1 >= 0.8f ? 4 : 3) : 2) : 1;
+                    star.planetCount = num1 >= 0.1 ? (num1 >= 0.3 ? (num1 >= 0.8 ? 4 : 3) : 2) : 1;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.2;
@@ -171,7 +171,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.K)
                 {
-                    star.planetCount = num1 >= 0.1f ? (num1 >= 0.2f ? (num1 >= 0.7f ? (num1 >= 0.95f ? 5 : 4) : 3) : 2) : 1;
+                    star.planetCount = num1 >= 0.1 ? (num1 >= 0.2 ? (num1 >= 0.7 ? (num1 >= 0.95 ? 5 : 4) : 3) : 2) : 1;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.18;
@@ -187,7 +187,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.G)
                 {
-                    star.planetCount = num1 >= 0.4f ? (num1 >= 0.9f ? 5 : 4) : 3;
+                    star.planetCount = num1 >= 0.4 ? (num1 >= 0.9 ? 5 : 4) : 3;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.18;
@@ -203,7 +203,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.F)
                 {
-                    star.planetCount = num1 >= 0.35f ? (num1 >= 0.8f ? 5 : 4) : 3;
+                    star.planetCount = num1 >= 0.35 ? (num1 >= 0.8 ? 5 : 4) : 3;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.2;
@@ -219,7 +219,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.A)
                 {
-                    star.planetCount = num1 >= 0.3f ? (num1 >= 0.75f ? 5 : 4) : 3;
+                    star.planetCount = num1 >= 0.3 ? (num1 >= 0.75 ? 5 : 4) : 3;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.2;
@@ -235,7 +235,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.B)
                 {
-                    star.planetCount = num1 >= 0.3f ? (num1 >= 0.75f ? 6 : 5) : 4;
+                    star.planetCount = num1 >= 0.3 ? (num1 >= 0.75 ? 6 : 5) : 4;
                     if (star.planetCount <= 3)
                     {
                         pGas[0] = 0.2;
@@ -252,7 +252,7 @@ namespace SeedCli
                 }
                 else if (star.spectr == ESpectrType.O)
                 {
-                    star.planetCount = num1 >= 0.5f ? 6 : 5;
+                    star.planetCount = num1 >= 0.5 ? 6 : 5;
                     pGas[0] = 0.1;
                     pGas[1] = 0.2;
                     pGas[2] = 0.25;
@@ -274,13 +274,13 @@ namespace SeedCli
                 {
                     int info_seed = rng2.Next();
                     int gen_seed = rng2.Next();
-                    float num11 = (float)rng2.NextDouble();
-                    float num12 = (float)rng2.NextDouble();
+                    double num11 = rng2.NextDouble();
+                    double num12 = rng2.NextDouble();
                     bool gasGiant = false;
                     if (orbitAround == 0)
                     {
                         ++num8;
-                        if (index < star.planetCount - 1 && num11 < (float)pGas[index])
+                        if (index < star.planetCount - 1 && num11 < pGas[index])
                         {
                             gasGiant = true;
                             if (num10 < 3) num10 = 3;
@@ -292,8 +292,10 @@ namespace SeedCli
                             if (slots > left)
                             {
                                 float a = (float)left / (float)slots;
-                                float prob = num10 <= 3 ? Mathf.Lerp(a, 1f, 0.15f) + 0.01f : Mathf.Lerp(a, 1f, 0.45f) + 0.01f;
-                                if ((float)rng2.NextDouble() < prob) goto label_62;
+                                double prob = num10 <= 3
+                                    ? Mathf.Lerp(a, 1f, 0.15f) + 0.01f
+                                    : Mathf.Lerp(a, 1f, 0.45f) + 0.01f;
+                                if (rng2.NextDouble() < prob) goto label_62;
                             }
                             else goto label_62;
                         }
@@ -312,7 +314,7 @@ namespace SeedCli
                         orbitAround = num8;
                         num9 = 0;
                     }
-                    if (num9 >= 1 && num12 < 0.8f)
+                    if (num9 >= 1 && num12 < 0.8)
                     {
                         orbitAround = 0;
                         num9 = 0;
@@ -349,19 +351,18 @@ namespace SeedCli
                         break;
                     }
                 }
-                if (ok && num4 < 0.2f + idx * 0.2f)
+                if (ok && num4 < 0.2 + idx * 0.2)
                     belt1 = idx;
             }
 
-            int belt2 = num5 >= 0.2f ? (num5 >= 0.4f ? (num5 >= 0.8f ? 0 : lastOrbit + 1) : lastOrbit + 2) : lastOrbit + 3;
+            int belt2 = num5 >= 0.2 ? (num5 >= 0.4 ? (num5 >= 0.8 ? 0 : lastOrbit + 1) : lastOrbit + 2) : lastOrbit + 3;
             if (belt2 != 0 && belt2 < 5) belt2 = 5;
             star.asterBelt1OrbitIndex = belt1;
             star.asterBelt2OrbitIndex = belt2;
             if (belt1 > 0)
-                star.asterBelt1Radius = global::DspFindSeed.StarGen.orbitRadius[belt1] * num6 * star.orbitScaler;
+                star.asterBelt1Radius = (float)(global::DspFindSeed.StarGen.orbitRadius[belt1] * num6 * star.orbitScaler);
             if (belt2 > 0)
-                star.asterBelt2Radius = global::DspFindSeed.StarGen.orbitRadius[belt2] * num7 * star.orbitScaler;
+                star.asterBelt2Radius = (float)(global::DspFindSeed.StarGen.orbitRadius[belt2] * num7 * star.orbitScaler);
         }
     }
 }
-
