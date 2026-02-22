@@ -1,0 +1,239 @@
+{
+  "m_GameObject": {
+    "m_FileID": 0,
+    "m_PathID": 0
+  },
+  "m_Enabled": 1,
+  "m_Script": {
+    "m_FileID": 1,
+    "m_PathID": 2245
+  },
+  "m_Name": "TutorialProtoSet",
+  "TableName": "Tutorial",
+  "Signature": "",
+  "dataArray": [
+    {
+      "Name": "前情介绍标题",
+      "ID": 1,
+      "SID": "",
+      "LayoutFileName": "tutorial-1",
+      "DeterminatorName": "TOR_GameSecond",
+      "DeterminatorParams": [
+        1
+      ]
+    },
+    {
+      "Name": "戴森球介绍标题",
+      "ID": 2,
+      "SID": "",
+      "LayoutFileName": "tutorial-2",
+      "DeterminatorName": "TOR_GameSecond",
+      "DeterminatorParams": [
+        2
+      ]
+    },
+    {
+      "Name": "沙盒模式指引标题",
+      "ID": 15,
+      "SID": "",
+      "LayoutFileName": "tutorial-15",
+      "DeterminatorName": "TOR_SandboxMode",
+      "DeterminatorParams": []
+    },
+    {
+      "Name": "战斗系统前情介绍标题",
+      "ID": 17,
+      "SID": "",
+      "LayoutFileName": "tutorial-17",
+      "DeterminatorName": "TOR_CombatMode",
+      "DeterminatorParams": []
+    },
+    {
+      "Name": "采集资源指令标题",
+      "ID": 3,
+      "SID": "",
+      "LayoutFileName": "tutorial-3",
+      "DeterminatorName": "TOR_GameSecond",
+      "DeterminatorParams": [
+        26
+      ]
+    },
+    {
+      "Name": "采矿机搭建及矿脉覆盖标题",
+      "ID": 4,
+      "SID": "",
+      "LayoutFileName": "tutorial-4",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1001,
+        4
+      ]
+    },
+    {
+      "Name": "电网建立指南标题",
+      "ID": 5,
+      "SID": "",
+      "LayoutFileName": "tutorial-5",
+      "DeterminatorName": "TOR_OnBuild",
+      "DeterminatorParams": [
+        2201,
+        2203
+      ]
+    },
+    {
+      "Name": "机甲核心能量标题",
+      "ID": 6,
+      "SID": "",
+      "LayoutFileName": "tutorial-6",
+      "DeterminatorName": "TOR_LowFuel",
+      "DeterminatorParams": []
+    },
+    {
+      "Name": "机甲基本操作标题",
+      "ID": 11,
+      "SID": "",
+      "LayoutFileName": "tutorial-11",
+      "DeterminatorName": "TOR_GameSecond",
+      "DeterminatorParams": [
+        6
+      ]
+    },
+    {
+      "Name": "机甲航行操作标题",
+      "ID": 12,
+      "SID": "",
+      "LayoutFileName": "tutorial-12",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        2902,
+        7
+      ]
+    },
+    {
+      "Name": "矩阵研究站介绍标题",
+      "ID": 7,
+      "SID": "",
+      "LayoutFileName": "tutorial-7",
+      "DeterminatorName": "TOR_OnBuild",
+      "DeterminatorParams": [
+        2901
+      ]
+    },
+    {
+      "Name": "配方复制操作标题",
+      "ID": 8,
+      "SID": "",
+      "LayoutFileName": "tutorial-8",
+      "DeterminatorName": "TOR_RecipeCopyTip",
+      "DeterminatorParams": []
+    },
+    {
+      "Name": "传送带和分拣器标题",
+      "ID": 9,
+      "SID": "",
+      "LayoutFileName": "tutorial-9",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1601,
+        4
+      ]
+    },
+    {
+      "Name": "喷涂机和增产剂工作机制标题",
+      "ID": 14,
+      "SID": "",
+      "LayoutFileName": "tutorial-14",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1151,
+        7
+      ]
+    },
+    {
+      "Name": "自动集装机标题",
+      "ID": 13,
+      "SID": "",
+      "LayoutFileName": "tutorial-13",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1607,
+        7
+      ]
+    },
+    {
+      "Name": "射线接收站工作机制标题",
+      "ID": 10,
+      "SID": "",
+      "LayoutFileName": "tutorial-10",
+      "DeterminatorName": "TOR_OnBuild",
+      "DeterminatorParams": [
+        2208
+      ]
+    },
+    {
+      "Name": "物流配送器指引标题",
+      "ID": 16,
+      "SID": "",
+      "LayoutFileName": "tutorial-16",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1608,
+        7
+      ]
+    },
+    {
+      "Name": "防御塔介绍标题",
+      "ID": 18,
+      "SID": "",
+      "LayoutFileName": "tutorial-18",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1801,
+        7
+      ]
+    },
+    {
+      "Name": "战场分析基站标题",
+      "ID": 19,
+      "SID": "",
+      "LayoutFileName": "tutorial-19",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1826,
+        7
+      ]
+    },
+    {
+      "Name": "信号塔标题",
+      "ID": 20,
+      "SID": "",
+      "LayoutFileName": "tutorial-20",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1808,
+        7
+      ]
+    },
+    {
+      "Name": "行星护盾标题",
+      "ID": 21,
+      "SID": "",
+      "LayoutFileName": "tutorial-21",
+      "DeterminatorName": "TOR_OnBuild",
+      "DeterminatorParams": [
+        3008
+      ]
+    },
+    {
+      "Name": "无人机编队标题",
+      "ID": 22,
+      "SID": "",
+      "LayoutFileName": "tutorial-22",
+      "DeterminatorName": "TOR_TechUnlocked",
+      "DeterminatorParams": [
+        1819,
+        7
+      ]
+    }
+  ]
+}
