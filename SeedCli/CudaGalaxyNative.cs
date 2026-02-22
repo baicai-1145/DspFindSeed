@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace SeedCli
 {
@@ -15,6 +17,22 @@ namespace SeedCli
         private static bool _printedFallback;
         private static bool _printedForceColl64;
         [ThreadStatic] private static NativeVec3d[] _singlePoseScratch;
+        private static long _perfSingleCalls;
+        private static long _perfSingleTicks;
+        private static long _perfBatchCalls;
+        private static long _perfBatchTicks;
+        private static long _perfBatchSeeds;
+        private static long _perfFailCalls;
+
+        internal struct PerfStats
+        {
+            public long singleCalls;
+            public double singleMs;
+            public long batchCalls;
+            public double batchMs;
+            public long batchSeeds;
+            public long failCalls;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct NativeVec3d
@@ -100,6 +118,30 @@ namespace SeedCli
             return string.Equals(env, "1", StringComparison.Ordinal);
         }
 
+        public static void ResetPerfStats()
+        {
+            Interlocked.Exchange(ref _perfSingleCalls, 0);
+            Interlocked.Exchange(ref _perfSingleTicks, 0);
+            Interlocked.Exchange(ref _perfBatchCalls, 0);
+            Interlocked.Exchange(ref _perfBatchTicks, 0);
+            Interlocked.Exchange(ref _perfBatchSeeds, 0);
+            Interlocked.Exchange(ref _perfFailCalls, 0);
+        }
+
+        public static PerfStats GetPerfStats()
+        {
+            double toMs = 1000.0 / Stopwatch.Frequency;
+            return new PerfStats
+            {
+                singleCalls = Interlocked.Read(ref _perfSingleCalls),
+                singleMs = Interlocked.Read(ref _perfSingleTicks) * toMs,
+                batchCalls = Interlocked.Read(ref _perfBatchCalls),
+                batchMs = Interlocked.Read(ref _perfBatchTicks) * toMs,
+                batchSeeds = Interlocked.Read(ref _perfBatchSeeds),
+                failCalls = Interlocked.Read(ref _perfFailCalls)
+            };
+        }
+
         public static bool TryGenerateRandomPosesParamsFp64(
             int seed,
             int maxCount,
@@ -122,6 +164,8 @@ namespace SeedCli
             if (maxCount <= 0)
                 return false;
 
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfSingleCalls);
             var nativePoses = EnsureSinglePoseScratch(maxCount);
             int deviceId = GetDeviceIdFromEnv();
             bool effectiveCollisionFp64 = collisionFp64 || ForceCollisionFp64FromEnv();
@@ -150,18 +194,24 @@ namespace SeedCli
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
             {
+                Interlocked.Add(ref _perfSingleTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfFailCalls);
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
 
             if (rc != Ok)
             {
+                Interlocked.Add(ref _perfSingleTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfFailCalls);
                 MarkNativeBroken("native return code=" + rc);
                 return false;
             }
 
             if (outCount < 0 || outCount > maxCount)
             {
+                Interlocked.Add(ref _perfSingleTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfFailCalls);
                 MarkNativeBroken("invalid outCount=" + outCount);
                 return false;
             }
@@ -174,6 +224,7 @@ namespace SeedCli
             }
 
             generatedCount = outCount;
+            Interlocked.Add(ref _perfSingleTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 
@@ -256,6 +307,9 @@ namespace SeedCli
             if (_nativeBroken)
                 return false;
 
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfBatchCalls);
+            Interlocked.Add(ref _perfBatchSeeds, seedCount);
             int deviceId = GetDeviceIdFromEnv();
             bool effectiveCollisionFp64 = collisionFp64 || ForceCollisionFp64FromEnv();
             if (effectiveCollisionFp64 && !collisionFp64 && !_printedForceColl64)
@@ -283,16 +337,21 @@ namespace SeedCli
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
             {
+                Interlocked.Add(ref _perfBatchTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfFailCalls);
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
 
             if (rc != Ok)
             {
+                Interlocked.Add(ref _perfBatchTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfFailCalls);
                 MarkNativeBroken("batch native return code=" + rc);
                 return false;
             }
 
+            Interlocked.Add(ref _perfBatchTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 

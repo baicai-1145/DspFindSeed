@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -30,6 +31,17 @@ namespace SeedCli
         private static readonly ConcurrentQueue<PlanetCoreBatchRequest> _coreBatchQueue = new ConcurrentQueue<PlanetCoreBatchRequest>();
         private static readonly AutoResetEvent _coreBatchWake = new AutoResetEvent(false);
         private static int _coreBatchWorkerStarted;
+        private static long _perfCoreReqCount;
+        private static long _perfCoreReqWaitTicks;
+        private static long _perfCoreBatchCalls;
+        private static long _perfCoreBatchItems;
+        private static long _perfCoreBatchTicks;
+        private static long _perfCoreSingleCalls;
+        private static long _perfCoreSingleTicks;
+        private static long _perfVeinBatchCalls;
+        private static long _perfVeinBatchPlanets;
+        private static long _perfVeinBatchTicks;
+        private static long _perfVeinBatchFailCalls;
 
         [ThreadStatic] private static int[] _planetSeeds;
         [ThreadStatic] private static float[] _pValues;
@@ -92,6 +104,21 @@ namespace SeedCli
             public PlanetCoreF32Out core;
             public bool success;
             public ManualResetEventSlim done = new ManualResetEventSlim(false);
+        }
+
+        internal struct PerfStats
+        {
+            public long coreReqCount;
+            public double coreReqWaitMs;
+            public long coreBatchCalls;
+            public long coreBatchItems;
+            public double coreBatchMs;
+            public long coreSingleCalls;
+            public double coreSingleMs;
+            public long veinBatchCalls;
+            public long veinBatchPlanets;
+            public double veinBatchMs;
+            public long veinBatchFailCalls;
         }
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_refresh_planet_vein_spots_batch")]
@@ -195,6 +222,40 @@ namespace SeedCli
             return string.Equals(env, "1", StringComparison.Ordinal);
         }
 
+        public static void ResetPerfStats()
+        {
+            Interlocked.Exchange(ref _perfCoreReqCount, 0);
+            Interlocked.Exchange(ref _perfCoreReqWaitTicks, 0);
+            Interlocked.Exchange(ref _perfCoreBatchCalls, 0);
+            Interlocked.Exchange(ref _perfCoreBatchItems, 0);
+            Interlocked.Exchange(ref _perfCoreBatchTicks, 0);
+            Interlocked.Exchange(ref _perfCoreSingleCalls, 0);
+            Interlocked.Exchange(ref _perfCoreSingleTicks, 0);
+            Interlocked.Exchange(ref _perfVeinBatchCalls, 0);
+            Interlocked.Exchange(ref _perfVeinBatchPlanets, 0);
+            Interlocked.Exchange(ref _perfVeinBatchTicks, 0);
+            Interlocked.Exchange(ref _perfVeinBatchFailCalls, 0);
+        }
+
+        public static PerfStats GetPerfStats()
+        {
+            double toMs = 1000.0 / Stopwatch.Frequency;
+            return new PerfStats
+            {
+                coreReqCount = Interlocked.Read(ref _perfCoreReqCount),
+                coreReqWaitMs = Interlocked.Read(ref _perfCoreReqWaitTicks) * toMs,
+                coreBatchCalls = Interlocked.Read(ref _perfCoreBatchCalls),
+                coreBatchItems = Interlocked.Read(ref _perfCoreBatchItems),
+                coreBatchMs = Interlocked.Read(ref _perfCoreBatchTicks) * toMs,
+                coreSingleCalls = Interlocked.Read(ref _perfCoreSingleCalls),
+                coreSingleMs = Interlocked.Read(ref _perfCoreSingleTicks) * toMs,
+                veinBatchCalls = Interlocked.Read(ref _perfVeinBatchCalls),
+                veinBatchPlanets = Interlocked.Read(ref _perfVeinBatchPlanets),
+                veinBatchMs = Interlocked.Read(ref _perfVeinBatchTicks) * toMs,
+                veinBatchFailCalls = Interlocked.Read(ref _perfVeinBatchFailCalls)
+            };
+        }
+
         public static bool TryRefreshPlanetVeinSpotsBatch(
             IList<PlanetData> planets,
             bool useFp32ProbCompare,
@@ -219,6 +280,9 @@ namespace SeedCli
                 return false;
 
             int planetCount = planets.Count;
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfVeinBatchCalls);
+            Interlocked.Add(ref _perfVeinBatchPlanets, planetCount);
             EnsureBuffers(planetCount, veinLen);
 
             for (int i = 0; i < planetCount; ++i)
@@ -288,18 +352,23 @@ namespace SeedCli
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
             {
+                Interlocked.Add(ref _perfVeinBatchTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfVeinBatchFailCalls);
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
 
             if (rc != Ok)
             {
+                Interlocked.Add(ref _perfVeinBatchTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfVeinBatchFailCalls);
                 MarkNativeBroken("planet native return code=" + rc);
                 return false;
             }
 
             countsFlat = _outCounts;
             outVeinLen = veinLen;
+            Interlocked.Add(ref _perfVeinBatchTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 
@@ -363,16 +432,25 @@ namespace SeedCli
             if (_coreBatchEntryMissing || _nativeBroken)
                 return false;
 
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfCoreReqCount);
             EnsureCoreBatchWorker();
             _coreBatchQueue.Enqueue(req);
             _coreBatchWake.Set();
 
             // 保守等待，避免 worker 异常导致调用方永久阻塞。
             if (!req.done.Wait(30000))
+            {
+                Interlocked.Add(ref _perfCoreReqWaitTicks, Stopwatch.GetTimestamp() - t0);
                 return false;
+            }
             if (!req.success)
+            {
+                Interlocked.Add(ref _perfCoreReqWaitTicks, Stopwatch.GetTimestamp() - t0);
                 return false;
+            }
             core = req.core;
+            Interlocked.Add(ref _perfCoreReqWaitTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 
@@ -433,6 +511,9 @@ namespace SeedCli
                 return false;
 
             int n = batch.Count;
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfCoreBatchCalls);
+            Interlocked.Add(ref _perfCoreBatchItems, n);
             var infoSeeds = new int[n];
             var orbitArounds = new int[n];
             var orbitIndexes = new int[n];
@@ -499,6 +580,7 @@ namespace SeedCli
             }
             catch (EntryPointNotFoundException)
             {
+                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
                 _coreBatchEntryMissing = true;
                 if (!_coreBatchFallbackPrinted)
                 {
@@ -509,12 +591,14 @@ namespace SeedCli
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
             {
+                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
 
             if (rc != Ok)
             {
+                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
                 MarkNativeBroken("planet-core-batch native return code=" + rc);
                 return false;
             }
@@ -524,6 +608,7 @@ namespace SeedCli
                 batch[i].core = outResults[i];
                 batch[i].success = true;
             }
+            Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 
@@ -533,6 +618,8 @@ namespace SeedCli
             if (_nativeBroken)
                 return false;
 
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfCoreSingleCalls);
             int deviceId = GetDeviceIdFromEnv();
             int rc;
             try
@@ -559,15 +646,18 @@ namespace SeedCli
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
             {
+                Interlocked.Add(ref _perfCoreSingleTicks, Stopwatch.GetTimestamp() - t0);
                 MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
                 return false;
             }
 
             if (rc != Ok)
             {
+                Interlocked.Add(ref _perfCoreSingleTicks, Stopwatch.GetTimestamp() - t0);
                 MarkNativeBroken("planet-core native return code=" + rc);
                 return false;
             }
+            Interlocked.Add(ref _perfCoreSingleTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 

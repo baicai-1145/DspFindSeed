@@ -53,6 +53,7 @@ namespace SeedCli
             int planetId = GetIntArg(args, "--planet-id", 0);
             string cpuCacheFile = GetStringArg(args, "--cpu-cache-file", null);
             bool noCpuCache = HasFlag(args, "--no-cpu-cache");
+            bool timingDebug = HasFlag(args, "--timing-debug");
 
             if (seed <= 0)
             {
@@ -67,6 +68,7 @@ namespace SeedCli
                 Console.WriteLine("并行线程数：追加 --threads <N>（例如 10）");
                 Console.WriteLine("每线程批大小：追加 --batch-per-thread <N>（总批大小 = threads * batchPerThread）");
                 Console.WriteLine("兼容别名：--seed-batch-size <N> 等价于 --batch-per-thread <N>");
+                Console.WriteLine("耗时统计：追加 --timing-debug（打印各阶段耗时与 native 调用统计）");
                 Console.WriteLine("CPU FP64 缓存文件：追加 --cpu-cache-file <路径>（默认 logs/cpu_fp64_cache 自动命名）");
                 Console.WriteLine("禁用 CPU FP64 缓存：追加 --no-cpu-cache");
                 Console.WriteLine("Mix 路线强制星系碰撞 FP64：追加 --mix-collision-fp64");
@@ -120,6 +122,7 @@ namespace SeedCli
                         batchPerThread: batchPerThread,
                         mixCollisionFp64: mixCollisionFp64,
                         threads: threads,
+                        timingDebug: timingDebug,
                         cpuCacheFile: cpuCacheFile,
                         useCpuCache: !noCpuCache);
                 }
@@ -739,6 +742,7 @@ namespace SeedCli
             int batchPerThread,
             bool mixCollisionFp64,
             int threads,
+            bool timingDebug,
             string cpuCacheFile,
             bool useCpuCache)
         {
@@ -759,6 +763,23 @@ namespace SeedCli
             int batchChunkTotal = 0;
             int batchChunkPrefetchOk = 0;
             bool enableBatchPrefetch = seedBatchSize > 1;
+            long tAllStart = 0;
+            long tCacheLoad = 0;
+            long tCpuGen = 0;
+            long tCacheSave = 0;
+            long tMixTotal = 0;
+            long tMixPrefetch = 0;
+            long tMixCreateGalaxy = 0;
+            long tMixVeinBatch = 0;
+            long tMixCompare = 0;
+            long tMixDetail = 0;
+
+            if (timingDebug)
+            {
+                tAllStart = Stopwatch.GetTimestamp();
+                CudaGalaxyNative.ResetPerfStats();
+                CudaPlanetNative.ResetPerfStats();
+            }
 
             var cpuRows = new CpuFp64SigRow[count];
             string resolvedCpuCacheFile = null;
@@ -767,12 +788,16 @@ namespace SeedCli
 
             if (useCpuCache)
             {
+                long t0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 resolvedCpuCacheFile = ResolveCpuFp64CacheFile(cpuCacheFile, startSeed, starCount, count);
                 cpuCacheLoaded = TryLoadCpuFp64SigCache(resolvedCpuCacheFile, startSeed, starCount, count, cpuRows);
+                if (timingDebug)
+                    tCacheLoad += Stopwatch.GetTimestamp() - t0;
             }
 
             if (!cpuCacheLoaded)
             {
+                long tCpuStart = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 if (threads > 1)
                 {
                     var options = new ParallelOptions { MaxDegreeOfParallelism = threads };
@@ -812,19 +837,28 @@ namespace SeedCli
                 }
 
                 if (useCpuCache && !string.IsNullOrEmpty(resolvedCpuCacheFile))
+                {
+                    long tSave = timingDebug ? Stopwatch.GetTimestamp() : 0;
                     cpuCacheSaved = TrySaveCpuFp64SigCache(resolvedCpuCacheFile, startSeed, starCount, count, cpuRows);
+                    if (timingDebug)
+                        tCacheSave += Stopwatch.GetTimestamp() - tSave;
+                }
+                if (timingDebug)
+                    tCpuGen += Stopwatch.GetTimestamp() - tCpuStart;
             }
 
             int mixChunkTotal = 0;
             int mixChunkCudaCountsOk = 0;
             int endSeed = startSeed + count;
             var parallelOptions = threads > 1 ? new ParallelOptions { MaxDegreeOfParallelism = threads } : null;
+            long tMixStart = timingDebug ? Stopwatch.GetTimestamp() : 0;
             for (int seedBase = startSeed; seedBase < endSeed; seedBase += seedBatchSize)
             {
                 int chunk = Math.Min(seedBatchSize, endSeed - seedBase);
                 bool prefetched = false;
                 if (enableBatchPrefetch)
                 {
+                    long tp0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                     var chunkSeeds = new int[chunk];
                     for (int i = 0; i < chunk; ++i)
                         chunkSeeds[i] = seedBase + i;
@@ -832,9 +866,12 @@ namespace SeedCli
                     batchChunkTotal++;
                     if (prefetched)
                         batchChunkPrefetchOk++;
+                    if (timingDebug)
+                        tMixPrefetch += Stopwatch.GetTimestamp() - tp0;
                 }
 
                 var gMixChunk = new GalaxyData[chunk];
+                long tg0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 if (threads > 1)
                 {
                     Parallel.For(0, chunk, parallelOptions, i =>
@@ -855,17 +892,23 @@ namespace SeedCli
                         gMixChunk[i] = UniverseGenPipelineMix.CreateGalaxy(gd, collisionFp64: mixCollisionFp64);
                     }
                 }
+                if (timingDebug)
+                    tMixCreateGalaxy += Stopwatch.GetTimestamp() - tg0;
 
+                long tv0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 bool useChunkCudaCounts = TryGetCudaPlanetCountsBatch(
                     gMixChunk,
                     useFp32Veins,
                     out var chunkCudaCounts,
                     out var chunkCudaStride,
                     out var chunkPlanetOffsetMap);
+                if (timingDebug)
+                    tMixVeinBatch += Stopwatch.GetTimestamp() - tv0;
                 mixChunkTotal++;
                 if (useChunkCudaCounts)
                     mixChunkCudaCountsOk++;
 
+                long tc0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 for (int i = 0; i < chunk; i++)
                 {
                     int s = seedBase + i;
@@ -896,6 +939,7 @@ namespace SeedCli
                     total++;
                     if (showMismatches > 0 && shown < showMismatches && hall64 != hall32)
                     {
+                        long td0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                         shown++;
                         var gd64 = new global::DspFindSeed.GameDesc();
                         gd64.SetForNewGame(global::DspFindSeed.UniverseGen.algoVersion, s, starCount, 1, 1f);
@@ -907,12 +951,18 @@ namespace SeedCli
                         Console.WriteLine($"veinSig64=0x{hv64:X16} veinSigMix=0x{hv32:X16}");
                         Console.WriteLine($"pipeSig64=0x{hall64:X16} pipeSigMix=0x{hall32:X16}");
                         Console.WriteLine(DescribeFirstDifferenceWithVeins(g64Detail, gMix));
+                        if (timingDebug)
+                            tMixDetail += Stopwatch.GetTimestamp() - td0;
                     }
                 }
+                if (timingDebug)
+                    tMixCompare += Stopwatch.GetTimestamp() - tc0;
 
                 if (prefetched)
                     UniverseGenF32.ClearPrefetchedTempPosesParamsFp64();
             }
+            if (timingDebug)
+                tMixTotal += Stopwatch.GetTimestamp() - tMixStart;
 
             var label = useFp32Veins ? "compare-pipeline-mix-veins-f32" : "compare-pipeline-mix";
             Console.WriteLine($"{label} startSeed={startSeed} stars={starCount} count={count}");
@@ -930,6 +980,20 @@ namespace SeedCli
             Console.WriteLine($"veinMismatch={mismatchVeins}/{total} ({(total > 0 ? (mismatchVeins * 100.0 / total) : 0):F6}%)");
             Console.WriteLine($"pipelineMismatch={mismatchPipeline}/{total} ({(total > 0 ? (mismatchPipeline * 100.0 / total) : 0):F6}%)");
             Console.WriteLine("说明：先全量生成 CPU FP64 签名（可缓存复用），再全量生成 Mix 并对比。");
+            if (timingDebug)
+            {
+                double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
+                var cudaGalaxyPerf = CudaGalaxyNative.GetPerfStats();
+                var cudaPlanetPerf = CudaPlanetNative.GetPerfStats();
+                long tAll = Stopwatch.GetTimestamp() - tAllStart;
+                Console.WriteLine("timingDebug=True");
+                Console.WriteLine($"timing.totalMs={Ms(tAll):F3}");
+                Console.WriteLine($"timing.cacheLoadMs={Ms(tCacheLoad):F3} cpuGenMs={Ms(tCpuGen):F3} cacheSaveMs={Ms(tCacheSave):F3}");
+                Console.WriteLine($"timing.mixTotalMs={Ms(tMixTotal):F3} prefetchMs={Ms(tMixPrefetch):F3} createGalaxyMs={Ms(tMixCreateGalaxy):F3} veinBatchMs={Ms(tMixVeinBatch):F3} compareMs={Ms(tMixCompare):F3} detailMs={Ms(tMixDetail):F3}");
+                Console.WriteLine($"timing.cudaGalaxy.singleCalls={cudaGalaxyPerf.singleCalls} singleMs={cudaGalaxyPerf.singleMs:F3} batchCalls={cudaGalaxyPerf.batchCalls} batchSeeds={cudaGalaxyPerf.batchSeeds} batchMs={cudaGalaxyPerf.batchMs:F3} fail={cudaGalaxyPerf.failCalls}");
+                Console.WriteLine($"timing.cudaPlanet.coreReq={cudaPlanetPerf.coreReqCount} coreReqWaitMs={cudaPlanetPerf.coreReqWaitMs:F3} coreBatchCalls={cudaPlanetPerf.coreBatchCalls} coreBatchItems={cudaPlanetPerf.coreBatchItems} coreBatchMs={cudaPlanetPerf.coreBatchMs:F3} coreSingleCalls={cudaPlanetPerf.coreSingleCalls} coreSingleMs={cudaPlanetPerf.coreSingleMs:F3}");
+                Console.WriteLine($"timing.cudaPlanet.veinBatchCalls={cudaPlanetPerf.veinBatchCalls} veinBatchPlanets={cudaPlanetPerf.veinBatchPlanets} veinBatchMs={cudaPlanetPerf.veinBatchMs:F3} fail={cudaPlanetPerf.veinBatchFailCalls}");
+            }
         }
 
         private static string ExtractKind(string diff)
