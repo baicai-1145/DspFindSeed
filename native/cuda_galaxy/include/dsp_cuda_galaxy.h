@@ -122,6 +122,27 @@ int dsp_cuda_planet_eval_core_f32(
     int device_id,
     dsp_planet_core_f32_out_t* out_result);
 
+int dsp_cuda_planet_eval_core_f32_batch(
+    const int* info_seeds,
+    const int* orbit_arounds,
+    const int* orbit_indexes,
+    const int* gas_giants,
+    const int* star_indexes,
+    const int* galaxy_star_counts,
+    const int* galaxy_habitable_counts,
+    const int* boost_inclination_ns,
+    const int* compact_type_cases,
+    const float* star_orbit_scalers,
+    const double* star_masses,
+    const float* star_habitable_radiuses,
+    const float* star_light_balance_radiuses,
+    const float* orbit_around_planet_real_radiuses,
+    const float* orbit_around_planet_orbit_radiuses,
+    const double* orbit_around_planet_orbital_periods,
+    int batch_count,
+    int device_id,
+    dsp_planet_core_f32_out_t* out_results);
+
 int dsp_cuda_planet_eval_gas_details_f32(
     int theme_seed,
     float gas_coef,

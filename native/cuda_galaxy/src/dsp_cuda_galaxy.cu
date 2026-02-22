@@ -420,7 +420,7 @@ constexpr int kSingularityTidal2 = 4;
 constexpr int kSingularityTidal4 = 8;
 constexpr int kSingularityClockwise = 16;
 
-__global__ void EvalPlanetCoreF32Kernel(
+__device__ __forceinline__ void EvalPlanetCoreF32One(
     int info_seed,
     int orbit_around,
     int orbit_index,
@@ -439,7 +439,7 @@ __global__ void EvalPlanetCoreF32Kernel(
     double orbit_around_planet_orbital_period,
     dsp_planet_core_f32_out_t* out_result)
 {
-    if (blockIdx.x != 0 || threadIdx.x != 0 || out_result == nullptr)
+    if (out_result == nullptr)
         return;
 
     DotNet35RandomDevice rng(info_seed);
@@ -666,6 +666,92 @@ __global__ void EvalPlanetCoreF32Kernel(
     out_result->habitable_count_delta = habitable_count_delta;
     out_result->precision = precision;
     out_result->segment = segment;
+}
+
+__global__ void EvalPlanetCoreF32Kernel(
+    int info_seed,
+    int orbit_around,
+    int orbit_index,
+    int gas_giant,
+    int star_index,
+    int galaxy_star_count,
+    int galaxy_habitable_count,
+    int boost_inclination_ns,
+    int compact_type_case,
+    float star_orbit_scaler,
+    double star_mass,
+    float star_habitable_radius,
+    float star_light_balance_radius,
+    float orbit_around_planet_real_radius,
+    float orbit_around_planet_orbit_radius,
+    double orbit_around_planet_orbital_period,
+    dsp_planet_core_f32_out_t* out_result)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0 || out_result == nullptr)
+        return;
+
+    EvalPlanetCoreF32One(
+        info_seed,
+        orbit_around,
+        orbit_index,
+        gas_giant,
+        star_index,
+        galaxy_star_count,
+        galaxy_habitable_count,
+        boost_inclination_ns,
+        compact_type_case,
+        star_orbit_scaler,
+        star_mass,
+        star_habitable_radius,
+        star_light_balance_radius,
+        orbit_around_planet_real_radius,
+        orbit_around_planet_orbit_radius,
+        orbit_around_planet_orbital_period,
+        out_result);
+}
+
+__global__ void EvalPlanetCoreF32BatchKernel(
+    const int* info_seeds,
+    const int* orbit_arounds,
+    const int* orbit_indexes,
+    const int* gas_giants,
+    const int* star_indexes,
+    const int* galaxy_star_counts,
+    const int* galaxy_habitable_counts,
+    const int* boost_inclination_ns,
+    const int* compact_type_cases,
+    const float* star_orbit_scalers,
+    const double* star_masses,
+    const float* star_habitable_radiuses,
+    const float* star_light_balance_radiuses,
+    const float* orbit_around_planet_real_radiuses,
+    const float* orbit_around_planet_orbit_radiuses,
+    const double* orbit_around_planet_orbital_periods,
+    int batch_count,
+    dsp_planet_core_f32_out_t* out_results)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < 0 || idx >= batch_count || out_results == nullptr)
+        return;
+
+    EvalPlanetCoreF32One(
+        info_seeds[idx],
+        orbit_arounds[idx],
+        orbit_indexes[idx],
+        gas_giants[idx],
+        star_indexes[idx],
+        galaxy_star_counts[idx],
+        galaxy_habitable_counts[idx],
+        boost_inclination_ns[idx],
+        compact_type_cases[idx],
+        star_orbit_scalers[idx],
+        star_masses[idx],
+        star_habitable_radiuses[idx],
+        star_light_balance_radiuses[idx],
+        orbit_around_planet_real_radiuses[idx],
+        orbit_around_planet_orbit_radiuses[idx],
+        orbit_around_planet_orbital_periods[idx],
+        out_results + idx);
 }
 
 __global__ void EvalPlanetGasDetailsF32Kernel(
@@ -1237,6 +1323,242 @@ extern "C" int dsp_cuda_planet_eval_core_f32(
         rc = cudaMemcpy(out_result, d_out, sizeof(dsp_planet_core_f32_out_t), cudaMemcpyDeviceToHost);
 
     cudaFree(d_out);
+
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_planet_eval_core_f32_batch(
+    const int* info_seeds,
+    const int* orbit_arounds,
+    const int* orbit_indexes,
+    const int* gas_giants,
+    const int* star_indexes,
+    const int* galaxy_star_counts,
+    const int* galaxy_habitable_counts,
+    const int* boost_inclination_ns,
+    const int* compact_type_cases,
+    const float* star_orbit_scalers,
+    const double* star_masses,
+    const float* star_habitable_radiuses,
+    const float* star_light_balance_radiuses,
+    const float* orbit_around_planet_real_radiuses,
+    const float* orbit_around_planet_orbit_radiuses,
+    const double* orbit_around_planet_orbital_periods,
+    int batch_count,
+    int device_id,
+    dsp_planet_core_f32_out_t* out_results)
+{
+    if (info_seeds == nullptr || orbit_arounds == nullptr || orbit_indexes == nullptr || gas_giants == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (star_indexes == nullptr || galaxy_star_counts == nullptr || galaxy_habitable_counts == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (boost_inclination_ns == nullptr || compact_type_cases == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (star_orbit_scalers == nullptr || star_masses == nullptr || star_habitable_radiuses == nullptr || star_light_balance_radiuses == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (orbit_around_planet_real_radiuses == nullptr || orbit_around_planet_orbit_radiuses == nullptr || orbit_around_planet_orbital_periods == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (out_results == nullptr || batch_count <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+            return DSP_CUDA_ERR_CUDA;
+    }
+
+    const size_t n = static_cast<size_t>(batch_count);
+    const size_t ints_bytes = n * sizeof(int);
+    const size_t floats_bytes = n * sizeof(float);
+    const size_t doubles_bytes = n * sizeof(double);
+    const size_t out_bytes = n * sizeof(dsp_planet_core_f32_out_t);
+
+    int* d_info_seeds = nullptr;
+    int* d_orbit_arounds = nullptr;
+    int* d_orbit_indexes = nullptr;
+    int* d_gas_giants = nullptr;
+    int* d_star_indexes = nullptr;
+    int* d_galaxy_star_counts = nullptr;
+    int* d_galaxy_habitable_counts = nullptr;
+    int* d_boost_inclination_ns = nullptr;
+    int* d_compact_type_cases = nullptr;
+    float* d_star_orbit_scalers = nullptr;
+    double* d_star_masses = nullptr;
+    float* d_star_habitable_radiuses = nullptr;
+    float* d_star_light_balance_radiuses = nullptr;
+    float* d_orbit_around_planet_real_radiuses = nullptr;
+    float* d_orbit_around_planet_orbit_radiuses = nullptr;
+    double* d_orbit_around_planet_orbital_periods = nullptr;
+    dsp_planet_core_f32_out_t* d_out_results = nullptr;
+
+    auto fail = [&]() {
+        cudaFree(d_out_results);
+        cudaFree(d_orbit_around_planet_orbital_periods);
+        cudaFree(d_orbit_around_planet_orbit_radiuses);
+        cudaFree(d_orbit_around_planet_real_radiuses);
+        cudaFree(d_star_light_balance_radiuses);
+        cudaFree(d_star_habitable_radiuses);
+        cudaFree(d_star_masses);
+        cudaFree(d_star_orbit_scalers);
+        cudaFree(d_compact_type_cases);
+        cudaFree(d_boost_inclination_ns);
+        cudaFree(d_galaxy_habitable_counts);
+        cudaFree(d_galaxy_star_counts);
+        cudaFree(d_star_indexes);
+        cudaFree(d_gas_giants);
+        cudaFree(d_orbit_indexes);
+        cudaFree(d_orbit_arounds);
+        cudaFree(d_info_seeds);
+        return DSP_CUDA_ERR_CUDA;
+    };
+
+    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_info_seeds), ints_bytes);
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_orbit_arounds), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_orbit_indexes), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_gas_giants), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_star_indexes), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_galaxy_star_counts), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_galaxy_habitable_counts), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_boost_inclination_ns), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_compact_type_cases), ints_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_star_orbit_scalers), floats_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_star_masses), doubles_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_star_habitable_radiuses), floats_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_star_light_balance_radiuses), floats_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_orbit_around_planet_real_radiuses), floats_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_orbit_around_planet_orbit_radiuses), floats_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_orbit_around_planet_orbital_periods), doubles_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_out_results), out_bytes);
+    if (rc != cudaSuccess)
+        return fail();
+
+    rc = cudaMemcpy(d_info_seeds, info_seeds, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_orbit_arounds, orbit_arounds, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_orbit_indexes, orbit_indexes, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_gas_giants, gas_giants, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_star_indexes, star_indexes, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_galaxy_star_counts, galaxy_star_counts, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_galaxy_habitable_counts, galaxy_habitable_counts, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_boost_inclination_ns, boost_inclination_ns, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_compact_type_cases, compact_type_cases, ints_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_star_orbit_scalers, star_orbit_scalers, floats_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_star_masses, star_masses, doubles_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_star_habitable_radiuses, star_habitable_radiuses, floats_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_star_light_balance_radiuses, star_light_balance_radiuses, floats_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_orbit_around_planet_real_radiuses, orbit_around_planet_real_radiuses, floats_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_orbit_around_planet_orbit_radiuses, orbit_around_planet_orbit_radiuses, floats_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+    rc = cudaMemcpy(d_orbit_around_planet_orbital_periods, orbit_around_planet_orbital_periods, doubles_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+        return fail();
+
+    int block_size = 128;
+    int grid_size = (batch_count + block_size - 1) / block_size;
+    EvalPlanetCoreF32BatchKernel<<<grid_size, block_size>>>(
+        d_info_seeds,
+        d_orbit_arounds,
+        d_orbit_indexes,
+        d_gas_giants,
+        d_star_indexes,
+        d_galaxy_star_counts,
+        d_galaxy_habitable_counts,
+        d_boost_inclination_ns,
+        d_compact_type_cases,
+        d_star_orbit_scalers,
+        d_star_masses,
+        d_star_habitable_radiuses,
+        d_star_light_balance_radiuses,
+        d_orbit_around_planet_real_radiuses,
+        d_orbit_around_planet_orbit_radiuses,
+        d_orbit_around_planet_orbital_periods,
+        batch_count,
+        d_out_results);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_results, d_out_results, out_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_out_results);
+    cudaFree(d_orbit_around_planet_orbital_periods);
+    cudaFree(d_orbit_around_planet_orbit_radiuses);
+    cudaFree(d_orbit_around_planet_real_radiuses);
+    cudaFree(d_star_light_balance_radiuses);
+    cudaFree(d_star_habitable_radiuses);
+    cudaFree(d_star_masses);
+    cudaFree(d_star_orbit_scalers);
+    cudaFree(d_compact_type_cases);
+    cudaFree(d_boost_inclination_ns);
+    cudaFree(d_galaxy_habitable_counts);
+    cudaFree(d_galaxy_star_counts);
+    cudaFree(d_star_indexes);
+    cudaFree(d_gas_giants);
+    cudaFree(d_orbit_indexes);
+    cudaFree(d_orbit_arounds);
+    cudaFree(d_info_seeds);
 
     if (rc != cudaSuccess)
         return DSP_CUDA_ERR_CUDA;

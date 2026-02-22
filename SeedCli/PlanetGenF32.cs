@@ -15,7 +15,7 @@ namespace SeedCli
         // 复用原工程的 gasCoef（由 UniverseGen 按资源倍率设置）
         private static float GasCoef => global::DspFindSeed.PlanetGen.gasCoef;
 
-        private static List<int> _tmpTheme;
+        [ThreadStatic] private static List<int> _tmpTheme;
 
         public static PlanetData CreatePlanet(
             GalaxyData galaxy,
@@ -317,7 +317,12 @@ namespace SeedCli
                 }
                 else
                 {
-                    bool tempOk = (themeProto.Temperature * planet.temperatureBias) >= -0.1f;
+                    // 窄修复：温度门槛处于 -0.1 附近时，FP32 量化会引发主题翻转。
+                    // 这里改为 double 判定并加入极小 deadband，仅影响边界样本。
+                    const double tempGate = -0.10000000149011612;
+                    const double tempGateEps = 2e-8;
+                    double tempProd = (double)themeProto.Temperature * (double)planet.temperatureBias;
+                    bool tempOk = tempProd >= (tempGate + tempGateEps);
                     if (Mathf.Abs(themeProto.Temperature) < 0.5f && themeProto.PlanetType == EPlanetType.Desert)
                         tempOk = Mathf.Abs(planet.temperatureBias) < Mathf.Abs(themeProto.Temperature) + 0.1f;
 

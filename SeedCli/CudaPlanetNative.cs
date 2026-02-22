@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace SeedCli
 {
@@ -23,6 +25,11 @@ namespace SeedCli
         private static bool _nativeBroken;
         private static string _nativeBrokenReason;
         private static bool _printedFallback;
+        private static bool _coreBatchEntryMissing;
+        private static bool _coreBatchFallbackPrinted;
+        private static readonly ConcurrentQueue<PlanetCoreBatchRequest> _coreBatchQueue = new ConcurrentQueue<PlanetCoreBatchRequest>();
+        private static readonly AutoResetEvent _coreBatchWake = new AutoResetEvent(false);
+        private static int _coreBatchWorkerStarted;
 
         [ThreadStatic] private static int[] _planetSeeds;
         [ThreadStatic] private static float[] _pValues;
@@ -62,6 +69,29 @@ namespace SeedCli
             public int habitable_count_delta;
             public int precision;
             public int segment;
+        }
+
+        private sealed class PlanetCoreBatchRequest
+        {
+            public int infoSeed;
+            public int orbitAround;
+            public int orbitIndex;
+            public int gasGiant;
+            public int starIndex;
+            public int galaxyStarCount;
+            public int galaxyHabitableCount;
+            public int boostInclinationNs;
+            public int compactTypeCase;
+            public float starOrbitScaler;
+            public double starMass;
+            public float starHabitableRadius;
+            public float starLightBalanceRadius;
+            public float orbitAroundPlanetRealRadius;
+            public float orbitAroundPlanetOrbitRadius;
+            public double orbitAroundPlanetOrbitalPeriod;
+            public PlanetCoreF32Out core;
+            public bool success;
+            public ManualResetEventSlim done = new ManualResetEventSlim(false);
         }
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_refresh_planet_vein_spots_batch")]
@@ -104,6 +134,28 @@ namespace SeedCli
             double orbitAroundPlanetOrbitalPeriod,
             int deviceId,
             out PlanetCoreF32Out outResult);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_planet_eval_core_f32_batch")]
+        private static extern int NativePlanetEvalCoreF32Batch(
+            [In] int[] infoSeeds,
+            [In] int[] orbitArounds,
+            [In] int[] orbitIndexes,
+            [In] int[] gasGiants,
+            [In] int[] starIndexes,
+            [In] int[] galaxyStarCounts,
+            [In] int[] galaxyHabitableCounts,
+            [In] int[] boostInclinationNs,
+            [In] int[] compactTypeCases,
+            [In] float[] starOrbitScalers,
+            [In] double[] starMasses,
+            [In] float[] starHabitableRadii,
+            [In] float[] starLightBalanceRadii,
+            [In] float[] orbitAroundPlanetRealRadii,
+            [In] float[] orbitAroundPlanetOrbitRadii,
+            [In] double[] orbitAroundPlanetOrbitalPeriods,
+            int batchCount,
+            int deviceId,
+            [Out] PlanetCoreF32Out[] outResults);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_planet_eval_gas_details_f32")]
         private static extern int NativePlanetEvalGasDetailsF32(
@@ -279,27 +331,229 @@ namespace SeedCli
             float aroundOrbitRadius = orbitAroundPlanet != null ? orbitAroundPlanet.orbitRadius : 0f;
             double aroundOrbitalPeriod = orbitAroundPlanet != null ? orbitAroundPlanet.orbitalPeriod : 0.0;
 
+            var req = new PlanetCoreBatchRequest
+            {
+                infoSeed = infoSeed,
+                orbitAround = orbitAround,
+                orbitIndex = orbitIndex,
+                gasGiant = gasGiant ? 1 : 0,
+                starIndex = star.index,
+                galaxyStarCount = star.galaxy.starCount,
+                galaxyHabitableCount = galaxyHabitableCount,
+                boostInclinationNs = boostInclinationNs,
+                compactTypeCase = compactTypeCase,
+                starOrbitScaler = star.orbitScaler,
+                starMass = star.mass,
+                starHabitableRadius = star.habitableRadius,
+                starLightBalanceRadius = star.lightBalanceRadius,
+                orbitAroundPlanetRealRadius = aroundRealRadius,
+                orbitAroundPlanetOrbitRadius = aroundOrbitRadius,
+                orbitAroundPlanetOrbitalPeriod = aroundOrbitalPeriod
+            };
+
+            if (TryEvalPlanetCoreF32Batched(req, out core))
+                return true;
+
+            return TryEvalPlanetCoreF32Single(req, out core);
+        }
+
+        private static bool TryEvalPlanetCoreF32Batched(PlanetCoreBatchRequest req, out PlanetCoreF32Out core)
+        {
+            core = default;
+            if (_coreBatchEntryMissing || _nativeBroken)
+                return false;
+
+            EnsureCoreBatchWorker();
+            _coreBatchQueue.Enqueue(req);
+            _coreBatchWake.Set();
+
+            // 保守等待，避免 worker 异常导致调用方永久阻塞。
+            if (!req.done.Wait(30000))
+                return false;
+            if (!req.success)
+                return false;
+            core = req.core;
+            return true;
+        }
+
+        private static void EnsureCoreBatchWorker()
+        {
+            if (Interlocked.CompareExchange(ref _coreBatchWorkerStarted, 1, 0) != 0)
+                return;
+
+            var t = new Thread(CoreBatchWorkerLoop)
+            {
+                IsBackground = true,
+                Name = "CudaPlanetCoreBatchWorker"
+            };
+            t.Start();
+        }
+
+        private static void CoreBatchWorkerLoop()
+        {
+            var batch = new List<PlanetCoreBatchRequest>(GetCoreBatchMaxSize());
+            while (true)
+            {
+                batch.Clear();
+                if (!_coreBatchQueue.TryDequeue(out var first))
+                {
+                    _coreBatchWake.WaitOne();
+                    if (!_coreBatchQueue.TryDequeue(out first))
+                        continue;
+                }
+
+                batch.Add(first);
+                while (_coreBatchQueue.TryDequeue(out var req))
+                {
+                    batch.Add(req);
+                    if (batch.Count >= GetCoreBatchMaxSize())
+                        break;
+                }
+
+                bool ok = TryEvalPlanetCoreF32BatchInternal(batch);
+                if (!ok)
+                {
+                    for (int i = 0; i < batch.Count; ++i)
+                    {
+                        var r = batch[i];
+                        r.success = TryEvalPlanetCoreF32Single(r, out r.core);
+                    }
+                }
+
+                for (int i = 0; i < batch.Count; ++i)
+                    batch[i].done.Set();
+            }
+        }
+
+        private static bool TryEvalPlanetCoreF32BatchInternal(List<PlanetCoreBatchRequest> batch)
+        {
+            if (batch == null || batch.Count == 0)
+                return false;
+            if (_coreBatchEntryMissing || _nativeBroken)
+                return false;
+
+            int n = batch.Count;
+            var infoSeeds = new int[n];
+            var orbitArounds = new int[n];
+            var orbitIndexes = new int[n];
+            var gasGiants = new int[n];
+            var starIndexes = new int[n];
+            var galaxyStarCounts = new int[n];
+            var galaxyHabitableCounts = new int[n];
+            var boostInclinationNs = new int[n];
+            var compactTypeCases = new int[n];
+            var starOrbitScalers = new float[n];
+            var starMasses = new double[n];
+            var starHabitableRadii = new float[n];
+            var starLightBalanceRadii = new float[n];
+            var aroundRealRadii = new float[n];
+            var aroundOrbitRadii = new float[n];
+            var aroundOrbitalPeriods = new double[n];
+            var outResults = new PlanetCoreF32Out[n];
+
+            for (int i = 0; i < n; ++i)
+            {
+                var r = batch[i];
+                infoSeeds[i] = r.infoSeed;
+                orbitArounds[i] = r.orbitAround;
+                orbitIndexes[i] = r.orbitIndex;
+                gasGiants[i] = r.gasGiant;
+                starIndexes[i] = r.starIndex;
+                galaxyStarCounts[i] = r.galaxyStarCount;
+                galaxyHabitableCounts[i] = r.galaxyHabitableCount;
+                boostInclinationNs[i] = r.boostInclinationNs;
+                compactTypeCases[i] = r.compactTypeCase;
+                starOrbitScalers[i] = r.starOrbitScaler;
+                starMasses[i] = r.starMass;
+                starHabitableRadii[i] = r.starHabitableRadius;
+                starLightBalanceRadii[i] = r.starLightBalanceRadius;
+                aroundRealRadii[i] = r.orbitAroundPlanetRealRadius;
+                aroundOrbitRadii[i] = r.orbitAroundPlanetOrbitRadius;
+                aroundOrbitalPeriods[i] = r.orbitAroundPlanetOrbitalPeriod;
+            }
+
+            int deviceId = GetDeviceIdFromEnv();
+            int rc;
+            try
+            {
+                rc = NativePlanetEvalCoreF32Batch(
+                    infoSeeds,
+                    orbitArounds,
+                    orbitIndexes,
+                    gasGiants,
+                    starIndexes,
+                    galaxyStarCounts,
+                    galaxyHabitableCounts,
+                    boostInclinationNs,
+                    compactTypeCases,
+                    starOrbitScalers,
+                    starMasses,
+                    starHabitableRadii,
+                    starLightBalanceRadii,
+                    aroundRealRadii,
+                    aroundOrbitRadii,
+                    aroundOrbitalPeriods,
+                    n,
+                    deviceId,
+                    outResults);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _coreBatchEntryMissing = true;
+                if (!_coreBatchFallbackPrinted)
+                {
+                    _coreBatchFallbackPrinted = true;
+                    Console.WriteLine("[cuda-planet] planet-core batch entry not found, fallback to single.");
+                }
+                return false;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
+                return false;
+            }
+
+            if (rc != Ok)
+            {
+                MarkNativeBroken("planet-core-batch native return code=" + rc);
+                return false;
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                batch[i].core = outResults[i];
+                batch[i].success = true;
+            }
+            return true;
+        }
+
+        private static bool TryEvalPlanetCoreF32Single(PlanetCoreBatchRequest req, out PlanetCoreF32Out core)
+        {
+            core = default;
+            if (_nativeBroken)
+                return false;
+
             int deviceId = GetDeviceIdFromEnv();
             int rc;
             try
             {
                 rc = NativePlanetEvalCoreF32(
-                    infoSeed,
-                    orbitAround,
-                    orbitIndex,
-                    gasGiant ? 1 : 0,
-                    star.index,
-                    star.galaxy.starCount,
-                    galaxyHabitableCount,
-                    boostInclinationNs,
-                    compactTypeCase,
-                    star.orbitScaler,
-                    star.mass,
-                    star.habitableRadius,
-                    star.lightBalanceRadius,
-                    aroundRealRadius,
-                    aroundOrbitRadius,
-                    aroundOrbitalPeriod,
+                    req.infoSeed,
+                    req.orbitAround,
+                    req.orbitIndex,
+                    req.gasGiant,
+                    req.starIndex,
+                    req.galaxyStarCount,
+                    req.galaxyHabitableCount,
+                    req.boostInclinationNs,
+                    req.compactTypeCase,
+                    req.starOrbitScaler,
+                    req.starMass,
+                    req.starHabitableRadius,
+                    req.starLightBalanceRadius,
+                    req.orbitAroundPlanetRealRadius,
+                    req.orbitAroundPlanetOrbitRadius,
+                    req.orbitAroundPlanetOrbitalPeriod,
                     deviceId,
                     out core);
             }
@@ -314,8 +568,22 @@ namespace SeedCli
                 MarkNativeBroken("planet-core native return code=" + rc);
                 return false;
             }
-
             return true;
+        }
+
+        private static int GetCoreBatchMaxSize()
+        {
+            const int defaultSize = 2048;
+            var env = Environment.GetEnvironmentVariable("DSP_CUDA_PLANET_CORE_BATCH_MAX");
+            if (string.IsNullOrEmpty(env))
+                return defaultSize;
+            if (!int.TryParse(env, out var parsed))
+                return defaultSize;
+            if (parsed < 8)
+                return 8;
+            if (parsed > 16384)
+                return 16384;
+            return parsed;
         }
 
         public static bool TryEvalPlanetGasDetailsF32(

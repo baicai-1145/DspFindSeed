@@ -27,7 +27,7 @@ public static class StarGen
   };
   public static float specifyBirthStarMass = 0.0f;
   public static float specifyBirthStarAge = 0.0f;
-  private static double[] pGas = new double[10];
+  [ThreadStatic] private static double[] pGas;
   private const double PI = 3.14159265358979;
 
   public static StarData CreateStar(
@@ -376,6 +376,8 @@ public static class StarGen
     }
     else
     {
+      if (StarGen.pGas == null)
+        StarGen.pGas = new double[10];
       Array.Clear((Array) StarGen.pGas, 0, StarGen.pGas.Length);
       if (star.index == 0)
       {

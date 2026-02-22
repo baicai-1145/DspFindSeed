@@ -12,12 +12,20 @@ namespace SeedCli
     /// </summary>
     internal static class UniverseGenF32
     {
-        private static readonly List<VectorLF3> _tmpPoses = new List<VectorLF3>();
-        private static readonly List<VectorLF3> _tmpDrunk = new List<VectorLF3>();
+        [ThreadStatic] private static List<VectorLF3> _tmpPoses;
+        [ThreadStatic] private static List<VectorLF3> _tmpDrunk;
         private static bool _printedCudaPoseDiff;
         private static bool _printedCudaRngDiff;
         private static bool _printedCudaRngStateDiff;
-        private static Dictionary<int, Queue<List<VectorLF3>>> _prefetchedPosesBySeed;
+        [ThreadStatic] private static Dictionary<int, Queue<List<VectorLF3>>> _prefetchedPosesBySeed;
+        private static readonly object _prefetchedPosesSharedLock = new object();
+        private static Dictionary<int, Queue<List<VectorLF3>>> _prefetchedPosesBySeedShared;
+
+        private static void EnsureThreadBuffers()
+        {
+            if (_tmpPoses == null) _tmpPoses = new List<VectorLF3>();
+            if (_tmpDrunk == null) _tmpDrunk = new List<VectorLF3>();
+        }
 
         public static GalaxyData CreateGalaxy(DspFindSeed.GameDesc gameDesc)
         {
@@ -539,6 +547,7 @@ namespace SeedCli
             bool collisionFp64,
             List<VectorLF3> outPoses)
         {
+            EnsureThreadBuffers();
             var rng = new DotNet35Random(galaxySeed);
             int tempPoses = GenerateTempPoses_ParamsFp64_CpuCore(
                 rng.Next(),
@@ -561,6 +570,7 @@ namespace SeedCli
 
         public static bool PrecomputeTempPosesParamsFp64Batch(IList<int> galaxySeeds, int starCount, bool collisionFp64)
         {
+            EnsureThreadBuffers();
             ClearPrefetchedTempPosesParamsFp64();
 
             if (galaxySeeds == null || galaxySeeds.Count <= 0)
@@ -618,12 +628,20 @@ namespace SeedCli
             }
 
             _prefetchedPosesBySeed = map;
+            lock (_prefetchedPosesSharedLock)
+            {
+                _prefetchedPosesBySeedShared = map;
+            }
             return true;
         }
 
         public static void ClearPrefetchedTempPosesParamsFp64()
         {
             _prefetchedPosesBySeed = null;
+            lock (_prefetchedPosesSharedLock)
+            {
+                _prefetchedPosesBySeedShared = null;
+            }
         }
 
         private static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(DspFindSeed.GameDesc gameDesc, bool collisionFp64)
@@ -745,6 +763,7 @@ namespace SeedCli
             bool collisionFp64,
             bool randFp64)
         {
+            EnsureThreadBuffers();
             _tmpPoses.Clear();
             _tmpDrunk.Clear();
             if (iterCount < 1) iterCount = 1;
@@ -771,6 +790,7 @@ namespace SeedCli
             double flatten,
             bool collisionFp64)
         {
+            EnsureThreadBuffers();
             _tmpPoses.Clear();
             _tmpDrunk.Clear();
             if (iterCount < 1) iterCount = 1;
@@ -823,15 +843,29 @@ namespace SeedCli
         private static bool TryTakePrefetchedTempPoses(int poseSeed, out List<VectorLF3> poses)
         {
             poses = null;
-            if (_prefetchedPosesBySeed == null)
-                return false;
-            if (!_prefetchedPosesBySeed.TryGetValue(poseSeed, out var q) || q == null || q.Count <= 0)
-                return false;
+            if (_prefetchedPosesBySeed != null &&
+                _prefetchedPosesBySeed.TryGetValue(poseSeed, out var qLocal) &&
+                qLocal != null &&
+                qLocal.Count > 0)
+            {
+                poses = qLocal.Dequeue();
+                if (qLocal.Count == 0)
+                    _prefetchedPosesBySeed.Remove(poseSeed);
+                return poses != null;
+            }
 
-            poses = q.Dequeue();
-            if (q.Count == 0)
-                _prefetchedPosesBySeed.Remove(poseSeed);
-            return poses != null;
+            lock (_prefetchedPosesSharedLock)
+            {
+                if (_prefetchedPosesBySeedShared == null)
+                    return false;
+                if (!_prefetchedPosesBySeedShared.TryGetValue(poseSeed, out var qShared) || qShared == null || qShared.Count <= 0)
+                    return false;
+
+                poses = qShared.Dequeue();
+                if (qShared.Count == 0)
+                    _prefetchedPosesBySeedShared.Remove(poseSeed);
+                return poses != null;
+            }
         }
 
         private static List<VectorLF3> TrimPrefetchedPoses(
@@ -876,6 +910,7 @@ namespace SeedCli
             double flatten,
             bool collisionFp64)
         {
+            EnsureThreadBuffers();
             _tmpPoses.Clear();
             _tmpDrunk.Clear();
             if (iterCount < 1) iterCount = 1;
