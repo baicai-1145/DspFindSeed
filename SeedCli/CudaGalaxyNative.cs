@@ -10,6 +10,10 @@ namespace SeedCli
     {
         private const string LibName = "dsp_cuda_galaxy";
         private const int Ok = 0;
+        private const int MaxVeinSpotLen = 16;
+        private const int MaxRareVeins = 8;
+        private const int RareSettingsGroup = 4;
+        private const int MaxOutVeinLen = 32;
 
         private static bool _enabledByCli;
         private static bool _nativeBroken;
@@ -17,7 +21,12 @@ namespace SeedCli
         private static bool _printedFallback;
         private static bool _printedForceColl64;
         private static bool _mixSigEntryMissing;
+        private static bool _mixSeedSigEntryMissing;
+        private static readonly object _mixThemeLock = new object();
+        private static global::DspFindSeed.ThemeProto[] _mixThemeProtoArrayRef;
+        private static MixThemeFlatData _mixThemeCache;
         [ThreadStatic] private static NativeVec3d[] _singlePoseScratch;
+        [ThreadStatic] private static int[] _mixSeedSigSeeds;
         [ThreadStatic] private static int[] _mixSigSeedStarOffsets;
         [ThreadStatic] private static int[] _mixSigSeedPlanetOffsets;
         [ThreadStatic] private static int[] _mixSigGalaxyStarCounts;
@@ -50,6 +59,10 @@ namespace SeedCli
         private static long _perfBatchTicks;
         private static long _perfBatchSeeds;
         private static long _perfFailCalls;
+        private static long _perfMixSeedSigCalls;
+        private static long _perfMixSeedSigTicks;
+        private static long _perfMixSeedSigSeeds;
+        private static long _perfMixSeedSigFailCalls;
 
         internal struct PerfStats
         {
@@ -59,6 +72,26 @@ namespace SeedCli
             public double batchMs;
             public long batchSeeds;
             public long failCalls;
+            public long mixSeedSigCalls;
+            public double mixSeedSigMs;
+            public long mixSeedSigSeeds;
+            public long mixSeedSigFailCalls;
+        }
+
+        private sealed class MixThemeFlatData
+        {
+            public int count;
+            public int[] ids;
+            public int[] planetTypes;
+            public float[] temperatures;
+            public int[] distributes;
+            public int[] waterItemIds;
+            public int[] veinOffsets;
+            public int[] veinValues;
+            public int[] rareOffsets;
+            public int[] rareValues;
+            public int[] rareSettingsOffsets;
+            public float[] rareSettingsValues;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -145,6 +178,53 @@ namespace SeedCli
             [Out] ulong[] outVeinSigs,
             [Out] ulong[] outPipelineSigs);
 
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_mix_signatures_from_seeds_f32")]
+        private static extern int NativeMixSignaturesFromSeedsF32(
+            [In] int[] galaxySeeds,
+            int seedCount,
+            int starCount,
+            int collisionFp64,
+            int useFp32ProbCompare,
+            int veinLen,
+            int deviceId,
+            int starTypeMainSeq,
+            int starTypeGiant,
+            int starTypeWhiteDwarf,
+            int starTypeNeutronStar,
+            int starTypeBlackHole,
+            int spectrM,
+            int spectrK,
+            int spectrG,
+            int spectrF,
+            int spectrA,
+            int spectrB,
+            int spectrO,
+            int spectrX,
+            int planetTypeGas,
+            int planetTypeOcean,
+            int planetTypeVocano,
+            int planetTypeDesert,
+            int planetTypeIce,
+            int themeDistributeDefault,
+            int themeDistributeBirth,
+            int themeDistributeInterstellar,
+            [In] int[] themeIds,
+            [In] int[] themePlanetTypes,
+            [In] float[] themeTemperatures,
+            [In] int[] themeDistributes,
+            [In] int[] themeWaterItemIds,
+            [In] int[] themeVeinSpotOffsets,
+            [In] int[] themeVeinSpotValues,
+            [In] int[] themeRareVeinOffsets,
+            [In] int[] themeRareVeinValues,
+            [In] int[] themeRareSettingsOffsets,
+            [In] float[] themeRareSettingsValues,
+            int themeCount,
+            [Out] ulong[] outGalaxySigs,
+            [Out] ulong[] outPlanetSigs,
+            [Out] ulong[] outVeinSigs,
+            [Out] ulong[] outPipelineSigs);
+
         public static void EnableByCli(bool enabled)
         {
             _enabledByCli = enabled;
@@ -185,6 +265,10 @@ namespace SeedCli
             Interlocked.Exchange(ref _perfBatchTicks, 0);
             Interlocked.Exchange(ref _perfBatchSeeds, 0);
             Interlocked.Exchange(ref _perfFailCalls, 0);
+            Interlocked.Exchange(ref _perfMixSeedSigCalls, 0);
+            Interlocked.Exchange(ref _perfMixSeedSigTicks, 0);
+            Interlocked.Exchange(ref _perfMixSeedSigSeeds, 0);
+            Interlocked.Exchange(ref _perfMixSeedSigFailCalls, 0);
         }
 
         public static PerfStats GetPerfStats()
@@ -197,7 +281,11 @@ namespace SeedCli
                 batchCalls = Interlocked.Read(ref _perfBatchCalls),
                 batchMs = Interlocked.Read(ref _perfBatchTicks) * toMs,
                 batchSeeds = Interlocked.Read(ref _perfBatchSeeds),
-                failCalls = Interlocked.Read(ref _perfFailCalls)
+                failCalls = Interlocked.Read(ref _perfFailCalls),
+                mixSeedSigCalls = Interlocked.Read(ref _perfMixSeedSigCalls),
+                mixSeedSigMs = Interlocked.Read(ref _perfMixSeedSigTicks) * toMs,
+                mixSeedSigSeeds = Interlocked.Read(ref _perfMixSeedSigSeeds),
+                mixSeedSigFailCalls = Interlocked.Read(ref _perfMixSeedSigFailCalls)
             };
         }
 
@@ -626,6 +714,222 @@ namespace SeedCli
             outVeinSigs = _mixSigOutVein;
             outPipelineSigs = _mixSigOutPipeline;
             return true;
+        }
+
+        public static bool TryEvalMixSignaturesFromSeedRange(
+            int seedStart,
+            int seedCount,
+            int starCount,
+            bool collisionFp64,
+            bool useFp32ProbCompare,
+            out ulong[] outGalaxySigs,
+            out ulong[] outPlanetSigs,
+            out ulong[] outVeinSigs,
+            out ulong[] outPipelineSigs)
+        {
+            outGalaxySigs = null;
+            outPlanetSigs = null;
+            outVeinSigs = null;
+            outPipelineSigs = null;
+
+            if (!IsEnabled() || _nativeBroken || _mixSeedSigEntryMissing)
+                return false;
+            if (seedCount <= 0 || starCount <= 0)
+                return false;
+
+            if (!TryGetMixThemeFlatData(out var themes))
+                return false;
+
+            int veinLen = global::DspFindSeed.PlanetModelingManager.veinProtos != null
+                ? global::DspFindSeed.PlanetModelingManager.veinProtos.Length
+                : 0;
+            veinLen = Math.Min(veinLen, MaxOutVeinLen);
+            if (veinLen <= 1)
+                return false;
+
+            EnsureIntBuffer(ref _mixSeedSigSeeds, seedCount);
+            for (int i = 0; i < seedCount; ++i)
+                _mixSeedSigSeeds[i] = seedStart + i;
+
+            EnsureUlongBuffer(ref _mixSigOutGalaxy, seedCount);
+            EnsureUlongBuffer(ref _mixSigOutPlanet, seedCount);
+            EnsureUlongBuffer(ref _mixSigOutVein, seedCount);
+            EnsureUlongBuffer(ref _mixSigOutPipeline, seedCount);
+
+            int deviceId = GetDeviceIdFromEnv();
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfMixSeedSigCalls);
+            Interlocked.Add(ref _perfMixSeedSigSeeds, seedCount);
+
+            int rc;
+            try
+            {
+                rc = NativeMixSignaturesFromSeedsF32(
+                    _mixSeedSigSeeds,
+                    seedCount,
+                    starCount,
+                    collisionFp64 ? 1 : 0,
+                    useFp32ProbCompare ? 1 : 0,
+                    veinLen,
+                    deviceId,
+                    (int)EStarType.MainSeqStar,
+                    (int)EStarType.GiantStar,
+                    (int)EStarType.WhiteDwarf,
+                    (int)EStarType.NeutronStar,
+                    (int)EStarType.BlackHole,
+                    (int)ESpectrType.M,
+                    (int)ESpectrType.K,
+                    (int)ESpectrType.G,
+                    (int)ESpectrType.F,
+                    (int)ESpectrType.A,
+                    (int)ESpectrType.B,
+                    (int)ESpectrType.O,
+                    (int)ESpectrType.X,
+                    (int)EPlanetType.Gas,
+                    (int)EPlanetType.Ocean,
+                    (int)EPlanetType.Vocano,
+                    (int)EPlanetType.Desert,
+                    (int)EPlanetType.Ice,
+                    (int)EThemeDistribute.Default,
+                    (int)EThemeDistribute.Birth,
+                    (int)EThemeDistribute.Interstellar,
+                    themes.ids,
+                    themes.planetTypes,
+                    themes.temperatures,
+                    themes.distributes,
+                    themes.waterItemIds,
+                    themes.veinOffsets,
+                    themes.veinValues,
+                    themes.rareOffsets,
+                    themes.rareValues,
+                    themes.rareSettingsOffsets,
+                    themes.rareSettingsValues,
+                    themes.count,
+                    _mixSigOutGalaxy,
+                    _mixSigOutPlanet,
+                    _mixSigOutVein,
+                    _mixSigOutPipeline);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                Interlocked.Add(ref _perfMixSeedSigTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfMixSeedSigFailCalls);
+                _mixSeedSigEntryMissing = true;
+                return false;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                Interlocked.Add(ref _perfMixSeedSigTicks, Stopwatch.GetTimestamp() - t0);
+                Interlocked.Increment(ref _perfMixSeedSigFailCalls);
+                MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
+                return false;
+            }
+
+            Interlocked.Add(ref _perfMixSeedSigTicks, Stopwatch.GetTimestamp() - t0);
+            if (rc != Ok)
+            {
+                Interlocked.Increment(ref _perfMixSeedSigFailCalls);
+                MarkNativeBroken("mix-seed-signature native return code=" + rc);
+                return false;
+            }
+
+            outGalaxySigs = _mixSigOutGalaxy;
+            outPlanetSigs = _mixSigOutPlanet;
+            outVeinSigs = _mixSigOutVein;
+            outPipelineSigs = _mixSigOutPipeline;
+            return true;
+        }
+
+        private static bool TryGetMixThemeFlatData(out MixThemeFlatData cache)
+        {
+            cache = null;
+            var themeSet = global::DspFindSeed.LDB.themes;
+            if (themeSet == null || themeSet.dataArray == null || themeSet.dataArray.Length == 0)
+                return false;
+            var themeArray = themeSet.dataArray;
+
+            lock (_mixThemeLock)
+            {
+                if (_mixThemeCache != null &&
+                    ReferenceEquals(_mixThemeProtoArrayRef, themeArray) &&
+                    _mixThemeCache.count == themeArray.Length)
+                {
+                    cache = _mixThemeCache;
+                    return true;
+                }
+
+                int count = themeArray.Length;
+                var ids = new int[count];
+                var planetTypes = new int[count];
+                var temperatures = new float[count];
+                var distributes = new int[count];
+                var waterItemIds = new int[count];
+                var veinOffsets = new int[count + 1];
+                var rareOffsets = new int[count + 1];
+                var rareSettingsOffsets = new int[count + 1];
+                var veinValues = new List<int>(count * 8);
+                var rareValues = new List<int>(count * 4);
+                var rareSettingsValues = new List<float>(count * 12);
+
+                for (int i = 0; i < count; ++i)
+                {
+                    var theme = themeArray[i];
+                    if (theme == null)
+                        return false;
+
+                    var veinSpot = theme.VeinSpot ?? Array.Empty<int>();
+                    var rareVeins = theme.RareVeins ?? Array.Empty<int>();
+                    var rareSettings = theme.RareSettings ?? Array.Empty<float>();
+                    if (veinSpot.Length > MaxVeinSpotLen)
+                        return false;
+                    if (rareVeins.Length > MaxRareVeins)
+                        return false;
+                    if (rareSettings.Length < rareVeins.Length * RareSettingsGroup)
+                        return false;
+
+                    ids[i] = theme.ID;
+                    planetTypes[i] = (int)theme.PlanetType;
+                    temperatures[i] = theme.Temperature;
+                    distributes[i] = (int)theme.Distribute;
+                    waterItemIds[i] = theme.WaterItemId;
+
+                    veinOffsets[i] = veinValues.Count;
+                    for (int j = 0; j < veinSpot.Length; ++j)
+                        veinValues.Add(veinSpot[j]);
+
+                    rareOffsets[i] = rareValues.Count;
+                    for (int j = 0; j < rareVeins.Length; ++j)
+                        rareValues.Add(rareVeins[j]);
+
+                    rareSettingsOffsets[i] = rareSettingsValues.Count;
+                    int rareSettingsCount = rareVeins.Length * RareSettingsGroup;
+                    for (int j = 0; j < rareSettingsCount; ++j)
+                        rareSettingsValues.Add(rareSettings[j]);
+                }
+
+                veinOffsets[count] = veinValues.Count;
+                rareOffsets[count] = rareValues.Count;
+                rareSettingsOffsets[count] = rareSettingsValues.Count;
+
+                _mixThemeCache = new MixThemeFlatData
+                {
+                    count = count,
+                    ids = ids,
+                    planetTypes = planetTypes,
+                    temperatures = temperatures,
+                    distributes = distributes,
+                    waterItemIds = waterItemIds,
+                    veinOffsets = veinOffsets,
+                    veinValues = veinValues.ToArray(),
+                    rareOffsets = rareOffsets,
+                    rareValues = rareValues.ToArray(),
+                    rareSettingsOffsets = rareSettingsOffsets,
+                    rareSettingsValues = rareSettingsValues.ToArray()
+                };
+                _mixThemeProtoArrayRef = themeArray;
+                cache = _mixThemeCache;
+                return true;
+            }
         }
 
         private static NativeVec3d[] EnsureSinglePoseScratch(int needed)

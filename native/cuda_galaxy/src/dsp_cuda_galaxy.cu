@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 
@@ -1034,6 +1036,134 @@ __global__ void RefreshPlanetVeinSpotsBatchKernel(
         }
     }
 }
+
+__global__ void RefreshPlanetVeinSpotsByThemeBatchKernel(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* theme_indexes,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    const int* theme_vein_spot_offsets,
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets,
+    const float* theme_rare_settings_values,
+    int theme_count,
+    int* out_counts)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= planet_count)
+        return;
+
+    int* out_seg = out_counts + static_cast<long long>(idx) * out_vein_len;
+    for (int i = 0; i < out_vein_len; ++i)
+        out_seg[i] = 0;
+
+    int theme_idx = theme_indexes[idx];
+    if (theme_idx < 0 || theme_idx >= theme_count)
+        return;
+
+    int vein_begin = theme_vein_spot_offsets[theme_idx];
+    int vein_end = theme_vein_spot_offsets[theme_idx + 1];
+    int vlen = vein_end - vein_begin;
+    if (vlen < 0)
+        vlen = 0;
+    for (int i = 0; i < vlen; ++i)
+    {
+        int out_idx = i + 1;
+        if (out_idx >= 0 && out_idx < out_vein_len)
+            out_seg[out_idx] = theme_vein_spot_values[vein_begin + i];
+    }
+
+    DotNet35RandomDevice rng(planet_seeds[idx]);
+    rng.InternalSample();
+    rng.InternalSample();
+    rng.InternalSample();
+    rng.InternalSample();
+    rng.InternalSample();
+    DotNet35RandomDevice rng2(rng.InternalSample());
+    (void)rng2;
+
+    const bool use_fp32 = use_fp32_prob_compare != 0;
+    const int bonus_case = bonus_cases[idx];
+    if (bonus_case == 1)
+    {
+        if (9 < out_vein_len)
+        {
+            ++out_seg[9];
+            ++out_seg[9];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.449999988079071f, use_fp32); ++i)
+                ++out_seg[9];
+        }
+        if (10 < out_vein_len)
+        {
+            ++out_seg[10];
+            ++out_seg[10];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.449999988079071f, use_fp32); ++i)
+                ++out_seg[10];
+        }
+        if (12 < out_vein_len)
+        {
+            ++out_seg[12];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.5f, use_fp32); ++i)
+                ++out_seg[12];
+        }
+    }
+    else if (bonus_case == 2)
+    {
+        if (14 < out_vein_len)
+        {
+            ++out_seg[14];
+            for (int i = 1; i < 12 && ProbHit(rng, 0.649999976158142f, use_fp32); ++i)
+                ++out_seg[14];
+        }
+    }
+
+    int rare_begin = theme_rare_vein_offsets[theme_idx];
+    int rare_end = theme_rare_vein_offsets[theme_idx + 1];
+    int rare_len = rare_end - rare_begin;
+    if (rare_len < 0)
+        rare_len = 0;
+
+    int settings_begin = theme_rare_settings_offsets[theme_idx];
+    int settings_end = theme_rare_settings_offsets[theme_idx + 1];
+    int settings_len = settings_end - settings_begin;
+    if (settings_len < 0)
+        settings_len = 0;
+
+    const bool is_birth = is_birth_stars[idx] != 0;
+    const float p = p_values[idx];
+    for (int ri = 0; ri < rare_len; ++ri)
+    {
+        int vein_id = theme_rare_vein_values[rare_begin + ri];
+        int local_sbase = ri * 4;
+        float s0 = 0.0f;
+        float s1 = 0.0f;
+        float s2 = 0.0f;
+        if (local_sbase + 0 < settings_len) s0 = theme_rare_settings_values[settings_begin + local_sbase + 0];
+        if (local_sbase + 1 < settings_len) s1 = theme_rare_settings_values[settings_begin + local_sbase + 1];
+        if (local_sbase + 2 < settings_len) s2 = theme_rare_settings_values[settings_begin + local_sbase + 2];
+
+        float appear_base = is_birth ? s0 : s1;
+        float chain_prob = s2;
+        float appear_prob = 1.0f - powf(1.0f - appear_base, p);
+
+        if (ProbHit(rng, appear_prob, use_fp32))
+        {
+            if (vein_id > 0 && vein_id < out_vein_len)
+                ++out_seg[vein_id];
+            for (int i = 1; i < 12 && ProbHit(rng, chain_prob, use_fp32); ++i)
+            {
+                if (vein_id > 0 && vein_id < out_vein_len)
+                    ++out_seg[vein_id];
+            }
+        }
+    }
+}
 } // namespace
 
 extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
@@ -1050,6 +1180,9 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     int out_stride,
     int* out_counts)
 {
+    bool debug_enter = false;
+    if (const char* de = std::getenv("DSP_NATIVE_SIG_DEBUG_ENTER"))
+        debug_enter = std::atoi(de) != 0;
     if (seeds == nullptr || out_poses == nullptr || out_counts == nullptr)
         return DSP_CUDA_ERR_INVALID_ARGUMENT;
     if (seed_count <= 0 || max_count <= 0 || out_stride < max_count)
@@ -1059,7 +1192,11 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     {
         cudaError_t set_device_rc = cudaSetDevice(device_id);
         if (set_device_rc != cudaSuccess)
+        {
+            if (debug_enter)
+                std::fprintf(stderr, "[cuda-galaxy-error] pose_batch cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
             return DSP_CUDA_ERR_CUDA;
+        }
     }
 
     const size_t seeds_bytes = static_cast<size_t>(seed_count) * sizeof(int);
@@ -1081,11 +1218,19 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         &d_poses,
         &d_drunk);
     if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch EnsureBatchBuffers rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
+    }
 
     rc = cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice);
     if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch H2D seeds rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
+    }
 
     int block_size = 128;
     int grid_size = (seed_count + block_size - 1) / block_size;
@@ -1110,7 +1255,11 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         rc = cudaMemcpy(out_poses, d_poses, poses_bytes, cudaMemcpyDeviceToHost);
 
     if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch post-kernel rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
+    }
     return DSP_CUDA_OK;
 }
 
@@ -1404,6 +1553,198 @@ extern "C" int dsp_cuda_refresh_planet_vein_spots_batch(
     cudaFree(d_vein_spot_values);
     cudaFree(d_rare_vein_lens);
     cudaFree(d_vein_spot_lens);
+    cudaFree(d_is_birth_stars);
+    cudaFree(d_bonus_cases);
+    cudaFree(d_p_values);
+    cudaFree(d_planet_seeds);
+
+    if (rc != cudaSuccess)
+        return DSP_CUDA_ERR_CUDA;
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_refresh_planet_vein_spots_by_theme_batch(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* theme_indexes,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int device_id,
+    const int* theme_vein_spot_offsets,
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets,
+    const float* theme_rare_settings_values,
+    int theme_count,
+    int* out_counts)
+{
+    if (planet_seeds == nullptr || p_values == nullptr || bonus_cases == nullptr || is_birth_stars == nullptr || theme_indexes == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (theme_vein_spot_offsets == nullptr ||
+        theme_rare_vein_offsets == nullptr ||
+        theme_rare_settings_offsets == nullptr)
+    {
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    }
+    if (out_counts == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (planet_count <= 0 || out_vein_len <= 0 || theme_count <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    const int theme_vein_total = theme_vein_spot_offsets[theme_count];
+    const int theme_rare_total = theme_rare_vein_offsets[theme_count];
+    const int theme_settings_total = theme_rare_settings_offsets[theme_count];
+    if (theme_vein_total < 0 || theme_rare_total < 0 || theme_settings_total < 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (theme_vein_total > 0 && theme_vein_spot_values == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (theme_rare_total > 0 && theme_rare_vein_values == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (theme_settings_total > 0 && theme_rare_settings_values == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+            return DSP_CUDA_ERR_CUDA;
+    }
+
+    const size_t n = static_cast<size_t>(planet_count);
+    const size_t seeds_bytes = n * sizeof(int);
+    const size_t p_values_bytes = n * sizeof(float);
+    const size_t bonus_bytes = n * sizeof(int);
+    const size_t birth_bytes = n * sizeof(int);
+    const size_t theme_idx_bytes = n * sizeof(int);
+    const size_t out_bytes = n * static_cast<size_t>(out_vein_len) * sizeof(int);
+
+    const size_t theme_offsets_bytes = static_cast<size_t>(theme_count + 1) * sizeof(int);
+    const size_t theme_vein_values_bytes = static_cast<size_t>(theme_vein_total) * sizeof(int);
+    const size_t theme_rare_values_bytes = static_cast<size_t>(theme_rare_total) * sizeof(int);
+    const size_t theme_settings_values_bytes = static_cast<size_t>(theme_settings_total) * sizeof(float);
+
+    int* d_planet_seeds = nullptr;
+    float* d_p_values = nullptr;
+    int* d_bonus_cases = nullptr;
+    int* d_is_birth_stars = nullptr;
+    int* d_theme_indexes = nullptr;
+    int* d_theme_vein_offsets = nullptr;
+    int* d_theme_vein_values = nullptr;
+    int* d_theme_rare_offsets = nullptr;
+    int* d_theme_rare_values = nullptr;
+    int* d_theme_settings_offsets = nullptr;
+    float* d_theme_settings_values = nullptr;
+    int* d_out_counts = nullptr;
+
+    auto fail = [&]() {
+        cudaFree(d_out_counts);
+        cudaFree(d_theme_settings_values);
+        cudaFree(d_theme_settings_offsets);
+        cudaFree(d_theme_rare_values);
+        cudaFree(d_theme_rare_offsets);
+        cudaFree(d_theme_vein_values);
+        cudaFree(d_theme_vein_offsets);
+        cudaFree(d_theme_indexes);
+        cudaFree(d_is_birth_stars);
+        cudaFree(d_bonus_cases);
+        cudaFree(d_p_values);
+        cudaFree(d_planet_seeds);
+        return DSP_CUDA_ERR_CUDA;
+    };
+
+    cudaError_t rc = cudaMalloc(reinterpret_cast<void**>(&d_planet_seeds), seeds_bytes);
+    if (rc != cudaSuccess) return DSP_CUDA_ERR_CUDA;
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_p_values), p_values_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_bonus_cases), bonus_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_is_birth_stars), birth_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_indexes), theme_idx_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_vein_offsets), theme_offsets_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_vein_values), theme_vein_values_bytes > 0 ? theme_vein_values_bytes : sizeof(int));
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_rare_offsets), theme_offsets_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_rare_values), theme_rare_values_bytes > 0 ? theme_rare_values_bytes : sizeof(int));
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_settings_offsets), theme_offsets_bytes);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_theme_settings_values), theme_settings_values_bytes > 0 ? theme_settings_values_bytes : sizeof(float));
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMalloc(reinterpret_cast<void**>(&d_out_counts), out_bytes);
+    if (rc != cudaSuccess) return fail();
+
+    rc = cudaMemcpy(d_planet_seeds, planet_seeds, seeds_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMemcpy(d_p_values, p_values, p_values_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMemcpy(d_bonus_cases, bonus_cases, bonus_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMemcpy(d_is_birth_stars, is_birth_stars, birth_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMemcpy(d_theme_indexes, theme_indexes, theme_idx_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    rc = cudaMemcpy(d_theme_vein_offsets, theme_vein_spot_offsets, theme_offsets_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    if (theme_vein_values_bytes > 0)
+    {
+        rc = cudaMemcpy(d_theme_vein_values, theme_vein_spot_values, theme_vein_values_bytes, cudaMemcpyHostToDevice);
+        if (rc != cudaSuccess) return fail();
+    }
+    rc = cudaMemcpy(d_theme_rare_offsets, theme_rare_vein_offsets, theme_offsets_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    if (theme_rare_values_bytes > 0)
+    {
+        rc = cudaMemcpy(d_theme_rare_values, theme_rare_vein_values, theme_rare_values_bytes, cudaMemcpyHostToDevice);
+        if (rc != cudaSuccess) return fail();
+    }
+    rc = cudaMemcpy(d_theme_settings_offsets, theme_rare_settings_offsets, theme_offsets_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess) return fail();
+    if (theme_settings_values_bytes > 0)
+    {
+        rc = cudaMemcpy(d_theme_settings_values, theme_rare_settings_values, theme_settings_values_bytes, cudaMemcpyHostToDevice);
+        if (rc != cudaSuccess) return fail();
+    }
+
+    int block_size = 128;
+    int grid_size = (planet_count + block_size - 1) / block_size;
+    RefreshPlanetVeinSpotsByThemeBatchKernel<<<grid_size, block_size>>>(
+        d_planet_seeds,
+        d_p_values,
+        d_bonus_cases,
+        d_is_birth_stars,
+        d_theme_indexes,
+        planet_count,
+        out_vein_len,
+        use_fp32_prob_compare,
+        d_theme_vein_offsets,
+        d_theme_vein_values,
+        d_theme_rare_offsets,
+        d_theme_rare_values,
+        d_theme_settings_offsets,
+        d_theme_settings_values,
+        theme_count,
+        d_out_counts);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_counts, d_out_counts, out_bytes, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_out_counts);
+    cudaFree(d_theme_settings_values);
+    cudaFree(d_theme_settings_offsets);
+    cudaFree(d_theme_rare_values);
+    cudaFree(d_theme_rare_offsets);
+    cudaFree(d_theme_vein_values);
+    cudaFree(d_theme_vein_offsets);
+    cudaFree(d_theme_indexes);
     cudaFree(d_is_birth_stars);
     cudaFree(d_bonus_cases);
     cudaFree(d_p_values);
@@ -1763,6 +2104,45 @@ extern "C" int dsp_cuda_mix_chunk_eval_veins_f32(
         out_vein_len,
         use_fp32_prob_compare,
         device_id,
+        out_counts);
+}
+
+extern "C" int dsp_cuda_mix_chunk_eval_veins_by_theme_f32(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* theme_indexes,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int device_id,
+    const int* theme_vein_spot_offsets,
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets,
+    const float* theme_rare_settings_values,
+    int theme_count,
+    int* out_counts)
+{
+    return dsp_cuda_refresh_planet_vein_spots_by_theme_batch(
+        planet_seeds,
+        p_values,
+        bonus_cases,
+        is_birth_stars,
+        theme_indexes,
+        planet_count,
+        out_vein_len,
+        use_fp32_prob_compare,
+        device_id,
+        theme_vein_spot_offsets,
+        theme_vein_spot_values,
+        theme_rare_vein_offsets,
+        theme_rare_vein_values,
+        theme_rare_settings_offsets,
+        theme_rare_settings_values,
+        theme_count,
         out_counts);
 }
 

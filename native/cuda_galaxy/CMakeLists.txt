@@ -12,6 +12,7 @@ endif()
 
 add_library(dsp_cuda_galaxy SHARED
     src/dsp_cuda_galaxy.cu
+    src/dsp_cuda_mix_seed_signatures.cu
 )
 
 target_include_directories(dsp_cuda_galaxy

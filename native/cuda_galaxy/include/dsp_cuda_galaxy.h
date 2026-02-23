@@ -198,6 +198,27 @@ int dsp_cuda_mix_chunk_eval_veins_f32(
     int device_id,
     int* out_counts);
 
+// Variant: theme arrays are passed once and each planet only references theme index.
+// This avoids host-side per-planet expansion of vein/rare settings.
+int dsp_cuda_mix_chunk_eval_veins_by_theme_f32(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* theme_indexes,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int device_id,
+    const int* theme_vein_spot_offsets,
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets,
+    const float* theme_rare_settings_values,
+    int theme_count,
+    int* out_counts);
+
 // Reduce per-seed signatures from flattened chunk data.
 // This entry is host-side deterministic reduction (no RNG) and is used by compare pipeline fast-path.
 int dsp_cuda_mix_chunk_reduce_signatures(
@@ -231,6 +252,55 @@ int dsp_cuda_mix_chunk_reduce_signatures(
     unsigned long long* out_vein_sigs,     // len = seed_count
     unsigned long long* out_pipeline_sigs  // len = seed_count
 );
+
+// Direct seed->signature pipeline entry.
+// This path evaluates stars/planets/themes/veins from seeds and directly returns 4 signatures,
+// so the host can bypass building GalaxyData/StarData/PlanetData object graphs.
+int dsp_cuda_mix_signatures_from_seeds_f32(
+    const int* galaxy_seeds,
+    int seed_count,
+    int star_count,
+    int collision_fp64,
+    int use_fp32_prob_compare,
+    int vein_len,
+    int device_id,
+    int star_type_main_seq,
+    int star_type_giant,
+    int star_type_white_dwarf,
+    int star_type_neutron_star,
+    int star_type_black_hole,
+    int spectr_m,
+    int spectr_k,
+    int spectr_g,
+    int spectr_f,
+    int spectr_a,
+    int spectr_b,
+    int spectr_o,
+    int spectr_x,
+    int planet_type_gas,
+    int planet_type_ocean,
+    int planet_type_vocano,
+    int planet_type_desert,
+    int planet_type_ice,
+    int theme_distribute_default,
+    int theme_distribute_birth,
+    int theme_distribute_interstellar,
+    const int* theme_ids,
+    const int* theme_planet_types,
+    const float* theme_temperatures,
+    const int* theme_distributes,
+    const int* theme_water_item_ids,
+    const int* theme_vein_spot_offsets,   // len = theme_count + 1
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,   // len = theme_count + 1
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets, // len = theme_count + 1
+    const float* theme_rare_settings_values,
+    int theme_count,
+    unsigned long long* out_galaxy_sigs,
+    unsigned long long* out_planet_sigs,
+    unsigned long long* out_vein_sigs,
+    unsigned long long* out_pipeline_sigs);
 
 #ifdef __cplusplus
 }
