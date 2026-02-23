@@ -35,7 +35,9 @@ namespace SeedCli
             int gen_seed,
             int info_seed)
         {
-            PlanetData planet = new PlanetData();
+            PlanetData planet = MixRuntimeFlags.SignatureOnlyFastPath
+                ? MixObjectPool.RentPlanet()
+                : new PlanetData();
             planet.index = index;
             planet.galaxy = star.galaxy;
             planet.star = star;

@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -54,7 +53,7 @@ namespace SeedCli
             int cpuThreads = GetIntArg(args, "--cpu-threads", threads);
             int gpuChunkSeeds = GetIntArg(args, "--gpu-chunk-seeds", 0);
             int gpuStreams = GetIntArg(args, "--gpu-streams", 1);
-            int mixCoreGroupSeeds = GetIntArg(args, "--mix-core-group-seeds", 64);
+            int mixCoreGroupSeeds = GetIntArg(args, "--mix-core-group-seeds", 0);
             int planetId = GetIntArg(args, "--planet-id", 0);
             string cpuCacheFile = GetStringArg(args, "--cpu-cache-file", null);
             bool noCpuCache = HasFlag(args, "--no-cpu-cache");
@@ -72,7 +71,7 @@ namespace SeedCli
                 Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32 [--cpu-threads 10] [--gpu-chunk-seeds 4096]");
                 Console.WriteLine("CPU 线程数：追加 --cpu-threads <N>（兼容 --threads）");
                 Console.WriteLine("GPU 真批大小：追加 --gpu-chunk-seeds <N>");
-                Console.WriteLine("Mix 行星 core 分组大小：追加 --mix-core-group-seeds <N>（默认 64，仅单线程真批路径生效）");
+                Console.WriteLine("Mix 行星 core 分组大小：追加 --mix-core-group-seeds <N>（默认 0=自动按 chunk 大小）");
                 Console.WriteLine("GPU 流数量：追加 --gpu-streams <N>（当前为预留参数，默认 1）");
                 Console.WriteLine("兼容别名：--batch-per-thread / --seed-batch-size 仅用于推导 gpu-chunk-seeds（当未显式设置 --gpu-chunk-seeds）");
                 Console.WriteLine("耗时统计：追加 --timing-debug（打印各阶段耗时与 native 调用统计）");
@@ -767,13 +766,12 @@ namespace SeedCli
             if (batchPerThread < 1) batchPerThread = 1;
             if (cpuThreads < 1) cpuThreads = 1;
             if (gpuStreams < 1) gpuStreams = 1;
-            if (mixCoreGroupSeeds < 1) mixCoreGroupSeeds = 1;
-            MixRuntimeFlags.ChunkWideCoreBatchSeedGroup = mixCoreGroupSeeds;
             long derivedChunkLong = (long)cpuThreads * (long)batchPerThread;
             if (derivedChunkLong < 1) derivedChunkLong = 1;
             if (derivedChunkLong > int.MaxValue) derivedChunkLong = int.MaxValue;
             int seedBatchSize = gpuChunkSeeds > 0 ? gpuChunkSeeds : (int)derivedChunkLong;
             if (seedBatchSize < 1) seedBatchSize = 1;
+            bool autoCoreGroupSeeds = mixCoreGroupSeeds <= 0;
 
             int mismatchGalaxy = 0;
             int mismatchPlanets = 0;
@@ -873,9 +871,26 @@ namespace SeedCli
 
             int mixChunkTotal = 0;
             int mixChunkCudaCountsOk = 0;
+            int mixChunkNativeSigOk = 0;
             int endSeed = startSeed + count;
+            int mixThreads = cpuThreads;
+            if (mixThreads > 4)
+                mixThreads = 4;
+            if (mixThreads < 1)
+                mixThreads = 1;
+            if (autoCoreGroupSeeds)
+            {
+                int rangeSize = (seedBatchSize + mixThreads - 1) / mixThreads;
+                mixCoreGroupSeeds = rangeSize <= 1536 ? rangeSize : 1024;
+            }
+            if (mixCoreGroupSeeds < 1)
+                mixCoreGroupSeeds = 1;
+            if (mixCoreGroupSeeds > seedBatchSize)
+                mixCoreGroupSeeds = seedBatchSize;
+            MixRuntimeFlags.ChunkWideCoreBatchSeedGroup = mixCoreGroupSeeds;
+
             var chunkBuffers = new GpuChunkBuffers();
-            var chunkRunner = new GpuChunkRunner(starCount, mixCollisionFp64, cpuThreads);
+            var chunkRunner = new GpuChunkRunner(starCount, mixCollisionFp64, mixThreads);
             long tMixStart = timingDebug ? Stopwatch.GetTimestamp() : 0;
             MixRuntimeFlags.SignatureOnlyFastPath = true;
             try
@@ -907,12 +922,32 @@ namespace SeedCli
                         useFp32Veins,
                         out var chunkCudaCounts,
                         out var chunkCudaStride,
-                        out var chunkPlanetOffsetMap);
+                        out var chunkPlanetStartIdx);
                     if (timingDebug)
                         tMixVeinBatch += Stopwatch.GetTimestamp() - tv0;
                     mixChunkTotal++;
                     if (useChunkCudaCounts)
                         mixChunkCudaCountsOk++;
+                    bool useChunkNativeSig = false;
+                    ulong[] chunkNativeGalaxySig = null;
+                    ulong[] chunkNativePlanetSig = null;
+                    ulong[] chunkNativeVeinSig = null;
+                    ulong[] chunkNativePipelineSig = null;
+                    if (useChunkCudaCounts)
+                    {
+                        useChunkNativeSig = CudaGalaxyNative.TryReduceMixChunkSignatures(
+                            chunkBuffers.GalaxyBuffer,
+                            chunk,
+                            chunkCudaCounts,
+                            chunkCudaStride,
+                            chunkPlanetStartIdx,
+                            out chunkNativeGalaxySig,
+                            out chunkNativePlanetSig,
+                            out chunkNativeVeinSig,
+                            out chunkNativePipelineSig);
+                        if (useChunkNativeSig)
+                            mixChunkNativeSigOk++;
+                    }
                     long tc0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                     for (int i = 0; i < chunk; i++)
                     {
@@ -922,23 +957,31 @@ namespace SeedCli
                         var cpu = cpuRows[idx];
 
                         ulong hg64 = cpu.GalaxySig;
-                        ulong hg32 = SignatureGalaxyOnly(gMix);
+                        ulong hg32 = useChunkNativeSig
+                            ? chunkNativeGalaxySig[i]
+                            : SignatureGalaxyOnly(gMix);
                         if (hg64 != hg32) mismatchGalaxy++;
 
                         ulong hp64 = cpu.PlanetSig;
-                        ulong hp32 = Signature(gMix);
+                        ulong hp32 = useChunkNativeSig
+                            ? chunkNativePlanetSig[i]
+                            : Signature(gMix);
                         if (hp64 != hp32) mismatchPlanets++;
 
                         ulong hv64 = cpu.VeinSig;
-                        ulong hv32 = useChunkCudaCounts
-                            ? SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins, cudaCountsFlat: chunkCudaCounts, cudaStride: chunkCudaStride, cudaPlanetOffsetMap: chunkPlanetOffsetMap)
-                            : SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins);
+                        ulong hv32 = useChunkNativeSig
+                            ? chunkNativeVeinSig[i]
+                            : (useChunkCudaCounts
+                            ? SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins, cudaCountsFlat: chunkCudaCounts, cudaStride: chunkCudaStride, cudaPlanetStartIdx: chunkPlanetStartIdx[i])
+                            : SignatureVeinsOnly(gMix, useFp32Veins: useFp32Veins));
                         if (hv64 != hv32) mismatchVeins++;
 
                         ulong hall64 = cpu.PipelineSig;
-                        ulong hall32 = useChunkCudaCounts
-                            ? SignaturePipeline(gMix, useFp32Veins: useFp32Veins, cudaCountsFlat: chunkCudaCounts, cudaStride: chunkCudaStride, cudaPlanetOffsetMap: chunkPlanetOffsetMap)
-                            : SignaturePipeline(gMix, useFp32Veins: useFp32Veins);
+                        ulong hall32 = useChunkNativeSig
+                            ? chunkNativePipelineSig[i]
+                            : (useChunkCudaCounts
+                            ? SignaturePipeline(gMix, useFp32Veins: useFp32Veins, cudaCountsFlat: chunkCudaCounts, cudaStride: chunkCudaStride, cudaPlanetStartIdx: chunkPlanetStartIdx[i])
+                            : SignaturePipeline(gMix, useFp32Veins: useFp32Veins));
                         if (hall64 != hall32) mismatchPipeline++;
 
                         total++;
@@ -963,6 +1006,8 @@ namespace SeedCli
                     if (timingDebug)
                         tMixCompare += Stopwatch.GetTimestamp() - tc0;
 
+                    MixObjectPool.ReleaseGalaxies(chunkBuffers.GalaxyBuffer, chunk);
+
                     if (chunkRun.Prefetched)
                         GpuChunkRunner.ClearPrefetch();
                 }
@@ -977,13 +1022,14 @@ namespace SeedCli
             var label = useFp32Veins ? "compare-pipeline-mix-veins-f32" : "compare-pipeline-mix";
             Console.WriteLine($"{label} startSeed={startSeed} stars={starCount} count={count}");
             Console.WriteLine($"mixCollisionFp64={mixCollisionFp64}");
-            Console.WriteLine($"cpuThreads={cpuThreads} gpuChunkSeeds={seedBatchSize} gpuStreams={gpuStreams} cpuParallel={(cpuThreads > 1 ? "True" : "False")}");
+            Console.WriteLine($"cpuThreads={cpuThreads} mixThreads={mixThreads} gpuChunkSeeds={seedBatchSize} gpuStreams={gpuStreams} cpuParallel={(cpuThreads > 1 ? "True" : "False")}");
             Console.WriteLine($"mixCoreGroupSeeds={mixCoreGroupSeeds}");
             if (useCpuCache)
                 Console.WriteLine($"cpuFp64Cache={(cpuCacheLoaded ? "loaded" : (cpuCacheSaved ? "saved" : "built-no-save"))} file={resolvedCpuCacheFile}");
             else
                 Console.WriteLine("cpuFp64Cache=disabled");
             Console.WriteLine($"mixChunkSeeds={seedBatchSize} (derivedFromCpuThreads*batchPerThread={(gpuChunkSeeds > 0 ? "False" : "True")}) mixCudaPlanetBatchChunks={mixChunkCudaCountsOk}/{mixChunkTotal}");
+            Console.WriteLine($"mixNativeSigChunks={mixChunkNativeSigOk}/{mixChunkTotal}");
             if (mixChunkCount > 0)
                 Console.WriteLine($"mixChunkCount={mixChunkCount} mixChunkSizeAvg={mixChunkSeedTotal / (double)mixChunkCount:F2}");
             if (enableBatchPrefetch)
@@ -1025,7 +1071,7 @@ namespace SeedCli
             bool useFp32Veins,
             int[] cudaCountsFlat = null,
             int cudaStride = 0,
-            Dictionary<PlanetData, int> cudaPlanetOffsetMap = null,
+            int cudaPlanetStartIdx = -1,
             bool allowCudaPlanetCounts = true)
         {
             unchecked
@@ -1044,7 +1090,7 @@ namespace SeedCli
                     return 0;
 
                 bool useCudaPlanetCounts;
-                if (cudaCountsFlat != null && cudaPlanetOffsetMap != null && cudaStride > 0)
+                if (cudaCountsFlat != null && cudaStride > 0 && cudaPlanetStartIdx >= 0)
                 {
                     useCudaPlanetCounts = true;
                 }
@@ -1056,7 +1102,7 @@ namespace SeedCli
                 {
                     useCudaPlanetCounts = false;
                 }
-                int cudaPlanetIdx = 0;
+                int cudaPlanetIdx = cudaPlanetStartIdx >= 0 ? cudaPlanetStartIdx : 0;
 
                 Mix(g.starCount);
                 Mix(g.birthStarId);
@@ -1089,21 +1135,8 @@ namespace SeedCli
                         if (p.type == EPlanetType.Gas) continue;
                         if (useCudaPlanetCounts)
                         {
-                            int off;
-                            if (cudaPlanetOffsetMap != null)
-                            {
-                                if (!cudaPlanetOffsetMap.TryGetValue(p, out var mappedIdx))
-                                {
-                                    Mix(-4);
-                                    continue;
-                                }
-                                off = mappedIdx * cudaStride;
-                            }
-                            else
-                            {
-                                off = cudaPlanetIdx * cudaStride;
-                                cudaPlanetIdx++;
-                            }
+                            int off = cudaPlanetIdx * cudaStride;
+                            cudaPlanetIdx++;
                             int max = Math.Min(cudaStride, 32);
                             for (int vid = 1; vid < max; vid++)
                                 Mix(cudaCountsFlat[off + vid]);
@@ -1157,7 +1190,7 @@ namespace SeedCli
             bool useFp32Veins,
             int[] cudaCountsFlat = null,
             int cudaStride = 0,
-            Dictionary<PlanetData, int> cudaPlanetOffsetMap = null,
+            int cudaPlanetStartIdx = -1,
             bool allowCudaPlanetCounts = true)
         {
             unchecked
@@ -1169,7 +1202,7 @@ namespace SeedCli
 
                 if (g == null || g.stars == null) return 0;
                 bool useCudaPlanetCounts;
-                if (cudaCountsFlat != null && cudaPlanetOffsetMap != null && cudaStride > 0)
+                if (cudaCountsFlat != null && cudaStride > 0 && cudaPlanetStartIdx >= 0)
                 {
                     useCudaPlanetCounts = true;
                 }
@@ -1181,7 +1214,7 @@ namespace SeedCli
                 {
                     useCudaPlanetCounts = false;
                 }
-                int cudaPlanetIdx = 0;
+                int cudaPlanetIdx = cudaPlanetStartIdx >= 0 ? cudaPlanetStartIdx : 0;
                 Mix(g.starCount);
                 for (int si = 0; si < g.stars.Length; si++)
                 {
@@ -1196,21 +1229,8 @@ namespace SeedCli
                         if (p.type == EPlanetType.Gas) { Mix(0); continue; }
                         if (useCudaPlanetCounts)
                         {
-                            int off;
-                            if (cudaPlanetOffsetMap != null)
-                            {
-                                if (!cudaPlanetOffsetMap.TryGetValue(p, out var mappedIdx))
-                                {
-                                    Mix(-4);
-                                    continue;
-                                }
-                                off = mappedIdx * cudaStride;
-                            }
-                            else
-                            {
-                                off = cudaPlanetIdx * cudaStride;
-                                cudaPlanetIdx++;
-                            }
+                            int off = cudaPlanetIdx * cudaStride;
+                            cudaPlanetIdx++;
                             int max = Math.Min(cudaStride, 32);
                             for (int vid = 1; vid < max; vid++)
                                 Mix(cudaCountsFlat[off + vid]);
@@ -1265,18 +1285,20 @@ namespace SeedCli
             bool useFp32Veins,
             out int[] countsFlat,
             out int stride,
-            out Dictionary<PlanetData, int> planetOffsetMap)
+            out int[] galaxyPlanetStartIdx)
         {
             countsFlat = null;
             stride = 0;
-            planetOffsetMap = null;
+            galaxyPlanetStartIdx = null;
             if (galaxies == null || galaxyCount <= 0)
                 return false;
 
             var planets = new List<PlanetData>();
             int maxGi = Math.Min(galaxyCount, galaxies.Length);
+            galaxyPlanetStartIdx = new int[maxGi];
             for (int gi = 0; gi < maxGi; ++gi)
             {
+                galaxyPlanetStartIdx[gi] = planets.Count;
                 var g = galaxies[gi];
                 if (g == null || g.stars == null)
                     continue;
@@ -1298,16 +1320,7 @@ namespace SeedCli
             if (planets.Count == 0)
                 return false;
 
-            if (!CudaPlanetNative.TryRefreshPlanetVeinSpotsBatch(planets, useFp32Veins, out countsFlat, out stride))
-                return false;
-
-            var map = new Dictionary<PlanetData, int>(
-                planets.Count,
-                ReferenceEqualityComparer<PlanetData>.Instance);
-            for (int i = 0; i < planets.Count; ++i)
-                map[planets[i]] = i;
-            planetOffsetMap = map;
-            return true;
+            return CudaPlanetNative.TryRefreshPlanetVeinSpotsBatch(planets, useFp32Veins, out countsFlat, out stride);
         }
 
         private static string DescribeFirstDifferenceWithVeins(GalaxyData g64, GalaxyData g32)
@@ -1354,22 +1367,6 @@ namespace SeedCli
         {
             public string Kind;
             public int StarIndex;
-        }
-
-        private sealed class ReferenceEqualityComparer<T> : IEqualityComparer<T>
-            where T : class
-        {
-            public static readonly ReferenceEqualityComparer<T> Instance = new ReferenceEqualityComparer<T>();
-
-            public bool Equals(T x, T y)
-            {
-                return ReferenceEquals(x, y);
-            }
-
-            public int GetHashCode(T obj)
-            {
-                return obj == null ? 0 : RuntimeHelpers.GetHashCode(obj);
-            }
         }
 
         private static FirstDiff FirstDifference(GalaxyData g64, GalaxyData g32)

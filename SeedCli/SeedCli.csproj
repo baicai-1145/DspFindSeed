@@ -27,6 +27,7 @@
     <Compile Include="StarGenPlanetsF32.cs" />
     <Compile Include="PlanetGenF32.cs" />
     <Compile Include="MixRuntimeFlags.cs" />
+    <Compile Include="MixObjectPool.cs" />
     <Compile Include="GpuChunkBuffers.cs" />
     <Compile Include="GpuChunkRunner.cs" />
     <Compile Include="CudaGalaxyNative.cs" />

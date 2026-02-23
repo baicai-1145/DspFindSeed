@@ -16,7 +16,34 @@ namespace SeedCli
         private static string _nativeBrokenReason;
         private static bool _printedFallback;
         private static bool _printedForceColl64;
+        private static bool _mixSigEntryMissing;
         [ThreadStatic] private static NativeVec3d[] _singlePoseScratch;
+        [ThreadStatic] private static int[] _mixSigSeedStarOffsets;
+        [ThreadStatic] private static int[] _mixSigSeedPlanetOffsets;
+        [ThreadStatic] private static int[] _mixSigGalaxyStarCounts;
+        [ThreadStatic] private static int[] _mixSigBirthStarIds;
+        [ThreadStatic] private static int[] _mixSigBirthPlanetIds;
+        [ThreadStatic] private static int[] _mixSigStarIds;
+        [ThreadStatic] private static int[] _mixSigStarTypes;
+        [ThreadStatic] private static int[] _mixSigStarSpectrs;
+        [ThreadStatic] private static int[] _mixSigStarPlanetCounts;
+        [ThreadStatic] private static int[] _mixSigStarPlanetLoopCounts;
+        [ThreadStatic] private static int[] _mixSigStarPosX;
+        [ThreadStatic] private static int[] _mixSigStarPosY;
+        [ThreadStatic] private static int[] _mixSigStarPosZ;
+        [ThreadStatic] private static int[] _mixSigPlanetIds;
+        [ThreadStatic] private static int[] _mixSigPlanetTypes;
+        [ThreadStatic] private static int[] _mixSigPlanetThemes;
+        [ThreadStatic] private static int[] _mixSigPlanetWaterItemIds;
+        [ThreadStatic] private static int[] _mixSigPlanetOrbitIndexes;
+        [ThreadStatic] private static int[] _mixSigPlanetOrbitArounds;
+        [ThreadStatic] private static int[] _mixSigPlanetIsNull;
+        [ThreadStatic] private static int[] _mixSigPlanetIsGas;
+        [ThreadStatic] private static int[] _mixSigPlanetVeinOffsets;
+        [ThreadStatic] private static ulong[] _mixSigOutGalaxy;
+        [ThreadStatic] private static ulong[] _mixSigOutPlanet;
+        [ThreadStatic] private static ulong[] _mixSigOutVein;
+        [ThreadStatic] private static ulong[] _mixSigOutPipeline;
         private static long _perfSingleCalls;
         private static long _perfSingleTicks;
         private static long _perfBatchCalls;
@@ -85,6 +112,38 @@ namespace SeedCli
             [Out] int[] outSeedArray56,
             out int outInext,
             out int outInextp);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_mix_chunk_reduce_signatures")]
+        private static extern int NativeMixChunkReduceSignatures(
+            int seedCount,
+            [In] int[] seedStarOffsets,
+            [In] int[] seedPlanetOffsets,
+            [In] int[] galaxyStarCounts,
+            [In] int[] birthStarIds,
+            [In] int[] birthPlanetIds,
+            [In] int[] starIds,
+            [In] int[] starTypes,
+            [In] int[] starSpectrs,
+            [In] int[] starPlanetCounts,
+            [In] int[] starPlanetLoopCounts,
+            [In] int[] starPosX,
+            [In] int[] starPosY,
+            [In] int[] starPosZ,
+            [In] int[] planetIds,
+            [In] int[] planetTypes,
+            [In] int[] planetThemes,
+            [In] int[] planetWaterItemIds,
+            [In] int[] planetOrbitIndexes,
+            [In] int[] planetOrbitArounds,
+            [In] int[] planetIsNull,
+            [In] int[] planetIsGas,
+            [In] int[] planetVeinOffsets,
+            [In] int[] veinCountsFlat,
+            int veinStride,
+            [Out] ulong[] outGalaxySigs,
+            [Out] ulong[] outPlanetSigs,
+            [Out] ulong[] outVeinSigs,
+            [Out] ulong[] outPipelineSigs);
 
         public static void EnableByCli(bool enabled)
         {
@@ -355,11 +414,237 @@ namespace SeedCli
             return true;
         }
 
+        public static bool TryReduceMixChunkSignatures(
+            GalaxyData[] galaxies,
+            int galaxyCount,
+            int[] veinCountsFlat,
+            int veinStride,
+            int[] galaxyPlanetStartIdx,
+            out ulong[] outGalaxySigs,
+            out ulong[] outPlanetSigs,
+            out ulong[] outVeinSigs,
+            out ulong[] outPipelineSigs)
+        {
+            outGalaxySigs = null;
+            outPlanetSigs = null;
+            outVeinSigs = null;
+            outPipelineSigs = null;
+
+            if (!IsEnabled() || _nativeBroken || _mixSigEntryMissing)
+                return false;
+            if (galaxies == null || galaxyCount <= 0 || galaxyCount > galaxies.Length)
+                return false;
+            if (veinCountsFlat == null || veinStride <= 1 || galaxyPlanetStartIdx == null || galaxyPlanetStartIdx.Length < galaxyCount)
+                return false;
+
+            int totalStars = 0;
+            int totalPlanets = 0;
+            for (int gi = 0; gi < galaxyCount; ++gi)
+            {
+                var g = galaxies[gi];
+                if (g == null || g.stars == null)
+                    return false;
+
+                totalStars += g.stars.Length;
+                for (int si = 0; si < g.stars.Length; ++si)
+                {
+                    var s = g.stars[si];
+                    if (s == null || s.planets == null)
+                        continue;
+                    totalPlanets += s.planets.Length;
+                }
+            }
+
+            EnsureIntBuffer(ref _mixSigSeedStarOffsets, galaxyCount + 1);
+            EnsureIntBuffer(ref _mixSigSeedPlanetOffsets, galaxyCount + 1);
+            EnsureIntBuffer(ref _mixSigGalaxyStarCounts, galaxyCount);
+            EnsureIntBuffer(ref _mixSigBirthStarIds, galaxyCount);
+            EnsureIntBuffer(ref _mixSigBirthPlanetIds, galaxyCount);
+
+            EnsureIntBuffer(ref _mixSigStarIds, totalStars);
+            EnsureIntBuffer(ref _mixSigStarTypes, totalStars);
+            EnsureIntBuffer(ref _mixSigStarSpectrs, totalStars);
+            EnsureIntBuffer(ref _mixSigStarPlanetCounts, totalStars);
+            EnsureIntBuffer(ref _mixSigStarPlanetLoopCounts, totalStars);
+            EnsureIntBuffer(ref _mixSigStarPosX, totalStars);
+            EnsureIntBuffer(ref _mixSigStarPosY, totalStars);
+            EnsureIntBuffer(ref _mixSigStarPosZ, totalStars);
+
+            EnsureIntBuffer(ref _mixSigPlanetIds, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetTypes, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetThemes, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetWaterItemIds, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetOrbitIndexes, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetOrbitArounds, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetIsNull, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetIsGas, totalPlanets);
+            EnsureIntBuffer(ref _mixSigPlanetVeinOffsets, totalPlanets);
+
+            EnsureUlongBuffer(ref _mixSigOutGalaxy, galaxyCount);
+            EnsureUlongBuffer(ref _mixSigOutPlanet, galaxyCount);
+            EnsureUlongBuffer(ref _mixSigOutVein, galaxyCount);
+            EnsureUlongBuffer(ref _mixSigOutPipeline, galaxyCount);
+
+            int starCursor = 0;
+            int planetCursor = 0;
+            for (int gi = 0; gi < galaxyCount; ++gi)
+            {
+                var g = galaxies[gi];
+                _mixSigSeedStarOffsets[gi] = starCursor;
+                _mixSigSeedPlanetOffsets[gi] = planetCursor;
+                _mixSigGalaxyStarCounts[gi] = g.starCount;
+                _mixSigBirthStarIds[gi] = g.birthStarId;
+                _mixSigBirthPlanetIds[gi] = g.birthPlanetId;
+
+                int solidOffset = galaxyPlanetStartIdx[gi];
+                for (int si = 0; si < g.stars.Length; ++si)
+                {
+                    var s = g.stars[si];
+                    if (s == null)
+                    {
+                        _mixSigStarIds[starCursor] = -1;
+                        _mixSigStarTypes[starCursor] = 0;
+                        _mixSigStarSpectrs[starCursor] = 0;
+                        _mixSigStarPlanetCounts[starCursor] = 0;
+                        _mixSigStarPlanetLoopCounts[starCursor] = 0;
+                        _mixSigStarPosX[starCursor] = 0;
+                        _mixSigStarPosY[starCursor] = 0;
+                        _mixSigStarPosZ[starCursor] = 0;
+                        starCursor++;
+                        continue;
+                    }
+
+                    _mixSigStarIds[starCursor] = s.id;
+                    _mixSigStarTypes[starCursor] = (int)s.type;
+                    _mixSigStarSpectrs[starCursor] = (int)s.spectr;
+                    _mixSigStarPlanetCounts[starCursor] = s.planetCount;
+                    _mixSigStarPlanetLoopCounts[starCursor] = s.planets != null ? s.planets.Length : 0;
+                    _mixSigStarPosX[starCursor] = (int)Math.Round(s.uPosition.x * 0.001);
+                    _mixSigStarPosY[starCursor] = (int)Math.Round(s.uPosition.y * 0.001);
+                    _mixSigStarPosZ[starCursor] = (int)Math.Round(s.uPosition.z * 0.001);
+                    starCursor++;
+
+                    var planets = s.planets;
+                    if (planets == null)
+                        continue;
+                    for (int pi = 0; pi < planets.Length; ++pi)
+                    {
+                        var p = planets[pi];
+                        if (p == null)
+                        {
+                            _mixSigPlanetIds[planetCursor] = 0;
+                            _mixSigPlanetTypes[planetCursor] = 0;
+                            _mixSigPlanetThemes[planetCursor] = 0;
+                            _mixSigPlanetWaterItemIds[planetCursor] = 0;
+                            _mixSigPlanetOrbitIndexes[planetCursor] = 0;
+                            _mixSigPlanetOrbitArounds[planetCursor] = 0;
+                            _mixSigPlanetIsNull[planetCursor] = 1;
+                            _mixSigPlanetIsGas[planetCursor] = 0;
+                            _mixSigPlanetVeinOffsets[planetCursor] = -1;
+                            planetCursor++;
+                            continue;
+                        }
+
+                        bool isGas = p.type == EPlanetType.Gas;
+                        _mixSigPlanetIds[planetCursor] = p.id;
+                        _mixSigPlanetTypes[planetCursor] = (int)p.type;
+                        _mixSigPlanetThemes[planetCursor] = p.theme;
+                        _mixSigPlanetWaterItemIds[planetCursor] = p.waterItemId;
+                        _mixSigPlanetOrbitIndexes[planetCursor] = p.orbitIndex;
+                        _mixSigPlanetOrbitArounds[planetCursor] = p.orbitAround;
+                        _mixSigPlanetIsNull[planetCursor] = 0;
+                        _mixSigPlanetIsGas[planetCursor] = isGas ? 1 : 0;
+                        if (isGas)
+                        {
+                            _mixSigPlanetVeinOffsets[planetCursor] = -1;
+                        }
+                        else
+                        {
+                            _mixSigPlanetVeinOffsets[planetCursor] = solidOffset;
+                            solidOffset++;
+                        }
+                        planetCursor++;
+                    }
+                }
+            }
+            _mixSigSeedStarOffsets[galaxyCount] = starCursor;
+            _mixSigSeedPlanetOffsets[galaxyCount] = planetCursor;
+
+            int rc;
+            try
+            {
+                rc = NativeMixChunkReduceSignatures(
+                    galaxyCount,
+                    _mixSigSeedStarOffsets,
+                    _mixSigSeedPlanetOffsets,
+                    _mixSigGalaxyStarCounts,
+                    _mixSigBirthStarIds,
+                    _mixSigBirthPlanetIds,
+                    _mixSigStarIds,
+                    _mixSigStarTypes,
+                    _mixSigStarSpectrs,
+                    _mixSigStarPlanetCounts,
+                    _mixSigStarPlanetLoopCounts,
+                    _mixSigStarPosX,
+                    _mixSigStarPosY,
+                    _mixSigStarPosZ,
+                    _mixSigPlanetIds,
+                    _mixSigPlanetTypes,
+                    _mixSigPlanetThemes,
+                    _mixSigPlanetWaterItemIds,
+                    _mixSigPlanetOrbitIndexes,
+                    _mixSigPlanetOrbitArounds,
+                    _mixSigPlanetIsNull,
+                    _mixSigPlanetIsGas,
+                    _mixSigPlanetVeinOffsets,
+                    veinCountsFlat,
+                    veinStride,
+                    _mixSigOutGalaxy,
+                    _mixSigOutPlanet,
+                    _mixSigOutVein,
+                    _mixSigOutPipeline);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _mixSigEntryMissing = true;
+                return false;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
+                return false;
+            }
+
+            if (rc != Ok)
+            {
+                MarkNativeBroken("mix-signature native return code=" + rc);
+                return false;
+            }
+
+            outGalaxySigs = _mixSigOutGalaxy;
+            outPlanetSigs = _mixSigOutPlanet;
+            outVeinSigs = _mixSigOutVein;
+            outPipelineSigs = _mixSigOutPipeline;
+            return true;
+        }
+
         private static NativeVec3d[] EnsureSinglePoseScratch(int needed)
         {
             if (_singlePoseScratch == null || _singlePoseScratch.Length < needed)
                 _singlePoseScratch = new NativeVec3d[needed];
             return _singlePoseScratch;
+        }
+
+        private static void EnsureIntBuffer(ref int[] arr, int needed)
+        {
+            if (arr == null || arr.Length < needed)
+                arr = new int[needed];
+        }
+
+        private static void EnsureUlongBuffer(ref ulong[] arr, int needed)
+        {
+            if (arr == null || arr.Length < needed)
+                arr = new ulong[needed];
         }
 
         private static int GetDeviceIdFromEnv()

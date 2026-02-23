@@ -1765,3 +1765,204 @@ extern "C" int dsp_cuda_mix_chunk_eval_veins_f32(
         device_id,
         out_counts);
 }
+
+extern "C" int dsp_cuda_mix_chunk_reduce_signatures(
+    int seed_count,
+    const int* seed_star_offsets,
+    const int* seed_planet_offsets,
+    const int* galaxy_star_counts,
+    const int* birth_star_ids,
+    const int* birth_planet_ids,
+    const int* star_ids,
+    const int* star_types,
+    const int* star_spectrs,
+    const int* star_planet_counts,
+    const int* star_planet_loop_counts,
+    const int* star_pos_x,
+    const int* star_pos_y,
+    const int* star_pos_z,
+    const int* planet_ids,
+    const int* planet_types,
+    const int* planet_themes,
+    const int* planet_water_item_ids,
+    const int* planet_orbit_indexes,
+    const int* planet_orbit_arounds,
+    const int* planet_is_null,
+    const int* planet_is_gas,
+    const int* planet_vein_offsets,
+    const int* vein_counts_flat,
+    int vein_stride,
+    unsigned long long* out_galaxy_sigs,
+    unsigned long long* out_planet_sigs,
+    unsigned long long* out_vein_sigs,
+    unsigned long long* out_pipeline_sigs)
+{
+    if (seed_count <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (seed_star_offsets == nullptr || seed_planet_offsets == nullptr ||
+        galaxy_star_counts == nullptr || birth_star_ids == nullptr || birth_planet_ids == nullptr ||
+        star_ids == nullptr || star_types == nullptr || star_spectrs == nullptr || star_planet_counts == nullptr || star_planet_loop_counts == nullptr ||
+        star_pos_x == nullptr || star_pos_y == nullptr || star_pos_z == nullptr ||
+        planet_ids == nullptr || planet_types == nullptr || planet_themes == nullptr ||
+        planet_water_item_ids == nullptr || planet_orbit_indexes == nullptr || planet_orbit_arounds == nullptr ||
+        planet_is_null == nullptr || planet_is_gas == nullptr || planet_vein_offsets == nullptr ||
+        out_galaxy_sigs == nullptr || out_planet_sigs == nullptr || out_vein_sigs == nullptr || out_pipeline_sigs == nullptr)
+    {
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    }
+
+    constexpr unsigned long long kFnvOffset = 14695981039346656037ull;
+    constexpr unsigned long long kFnvPrime = 1099511628211ull;
+
+    auto mix = [&](unsigned long long h, int v) -> unsigned long long
+    {
+        h ^= static_cast<unsigned int>(v);
+        h *= kFnvPrime;
+        return h;
+    };
+
+    for (int si = 0; si < seed_count; ++si)
+    {
+        int star_begin = seed_star_offsets[si];
+        int star_end = seed_star_offsets[si + 1];
+        int planet_begin = seed_planet_offsets[si];
+        int planet_end = seed_planet_offsets[si + 1];
+        if (star_end < star_begin || planet_end < planet_begin)
+            return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+        unsigned long long h_galaxy = kFnvOffset;
+        unsigned long long h_planet = kFnvOffset;
+        unsigned long long h_vein = kFnvOffset;
+        unsigned long long h_pipeline = kFnvOffset;
+
+        int star_count = galaxy_star_counts[si];
+        int birth_star_id = birth_star_ids[si];
+        int birth_planet_id = birth_planet_ids[si];
+
+        h_galaxy = mix(h_galaxy, star_count);
+
+        h_planet = mix(h_planet, star_count);
+        h_planet = mix(h_planet, birth_star_id);
+        h_planet = mix(h_planet, birth_planet_id);
+
+        h_vein = mix(h_vein, star_count);
+
+        h_pipeline = mix(h_pipeline, star_count);
+        h_pipeline = mix(h_pipeline, birth_star_id);
+        h_pipeline = mix(h_pipeline, birth_planet_id);
+
+        int p_cur = planet_begin;
+        for (int st = star_begin; st < star_end; ++st)
+        {
+            const int sid = star_ids[st];
+            const int stype = star_types[st];
+            const int sspectr = star_spectrs[st];
+            const int spcnt = star_planet_counts[st];
+            const int spcnt_loop = star_planet_loop_counts[st];
+            const int sx = star_pos_x[st];
+            const int sy = star_pos_y[st];
+            const int sz = star_pos_z[st];
+
+            h_galaxy = mix(h_galaxy, sid);
+            h_galaxy = mix(h_galaxy, stype);
+            h_galaxy = mix(h_galaxy, sspectr);
+            h_galaxy = mix(h_galaxy, spcnt);
+            h_galaxy = mix(h_galaxy, sx);
+            h_galaxy = mix(h_galaxy, sy);
+            h_galaxy = mix(h_galaxy, sz);
+
+            h_planet = mix(h_planet, sid);
+            h_planet = mix(h_planet, stype);
+            h_planet = mix(h_planet, sspectr);
+            h_planet = mix(h_planet, spcnt);
+            h_planet = mix(h_planet, sx);
+            h_planet = mix(h_planet, sy);
+            h_planet = mix(h_planet, sz);
+
+            h_vein = mix(h_vein, sid);
+
+            h_pipeline = mix(h_pipeline, sid);
+            h_pipeline = mix(h_pipeline, stype);
+            h_pipeline = mix(h_pipeline, sspectr);
+            h_pipeline = mix(h_pipeline, spcnt);
+            h_pipeline = mix(h_pipeline, sx);
+            h_pipeline = mix(h_pipeline, sy);
+            h_pipeline = mix(h_pipeline, sz);
+
+            int loop_pcnt = spcnt_loop;
+            if (loop_pcnt < 0)
+                loop_pcnt = 0;
+            for (int pi = 0; pi < loop_pcnt; ++pi)
+            {
+                if (p_cur >= planet_end)
+                    return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+                if (planet_is_null[p_cur] != 0)
+                {
+                    h_planet = mix(h_planet, -2);
+                    h_vein = mix(h_vein, -2);
+                    h_pipeline = mix(h_pipeline, -2);
+                    ++p_cur;
+                    continue;
+                }
+
+                const int pid = planet_ids[p_cur];
+                const int ptype = planet_types[p_cur];
+                const int ptheme = planet_themes[p_cur];
+                const int pwater = planet_water_item_ids[p_cur];
+                const int porbit_index = planet_orbit_indexes[p_cur];
+                const int porbit_around = planet_orbit_arounds[p_cur];
+
+                h_planet = mix(h_planet, ptype);
+                h_planet = mix(h_planet, ptheme);
+                h_planet = mix(h_planet, pwater);
+                h_planet = mix(h_planet, porbit_index);
+                h_planet = mix(h_planet, porbit_around);
+
+                h_vein = mix(h_vein, pid);
+
+                h_pipeline = mix(h_pipeline, ptype);
+                h_pipeline = mix(h_pipeline, ptheme);
+                h_pipeline = mix(h_pipeline, pwater);
+                h_pipeline = mix(h_pipeline, porbit_index);
+                h_pipeline = mix(h_pipeline, porbit_around);
+
+                if (planet_is_gas[p_cur] != 0)
+                {
+                    h_vein = mix(h_vein, 0);
+                    ++p_cur;
+                    continue;
+                }
+
+                int vbase = planet_vein_offsets[p_cur];
+                if (vbase < 0 || vein_counts_flat == nullptr || vein_stride <= 1)
+                {
+                    h_vein = mix(h_vein, -4);
+                    h_pipeline = mix(h_pipeline, -4);
+                    ++p_cur;
+                    continue;
+                }
+
+                int vmax = vein_stride < 32 ? vein_stride : 32;
+                for (int vid = 1; vid < vmax; ++vid)
+                {
+                    int vv = vein_counts_flat[vbase * vein_stride + vid];
+                    h_vein = mix(h_vein, vv);
+                    h_pipeline = mix(h_pipeline, vv);
+                }
+
+                ++p_cur;
+            }
+        }
+
+        if (p_cur != planet_end)
+            return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+        out_galaxy_sigs[si] = h_galaxy;
+        out_planet_sigs[si] = h_planet;
+        out_vein_sigs[si] = h_vein;
+        out_pipeline_sigs[si] = h_pipeline;
+    }
+
+    return DSP_CUDA_OK;
+}

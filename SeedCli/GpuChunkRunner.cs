@@ -65,8 +65,11 @@ namespace SeedCli
                     MixRuntimeFlags.ChunkWideCoreBatch = true;
                     try
                     {
+                        int rangeSize = (chunkSize + _mixThreads - 1) / _mixThreads;
+                        if (rangeSize < 1)
+                            rangeSize = 1;
                         Parallel.ForEach(
-                            Partitioner.Create(0, chunkSize),
+                            Partitioner.Create(0, chunkSize, rangeSize),
                             options,
                             range =>
                             {

@@ -124,6 +124,26 @@ namespace SeedCli
             public double orbitAroundPlanetOrbitalPeriod;
         }
 
+        internal struct PlanetCoreBatchArrays
+        {
+            public int[] infoSeeds;
+            public int[] orbitArounds;
+            public int[] orbitIndexes;
+            public int[] gasGiants;
+            public int[] starIndexes;
+            public int[] galaxyStarCounts;
+            public int[] galaxyHabitableCounts;
+            public int[] boostInclinationNs;
+            public int[] compactTypeCases;
+            public float[] starOrbitScalers;
+            public double[] starMasses;
+            public float[] starHabitableRadii;
+            public float[] starLightBalanceRadii;
+            public float[] aroundRealRadii;
+            public float[] aroundOrbitRadii;
+            public double[] aroundOrbitalPeriods;
+        }
+
         private sealed class PlanetCoreBatchRequest
         {
             public int infoSeed;
@@ -504,60 +524,47 @@ namespace SeedCli
             return true;
         }
 
-        public static bool TryEvalPlanetCoreF32Batch(
-            IList<PlanetCoreBatchInput> inputs,
+        internal static PlanetCoreBatchArrays AcquireCoreBatchArrays(int itemCount)
+        {
+            if (itemCount < 1)
+                itemCount = 1;
+            EnsureCoreBatchBuffers(itemCount);
+            return new PlanetCoreBatchArrays
+            {
+                infoSeeds = _coreInfoSeeds,
+                orbitArounds = _coreOrbitArounds,
+                orbitIndexes = _coreOrbitIndexes,
+                gasGiants = _coreGasGiants,
+                starIndexes = _coreStarIndexes,
+                galaxyStarCounts = _coreGalaxyStarCounts,
+                galaxyHabitableCounts = _coreGalaxyHabitableCounts,
+                boostInclinationNs = _coreBoostInclinationNs,
+                compactTypeCases = _coreCompactTypeCases,
+                starOrbitScalers = _coreStarOrbitScalers,
+                starMasses = _coreStarMasses,
+                starHabitableRadii = _coreStarHabitableRadii,
+                starLightBalanceRadii = _coreStarLightBalanceRadii,
+                aroundRealRadii = _coreAroundRealRadii,
+                aroundOrbitRadii = _coreAroundOrbitRadii,
+                aroundOrbitalPeriods = _coreAroundOrbitalPeriods
+            };
+        }
+
+        internal static bool TryEvalPlanetCoreF32BatchRaw(
+            PlanetCoreBatchArrays arrays,
+            int batchCount,
             PlanetCoreF32Out[] outResults)
         {
             if (!IsCoreEnabled())
                 return false;
             if (_nativeBroken)
                 return false;
-            if (inputs == null || inputs.Count == 0 || outResults == null || outResults.Length < inputs.Count)
+            if (batchCount < 1 || outResults == null || outResults.Length < batchCount)
                 return false;
 
-            int n = inputs.Count;
             long t0 = Stopwatch.GetTimestamp();
             Interlocked.Increment(ref _perfCoreBatchCalls);
-            Interlocked.Add(ref _perfCoreBatchItems, n);
-
-            EnsureCoreBatchBuffers(n);
-            var infoSeeds = _coreInfoSeeds;
-            var orbitArounds = _coreOrbitArounds;
-            var orbitIndexes = _coreOrbitIndexes;
-            var gasGiants = _coreGasGiants;
-            var starIndexes = _coreStarIndexes;
-            var galaxyStarCounts = _coreGalaxyStarCounts;
-            var galaxyHabitableCounts = _coreGalaxyHabitableCounts;
-            var boostInclinationNs = _coreBoostInclinationNs;
-            var compactTypeCases = _coreCompactTypeCases;
-            var starOrbitScalers = _coreStarOrbitScalers;
-            var starMasses = _coreStarMasses;
-            var starHabitableRadii = _coreStarHabitableRadii;
-            var starLightBalanceRadii = _coreStarLightBalanceRadii;
-            var aroundRealRadii = _coreAroundRealRadii;
-            var aroundOrbitRadii = _coreAroundOrbitRadii;
-            var aroundOrbitalPeriods = _coreAroundOrbitalPeriods;
-
-            for (int i = 0; i < n; ++i)
-            {
-                var r = inputs[i];
-                infoSeeds[i] = r.infoSeed;
-                orbitArounds[i] = r.orbitAround;
-                orbitIndexes[i] = r.orbitIndex;
-                gasGiants[i] = r.gasGiant;
-                starIndexes[i] = r.starIndex;
-                galaxyStarCounts[i] = r.galaxyStarCount;
-                galaxyHabitableCounts[i] = r.galaxyHabitableCount;
-                boostInclinationNs[i] = r.boostInclinationNs;
-                compactTypeCases[i] = r.compactTypeCase;
-                starOrbitScalers[i] = r.starOrbitScaler;
-                starMasses[i] = r.starMass;
-                starHabitableRadii[i] = r.starHabitableRadius;
-                starLightBalanceRadii[i] = r.starLightBalanceRadius;
-                aroundRealRadii[i] = r.orbitAroundPlanetRealRadius;
-                aroundOrbitRadii[i] = r.orbitAroundPlanetOrbitRadius;
-                aroundOrbitalPeriods[i] = r.orbitAroundPlanetOrbitalPeriod;
-            }
+            Interlocked.Add(ref _perfCoreBatchItems, batchCount);
 
             int deviceId = GetDeviceIdFromEnv();
             int rc;
@@ -566,46 +573,46 @@ namespace SeedCli
                 if (_mixChunkPlanetEntryMissing)
                 {
                     rc = NativePlanetEvalCoreF32Batch(
-                        infoSeeds,
-                        orbitArounds,
-                        orbitIndexes,
-                        gasGiants,
-                        starIndexes,
-                        galaxyStarCounts,
-                        galaxyHabitableCounts,
-                        boostInclinationNs,
-                        compactTypeCases,
-                        starOrbitScalers,
-                        starMasses,
-                        starHabitableRadii,
-                        starLightBalanceRadii,
-                        aroundRealRadii,
-                        aroundOrbitRadii,
-                        aroundOrbitalPeriods,
-                        n,
+                        arrays.infoSeeds,
+                        arrays.orbitArounds,
+                        arrays.orbitIndexes,
+                        arrays.gasGiants,
+                        arrays.starIndexes,
+                        arrays.galaxyStarCounts,
+                        arrays.galaxyHabitableCounts,
+                        arrays.boostInclinationNs,
+                        arrays.compactTypeCases,
+                        arrays.starOrbitScalers,
+                        arrays.starMasses,
+                        arrays.starHabitableRadii,
+                        arrays.starLightBalanceRadii,
+                        arrays.aroundRealRadii,
+                        arrays.aroundOrbitRadii,
+                        arrays.aroundOrbitalPeriods,
+                        batchCount,
                         deviceId,
                         outResults);
                 }
                 else
                 {
                     rc = NativeMixChunkEvalPlanetsF32(
-                        infoSeeds,
-                        orbitArounds,
-                        orbitIndexes,
-                        gasGiants,
-                        starIndexes,
-                        galaxyStarCounts,
-                        galaxyHabitableCounts,
-                        boostInclinationNs,
-                        compactTypeCases,
-                        starOrbitScalers,
-                        starMasses,
-                        starHabitableRadii,
-                        starLightBalanceRadii,
-                        aroundRealRadii,
-                        aroundOrbitRadii,
-                        aroundOrbitalPeriods,
-                        n,
+                        arrays.infoSeeds,
+                        arrays.orbitArounds,
+                        arrays.orbitIndexes,
+                        arrays.gasGiants,
+                        arrays.starIndexes,
+                        arrays.galaxyStarCounts,
+                        arrays.galaxyHabitableCounts,
+                        arrays.boostInclinationNs,
+                        arrays.compactTypeCases,
+                        arrays.starOrbitScalers,
+                        arrays.starMasses,
+                        arrays.starHabitableRadii,
+                        arrays.starLightBalanceRadii,
+                        arrays.aroundRealRadii,
+                        arrays.aroundOrbitRadii,
+                        arrays.aroundOrbitalPeriods,
+                        batchCount,
                         deviceId,
                         outResults);
                 }
@@ -616,23 +623,23 @@ namespace SeedCli
                 try
                 {
                     rc = NativePlanetEvalCoreF32Batch(
-                        infoSeeds,
-                        orbitArounds,
-                        orbitIndexes,
-                        gasGiants,
-                        starIndexes,
-                        galaxyStarCounts,
-                        galaxyHabitableCounts,
-                        boostInclinationNs,
-                        compactTypeCases,
-                        starOrbitScalers,
-                        starMasses,
-                        starHabitableRadii,
-                        starLightBalanceRadii,
-                        aroundRealRadii,
-                        aroundOrbitRadii,
-                        aroundOrbitalPeriods,
-                        n,
+                        arrays.infoSeeds,
+                        arrays.orbitArounds,
+                        arrays.orbitIndexes,
+                        arrays.gasGiants,
+                        arrays.starIndexes,
+                        arrays.galaxyStarCounts,
+                        arrays.galaxyHabitableCounts,
+                        arrays.boostInclinationNs,
+                        arrays.compactTypeCases,
+                        arrays.starOrbitScalers,
+                        arrays.starMasses,
+                        arrays.starHabitableRadii,
+                        arrays.starLightBalanceRadii,
+                        arrays.aroundRealRadii,
+                        arrays.aroundOrbitRadii,
+                        arrays.aroundOrbitalPeriods,
+                        batchCount,
                         deviceId,
                         outResults);
                 }
@@ -659,6 +666,39 @@ namespace SeedCli
 
             Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
             return true;
+        }
+
+        public static bool TryEvalPlanetCoreF32Batch(
+            IList<PlanetCoreBatchInput> inputs,
+            PlanetCoreF32Out[] outResults)
+        {
+            if (inputs == null || inputs.Count == 0 || outResults == null || outResults.Length < inputs.Count)
+                return false;
+
+            int n = inputs.Count;
+            var arrays = AcquireCoreBatchArrays(n);
+            for (int i = 0; i < n; ++i)
+            {
+                var r = inputs[i];
+                arrays.infoSeeds[i] = r.infoSeed;
+                arrays.orbitArounds[i] = r.orbitAround;
+                arrays.orbitIndexes[i] = r.orbitIndex;
+                arrays.gasGiants[i] = r.gasGiant;
+                arrays.starIndexes[i] = r.starIndex;
+                arrays.galaxyStarCounts[i] = r.galaxyStarCount;
+                arrays.galaxyHabitableCounts[i] = r.galaxyHabitableCount;
+                arrays.boostInclinationNs[i] = r.boostInclinationNs;
+                arrays.compactTypeCases[i] = r.compactTypeCase;
+                arrays.starOrbitScalers[i] = r.starOrbitScaler;
+                arrays.starMasses[i] = r.starMass;
+                arrays.starHabitableRadii[i] = r.starHabitableRadius;
+                arrays.starLightBalanceRadii[i] = r.starLightBalanceRadius;
+                arrays.aroundRealRadii[i] = r.orbitAroundPlanetRealRadius;
+                arrays.aroundOrbitRadii[i] = r.orbitAroundPlanetOrbitRadius;
+                arrays.aroundOrbitalPeriods[i] = r.orbitAroundPlanetOrbitalPeriod;
+            }
+
+            return TryEvalPlanetCoreF32BatchRaw(arrays, n, outResults);
         }
 
         public static bool TryEvalPlanetCoreF32(

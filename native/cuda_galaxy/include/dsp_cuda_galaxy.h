@@ -198,6 +198,40 @@ int dsp_cuda_mix_chunk_eval_veins_f32(
     int device_id,
     int* out_counts);
 
+// Reduce per-seed signatures from flattened chunk data.
+// This entry is host-side deterministic reduction (no RNG) and is used by compare pipeline fast-path.
+int dsp_cuda_mix_chunk_reduce_signatures(
+    int seed_count,
+    const int* seed_star_offsets,   // len = seed_count + 1
+    const int* seed_planet_offsets, // len = seed_count + 1
+    const int* galaxy_star_counts,  // len = seed_count
+    const int* birth_star_ids,      // len = seed_count
+    const int* birth_planet_ids,    // len = seed_count
+    const int* star_ids,            // len = total_stars
+    const int* star_types,          // len = total_stars
+    const int* star_spectrs,        // len = total_stars
+    const int* star_planet_counts,  // len = total_stars (signature field: star.planetCount)
+    const int* star_planet_loop_counts, // len = total_stars (actual traversed count: star.planets.Length)
+    const int* star_pos_x,          // len = total_stars (already quantized to round(uPos.x*0.001))
+    const int* star_pos_y,          // len = total_stars
+    const int* star_pos_z,          // len = total_stars
+    const int* planet_ids,          // len = total_planets
+    const int* planet_types,        // len = total_planets
+    const int* planet_themes,       // len = total_planets
+    const int* planet_water_item_ids, // len = total_planets
+    const int* planet_orbit_indexes,  // len = total_planets
+    const int* planet_orbit_arounds,  // len = total_planets
+    const int* planet_is_null,      // len = total_planets (1=true)
+    const int* planet_is_gas,       // len = total_planets (1=true, ignored when is_null=1)
+    const int* planet_vein_offsets, // len = total_planets, -1 for gas/null
+    const int* vein_counts_flat,    // len = total_solid_planets * vein_stride
+    int vein_stride,
+    unsigned long long* out_galaxy_sigs,   // len = seed_count
+    unsigned long long* out_planet_sigs,   // len = seed_count
+    unsigned long long* out_vein_sigs,     // len = seed_count
+    unsigned long long* out_pipeline_sigs  // len = seed_count
+);
+
 #ifdef __cplusplus
 }
 #endif
