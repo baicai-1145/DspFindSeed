@@ -533,12 +533,38 @@ namespace SeedCli
         /// </summary>
         public static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64(DspFindSeed.GameDesc gameDesc)
         {
-            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(gameDesc, collisionFp64: false);
+            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(
+                gameDesc,
+                collisionFp64: false,
+                buildPlanetsAndAstros: true,
+                buildStarGraph: true);
         }
 
         public static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64(DspFindSeed.GameDesc gameDesc)
         {
-            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(gameDesc, collisionFp64: true);
+            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(
+                gameDesc,
+                collisionFp64: true,
+                buildPlanetsAndAstros: true,
+                buildStarGraph: true);
+        }
+
+        public static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_StarsOnly(DspFindSeed.GameDesc gameDesc)
+        {
+            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(
+                gameDesc,
+                collisionFp64: false,
+                buildPlanetsAndAstros: false,
+                buildStarGraph: false);
+        }
+
+        public static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64_StarsOnly(DspFindSeed.GameDesc gameDesc)
+        {
+            return CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(
+                gameDesc,
+                collisionFp64: true,
+                buildPlanetsAndAstros: false,
+                buildStarGraph: false);
         }
 
         public static int GenerateTempPosesOnly_ParamsFp64_Cpu(
@@ -644,7 +670,11 @@ namespace SeedCli
             }
         }
 
-        private static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(DspFindSeed.GameDesc gameDesc, bool collisionFp64)
+        private static GalaxyData CreateGalaxy_PtFp64_RandFp64_ParamsFp64_Impl(
+            DspFindSeed.GameDesc gameDesc,
+            bool collisionFp64,
+            bool buildPlanetsAndAstros,
+            bool buildStarGraph)
         {
             int galaxyAlgo = gameDesc.galaxyAlgo;
             int galaxySeed = gameDesc.galaxySeed;
@@ -713,40 +743,44 @@ namespace SeedCli
                 }
             }
 
-            AstroData[] astrosData = galaxy.astrosData;
             StarData[] stars = galaxy.stars;
-            for (int i = 0; i < galaxy.astrosData.Length; ++i)
+            if (buildPlanetsAndAstros)
             {
-                astrosData[i].uRot.w = 1f;
-                astrosData[i].uRotNext.w = 1f;
-            }
-
-            for (int i = 0; i < tempPoses; ++i)
-            {
-                DspFindSeed.StarGen.CreateStarPlanets(galaxy, stars[i], gameDesc);
-                astrosData[stars[i].id * 100].uPos = astrosData[stars[i].id * 100].uPosNext = stars[i].uPosition;
-                astrosData[stars[i].id * 100].uRot = astrosData[stars[i].id * 100].uRotNext = Quaternion.identity;
-                astrosData[stars[i].id * 100].uRadius = stars[i].physicsRadius;
-            }
-
-            galaxy.birthPlanetId = 0;
-            if (tempPoses > 0)
-            {
-                StarData birthStar = stars[0];
-                for (int i = 0; i < birthStar.planetCount; ++i)
+                AstroData[] astrosData = galaxy.astrosData;
+                for (int i = 0; i < galaxy.astrosData.Length; ++i)
                 {
-                    PlanetData planet = birthStar.planets[i];
-                    var themeProto = DspFindSeed.LDB.themes.Select(planet.theme);
-                    if (themeProto != null && themeProto.Distribute == EThemeDistribute.Birth)
+                    astrosData[i].uRot.w = 1f;
+                    astrosData[i].uRotNext.w = 1f;
+                }
+
+                for (int i = 0; i < tempPoses; ++i)
+                {
+                    DspFindSeed.StarGen.CreateStarPlanets(galaxy, stars[i], gameDesc);
+                    astrosData[stars[i].id * 100].uPos = astrosData[stars[i].id * 100].uPosNext = stars[i].uPosition;
+                    astrosData[stars[i].id * 100].uRot = astrosData[stars[i].id * 100].uRotNext = Quaternion.identity;
+                    astrosData[stars[i].id * 100].uRadius = stars[i].physicsRadius;
+                }
+
+                galaxy.birthPlanetId = 0;
+                if (tempPoses > 0)
+                {
+                    StarData birthStar = stars[0];
+                    for (int i = 0; i < birthStar.planetCount; ++i)
                     {
-                        galaxy.birthPlanetId = planet.id;
-                        galaxy.birthStarId = birthStar.id;
-                        break;
+                        PlanetData planet = birthStar.planets[i];
+                        var themeProto = DspFindSeed.LDB.themes.Select(planet.theme);
+                        if (themeProto != null && themeProto.Distribute == EThemeDistribute.Birth)
+                        {
+                            galaxy.birthPlanetId = planet.id;
+                            galaxy.birthStarId = birthStar.id;
+                            break;
+                        }
                     }
                 }
             }
 
-            DspFindSeed.UniverseGen.CreateGalaxyStarGraph(galaxy);
+            if (buildStarGraph)
+                DspFindSeed.UniverseGen.CreateGalaxyStarGraph(galaxy);
             DspFindSeed.PlanetGen.gasCoef = 1f;
             return galaxy;
         }

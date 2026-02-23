@@ -29,6 +29,8 @@ typedef struct dsp_planet_core_f32_out_t {
     double rand2;
     double rand3;
     double rand4;
+    double num13;
+    double num14;
     int theme_seed;
     int type_case;
     int singularity_flags;
@@ -153,6 +155,48 @@ int dsp_cuda_planet_eval_gas_details_f32(
     int device_id,
     float* out_gas_speeds,
     double* out_total_heat);
+
+// Chunk-level wrappers for pipeline orchestration.
+// Current implementation reuses existing batch kernels; ABI is stabilized for future fused kernels.
+int dsp_cuda_mix_chunk_eval_planets_f32(
+    const int* info_seeds,
+    const int* orbit_arounds,
+    const int* orbit_indexes,
+    const int* gas_giants,
+    const int* star_indexes,
+    const int* galaxy_star_counts,
+    const int* galaxy_habitable_counts,
+    const int* boost_inclination_ns,
+    const int* compact_type_cases,
+    const float* star_orbit_scalers,
+    const double* star_masses,
+    const float* star_habitable_radiuses,
+    const float* star_light_balance_radiuses,
+    const float* orbit_around_planet_real_radiuses,
+    const float* orbit_around_planet_orbit_radiuses,
+    const double* orbit_around_planet_orbital_periods,
+    int batch_count,
+    int device_id,
+    dsp_planet_core_f32_out_t* out_results);
+
+int dsp_cuda_mix_chunk_eval_veins_f32(
+    const int* planet_seeds,
+    const float* p_values,
+    const int* bonus_cases,
+    const int* is_birth_stars,
+    const int* vein_spot_lens,
+    const int* rare_vein_lens,
+    const int* vein_spot_values,
+    int vein_spot_stride,
+    const int* rare_vein_values,
+    int rare_vein_stride,
+    const float* rare_settings_values,
+    int rare_settings_stride,
+    int planet_count,
+    int out_vein_len,
+    int use_fp32_prob_compare,
+    int device_id,
+    int* out_counts);
 
 #ifdef __cplusplus
 }

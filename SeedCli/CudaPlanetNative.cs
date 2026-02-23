@@ -28,6 +28,8 @@ namespace SeedCli
         private static bool _printedFallback;
         private static bool _coreBatchEntryMissing;
         private static bool _coreBatchFallbackPrinted;
+        private static bool _mixChunkPlanetEntryMissing;
+        private static bool _mixChunkVeinEntryMissing;
         private static readonly ConcurrentQueue<PlanetCoreBatchRequest> _coreBatchQueue = new ConcurrentQueue<PlanetCoreBatchRequest>();
         private static readonly AutoResetEvent _coreBatchWake = new AutoResetEvent(false);
         private static int _coreBatchWorkerStarted;
@@ -36,6 +38,7 @@ namespace SeedCli
         private static long _perfCoreBatchCalls;
         private static long _perfCoreBatchItems;
         private static long _perfCoreBatchTicks;
+        private static long _perfCoreBatchFallbackCalls;
         private static long _perfCoreSingleCalls;
         private static long _perfCoreSingleTicks;
         private static long _perfVeinBatchCalls;
@@ -53,6 +56,22 @@ namespace SeedCli
         [ThreadStatic] private static int[] _rareVeinValues;
         [ThreadStatic] private static float[] _rareSettingsValues;
         [ThreadStatic] private static int[] _outCounts;
+        [ThreadStatic] private static int[] _coreInfoSeeds;
+        [ThreadStatic] private static int[] _coreOrbitArounds;
+        [ThreadStatic] private static int[] _coreOrbitIndexes;
+        [ThreadStatic] private static int[] _coreGasGiants;
+        [ThreadStatic] private static int[] _coreStarIndexes;
+        [ThreadStatic] private static int[] _coreGalaxyStarCounts;
+        [ThreadStatic] private static int[] _coreGalaxyHabitableCounts;
+        [ThreadStatic] private static int[] _coreBoostInclinationNs;
+        [ThreadStatic] private static int[] _coreCompactTypeCases;
+        [ThreadStatic] private static float[] _coreStarOrbitScalers;
+        [ThreadStatic] private static double[] _coreStarMasses;
+        [ThreadStatic] private static float[] _coreStarHabitableRadii;
+        [ThreadStatic] private static float[] _coreStarLightBalanceRadii;
+        [ThreadStatic] private static float[] _coreAroundRealRadii;
+        [ThreadStatic] private static float[] _coreAroundOrbitRadii;
+        [ThreadStatic] private static double[] _coreAroundOrbitalPeriods;
 
         [StructLayout(LayoutKind.Sequential)]
         internal struct PlanetCoreF32Out
@@ -75,12 +94,34 @@ namespace SeedCli
             public double rand2;
             public double rand3;
             public double rand4;
+            public double num13;
+            public double num14;
             public int theme_seed;
             public int type_case;
             public int singularity_flags;
             public int habitable_count_delta;
             public int precision;
             public int segment;
+        }
+
+        internal struct PlanetCoreBatchInput
+        {
+            public int infoSeed;
+            public int orbitAround;
+            public int orbitIndex;
+            public int gasGiant;
+            public int starIndex;
+            public int galaxyStarCount;
+            public int galaxyHabitableCount;
+            public int boostInclinationNs;
+            public int compactTypeCase;
+            public float starOrbitScaler;
+            public double starMass;
+            public float starHabitableRadius;
+            public float starLightBalanceRadius;
+            public float orbitAroundPlanetRealRadius;
+            public float orbitAroundPlanetOrbitRadius;
+            public double orbitAroundPlanetOrbitalPeriod;
         }
 
         private sealed class PlanetCoreBatchRequest
@@ -113,6 +154,7 @@ namespace SeedCli
             public long coreBatchCalls;
             public long coreBatchItems;
             public double coreBatchMs;
+            public long coreBatchFallbackCalls;
             public long coreSingleCalls;
             public double coreSingleMs;
             public long veinBatchCalls;
@@ -123,6 +165,26 @@ namespace SeedCli
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_refresh_planet_vein_spots_batch")]
         private static extern int NativeRefreshPlanetVeinSpotsBatch(
+            [In] int[] planetSeeds,
+            [In] float[] pValues,
+            [In] int[] bonusCases,
+            [In] int[] isBirthStars,
+            [In] int[] veinSpotLens,
+            [In] int[] rareVeinLens,
+            [In] int[] veinSpotValues,
+            int veinSpotStride,
+            [In] int[] rareVeinValues,
+            int rareVeinStride,
+            [In] float[] rareSettingsValues,
+            int rareSettingsStride,
+            int planetCount,
+            int outVeinLen,
+            int useFp32ProbCompare,
+            int deviceId,
+            [Out] int[] outCounts);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_mix_chunk_eval_veins_f32")]
+        private static extern int NativeMixChunkEvalVeinsF32(
             [In] int[] planetSeeds,
             [In] float[] pValues,
             [In] int[] bonusCases,
@@ -164,6 +226,28 @@ namespace SeedCli
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_planet_eval_core_f32_batch")]
         private static extern int NativePlanetEvalCoreF32Batch(
+            [In] int[] infoSeeds,
+            [In] int[] orbitArounds,
+            [In] int[] orbitIndexes,
+            [In] int[] gasGiants,
+            [In] int[] starIndexes,
+            [In] int[] galaxyStarCounts,
+            [In] int[] galaxyHabitableCounts,
+            [In] int[] boostInclinationNs,
+            [In] int[] compactTypeCases,
+            [In] float[] starOrbitScalers,
+            [In] double[] starMasses,
+            [In] float[] starHabitableRadii,
+            [In] float[] starLightBalanceRadii,
+            [In] float[] orbitAroundPlanetRealRadii,
+            [In] float[] orbitAroundPlanetOrbitRadii,
+            [In] double[] orbitAroundPlanetOrbitalPeriods,
+            int batchCount,
+            int deviceId,
+            [Out] PlanetCoreF32Out[] outResults);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, EntryPoint = "dsp_cuda_mix_chunk_eval_planets_f32")]
+        private static extern int NativeMixChunkEvalPlanetsF32(
             [In] int[] infoSeeds,
             [In] int[] orbitArounds,
             [In] int[] orbitIndexes,
@@ -229,6 +313,7 @@ namespace SeedCli
             Interlocked.Exchange(ref _perfCoreBatchCalls, 0);
             Interlocked.Exchange(ref _perfCoreBatchItems, 0);
             Interlocked.Exchange(ref _perfCoreBatchTicks, 0);
+            Interlocked.Exchange(ref _perfCoreBatchFallbackCalls, 0);
             Interlocked.Exchange(ref _perfCoreSingleCalls, 0);
             Interlocked.Exchange(ref _perfCoreSingleTicks, 0);
             Interlocked.Exchange(ref _perfVeinBatchCalls, 0);
@@ -247,6 +332,7 @@ namespace SeedCli
                 coreBatchCalls = Interlocked.Read(ref _perfCoreBatchCalls),
                 coreBatchItems = Interlocked.Read(ref _perfCoreBatchItems),
                 coreBatchMs = Interlocked.Read(ref _perfCoreBatchTicks) * toMs,
+                coreBatchFallbackCalls = Interlocked.Read(ref _perfCoreBatchFallbackCalls),
                 coreSingleCalls = Interlocked.Read(ref _perfCoreSingleCalls),
                 coreSingleMs = Interlocked.Read(ref _perfCoreSingleTicks) * toMs,
                 veinBatchCalls = Interlocked.Read(ref _perfVeinBatchCalls),
@@ -331,6 +417,52 @@ namespace SeedCli
             int rc;
             try
             {
+                if (_mixChunkVeinEntryMissing)
+                {
+                    rc = NativeRefreshPlanetVeinSpotsBatch(
+                        _planetSeeds,
+                        _pValues,
+                        _bonusCases,
+                        _isBirthStars,
+                        _veinSpotLens,
+                        _rareVeinLens,
+                        _veinSpotValues,
+                        MaxVeinSpotLen,
+                        _rareVeinValues,
+                        MaxRareVeins,
+                        _rareSettingsValues,
+                        MaxRareVeins * RareSettingsGroup,
+                        planetCount,
+                        veinLen,
+                        useFp32ProbCompare ? 1 : 0,
+                        deviceId,
+                        _outCounts);
+                }
+                else
+                {
+                    rc = NativeMixChunkEvalVeinsF32(
+                        _planetSeeds,
+                        _pValues,
+                        _bonusCases,
+                        _isBirthStars,
+                        _veinSpotLens,
+                        _rareVeinLens,
+                        _veinSpotValues,
+                        MaxVeinSpotLen,
+                        _rareVeinValues,
+                        MaxRareVeins,
+                        _rareSettingsValues,
+                        MaxRareVeins * RareSettingsGroup,
+                        planetCount,
+                        veinLen,
+                        useFp32ProbCompare ? 1 : 0,
+                        deviceId,
+                        _outCounts);
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _mixChunkVeinEntryMissing = true;
                 rc = NativeRefreshPlanetVeinSpotsBatch(
                     _planetSeeds,
                     _pValues,
@@ -350,7 +482,7 @@ namespace SeedCli
                     deviceId,
                     _outCounts);
             }
-            catch (Exception ex) when (ex is DllNotFoundException || ex is EntryPointNotFoundException || ex is BadImageFormatException)
+            catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
             {
                 Interlocked.Add(ref _perfVeinBatchTicks, Stopwatch.GetTimestamp() - t0);
                 Interlocked.Increment(ref _perfVeinBatchFailCalls);
@@ -369,6 +501,163 @@ namespace SeedCli
             countsFlat = _outCounts;
             outVeinLen = veinLen;
             Interlocked.Add(ref _perfVeinBatchTicks, Stopwatch.GetTimestamp() - t0);
+            return true;
+        }
+
+        public static bool TryEvalPlanetCoreF32Batch(
+            IList<PlanetCoreBatchInput> inputs,
+            PlanetCoreF32Out[] outResults)
+        {
+            if (!IsCoreEnabled())
+                return false;
+            if (_nativeBroken)
+                return false;
+            if (inputs == null || inputs.Count == 0 || outResults == null || outResults.Length < inputs.Count)
+                return false;
+
+            int n = inputs.Count;
+            long t0 = Stopwatch.GetTimestamp();
+            Interlocked.Increment(ref _perfCoreBatchCalls);
+            Interlocked.Add(ref _perfCoreBatchItems, n);
+
+            EnsureCoreBatchBuffers(n);
+            var infoSeeds = _coreInfoSeeds;
+            var orbitArounds = _coreOrbitArounds;
+            var orbitIndexes = _coreOrbitIndexes;
+            var gasGiants = _coreGasGiants;
+            var starIndexes = _coreStarIndexes;
+            var galaxyStarCounts = _coreGalaxyStarCounts;
+            var galaxyHabitableCounts = _coreGalaxyHabitableCounts;
+            var boostInclinationNs = _coreBoostInclinationNs;
+            var compactTypeCases = _coreCompactTypeCases;
+            var starOrbitScalers = _coreStarOrbitScalers;
+            var starMasses = _coreStarMasses;
+            var starHabitableRadii = _coreStarHabitableRadii;
+            var starLightBalanceRadii = _coreStarLightBalanceRadii;
+            var aroundRealRadii = _coreAroundRealRadii;
+            var aroundOrbitRadii = _coreAroundOrbitRadii;
+            var aroundOrbitalPeriods = _coreAroundOrbitalPeriods;
+
+            for (int i = 0; i < n; ++i)
+            {
+                var r = inputs[i];
+                infoSeeds[i] = r.infoSeed;
+                orbitArounds[i] = r.orbitAround;
+                orbitIndexes[i] = r.orbitIndex;
+                gasGiants[i] = r.gasGiant;
+                starIndexes[i] = r.starIndex;
+                galaxyStarCounts[i] = r.galaxyStarCount;
+                galaxyHabitableCounts[i] = r.galaxyHabitableCount;
+                boostInclinationNs[i] = r.boostInclinationNs;
+                compactTypeCases[i] = r.compactTypeCase;
+                starOrbitScalers[i] = r.starOrbitScaler;
+                starMasses[i] = r.starMass;
+                starHabitableRadii[i] = r.starHabitableRadius;
+                starLightBalanceRadii[i] = r.starLightBalanceRadius;
+                aroundRealRadii[i] = r.orbitAroundPlanetRealRadius;
+                aroundOrbitRadii[i] = r.orbitAroundPlanetOrbitRadius;
+                aroundOrbitalPeriods[i] = r.orbitAroundPlanetOrbitalPeriod;
+            }
+
+            int deviceId = GetDeviceIdFromEnv();
+            int rc;
+            try
+            {
+                if (_mixChunkPlanetEntryMissing)
+                {
+                    rc = NativePlanetEvalCoreF32Batch(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
+                }
+                else
+                {
+                    rc = NativeMixChunkEvalPlanetsF32(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
+                }
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _mixChunkPlanetEntryMissing = true;
+                try
+                {
+                    rc = NativePlanetEvalCoreF32Batch(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
+                    _coreBatchEntryMissing = true;
+                    return false;
+                }
+            }
+            catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
+                MarkNativeBroken(ex.GetType().Name + ": " + ex.Message);
+                return false;
+            }
+
+            if (rc != Ok)
+            {
+                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
+                MarkNativeBroken("planet-core-batch native return code=" + rc);
+                return false;
+            }
+
+            Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
             return true;
         }
 
@@ -470,6 +759,7 @@ namespace SeedCli
         private static void CoreBatchWorkerLoop()
         {
             var batch = new List<PlanetCoreBatchRequest>(GetCoreBatchMaxSize());
+            int collectUs = GetCoreBatchCollectUs();
             while (true)
             {
                 batch.Clear();
@@ -481,16 +771,32 @@ namespace SeedCli
                 }
 
                 batch.Add(first);
-                while (_coreBatchQueue.TryDequeue(out var req))
+                if (collectUs > 0)
                 {
-                    batch.Add(req);
-                    if (batch.Count >= GetCoreBatchMaxSize())
-                        break;
+                    long waitTicks = (long)(collectUs * (Stopwatch.Frequency / 1_000_000.0));
+                    long deadline = Stopwatch.GetTimestamp() + waitTicks;
+                    while (batch.Count < GetCoreBatchMaxSize())
+                    {
+                        if (_coreBatchQueue.TryDequeue(out var req))
+                        {
+                            batch.Add(req);
+                            continue;
+                        }
+                        if (Stopwatch.GetTimestamp() >= deadline)
+                            break;
+                        Thread.SpinWait(64);
+                    }
+                }
+
+                while (batch.Count < GetCoreBatchMaxSize() && _coreBatchQueue.TryDequeue(out var req2))
+                {
+                    batch.Add(req2);
                 }
 
                 bool ok = TryEvalPlanetCoreF32BatchInternal(batch);
                 if (!ok)
                 {
+                    Interlocked.Increment(ref _perfCoreBatchFallbackCalls);
                     for (int i = 0; i < batch.Count; ++i)
                     {
                         var r = batch[i];
@@ -557,37 +863,90 @@ namespace SeedCli
             int rc;
             try
             {
-                rc = NativePlanetEvalCoreF32Batch(
-                    infoSeeds,
-                    orbitArounds,
-                    orbitIndexes,
-                    gasGiants,
-                    starIndexes,
-                    galaxyStarCounts,
-                    galaxyHabitableCounts,
-                    boostInclinationNs,
-                    compactTypeCases,
-                    starOrbitScalers,
-                    starMasses,
-                    starHabitableRadii,
-                    starLightBalanceRadii,
-                    aroundRealRadii,
-                    aroundOrbitRadii,
-                    aroundOrbitalPeriods,
-                    n,
-                    deviceId,
-                    outResults);
+                if (_mixChunkPlanetEntryMissing)
+                {
+                    rc = NativePlanetEvalCoreF32Batch(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
+                }
+                else
+                {
+                    rc = NativeMixChunkEvalPlanetsF32(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
+                }
             }
             catch (EntryPointNotFoundException)
             {
-                Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
-                _coreBatchEntryMissing = true;
-                if (!_coreBatchFallbackPrinted)
+                _mixChunkPlanetEntryMissing = true;
+                try
                 {
-                    _coreBatchFallbackPrinted = true;
-                    Console.WriteLine("[cuda-planet] planet-core batch entry not found, fallback to single.");
+                    rc = NativePlanetEvalCoreF32Batch(
+                        infoSeeds,
+                        orbitArounds,
+                        orbitIndexes,
+                        gasGiants,
+                        starIndexes,
+                        galaxyStarCounts,
+                        galaxyHabitableCounts,
+                        boostInclinationNs,
+                        compactTypeCases,
+                        starOrbitScalers,
+                        starMasses,
+                        starHabitableRadii,
+                        starLightBalanceRadii,
+                        aroundRealRadii,
+                        aroundOrbitRadii,
+                        aroundOrbitalPeriods,
+                        n,
+                        deviceId,
+                        outResults);
                 }
-                return false;
+                catch (EntryPointNotFoundException)
+                {
+                    Interlocked.Add(ref _perfCoreBatchTicks, Stopwatch.GetTimestamp() - t0);
+                    _coreBatchEntryMissing = true;
+                    if (!_coreBatchFallbackPrinted)
+                    {
+                        _coreBatchFallbackPrinted = true;
+                        Console.WriteLine("[cuda-planet] planet-core batch entry not found, fallback to single.");
+                    }
+                    return false;
+                }
             }
             catch (Exception ex) when (ex is DllNotFoundException || ex is BadImageFormatException)
             {
@@ -673,6 +1032,21 @@ namespace SeedCli
                 return 8;
             if (parsed > 16384)
                 return 16384;
+            return parsed;
+        }
+
+        private static int GetCoreBatchCollectUs()
+        {
+            const int defaultUs = 300;
+            var env = Environment.GetEnvironmentVariable("DSP_CUDA_PLANET_CORE_BATCH_WAIT_US");
+            if (string.IsNullOrEmpty(env))
+                return defaultUs;
+            if (!int.TryParse(env, out var parsed))
+                return defaultUs;
+            if (parsed < 0)
+                return 0;
+            if (parsed > 5000)
+                return 5000;
             return parsed;
         }
 
@@ -800,6 +1174,26 @@ namespace SeedCli
             EnsureIntBuffer(ref _outCounts, planetCount * outVeinLen);
         }
 
+        private static void EnsureCoreBatchBuffers(int itemCount)
+        {
+            EnsureIntBuffer(ref _coreInfoSeeds, itemCount);
+            EnsureIntBuffer(ref _coreOrbitArounds, itemCount);
+            EnsureIntBuffer(ref _coreOrbitIndexes, itemCount);
+            EnsureIntBuffer(ref _coreGasGiants, itemCount);
+            EnsureIntBuffer(ref _coreStarIndexes, itemCount);
+            EnsureIntBuffer(ref _coreGalaxyStarCounts, itemCount);
+            EnsureIntBuffer(ref _coreGalaxyHabitableCounts, itemCount);
+            EnsureIntBuffer(ref _coreBoostInclinationNs, itemCount);
+            EnsureIntBuffer(ref _coreCompactTypeCases, itemCount);
+            EnsureFloatBuffer(ref _coreStarOrbitScalers, itemCount);
+            EnsureDoubleBuffer(ref _coreStarMasses, itemCount);
+            EnsureFloatBuffer(ref _coreStarHabitableRadii, itemCount);
+            EnsureFloatBuffer(ref _coreStarLightBalanceRadii, itemCount);
+            EnsureFloatBuffer(ref _coreAroundRealRadii, itemCount);
+            EnsureFloatBuffer(ref _coreAroundOrbitRadii, itemCount);
+            EnsureDoubleBuffer(ref _coreAroundOrbitalPeriods, itemCount);
+        }
+
         private static void EnsureIntBuffer(ref int[] arr, int needed)
         {
             if (arr == null || arr.Length < needed)
@@ -810,6 +1204,12 @@ namespace SeedCli
         {
             if (arr == null || arr.Length < needed)
                 arr = new float[needed];
+        }
+
+        private static void EnsureDoubleBuffer(ref double[] arr, int needed)
+        {
+            if (arr == null || arr.Length < needed)
+                arr = new double[needed];
         }
 
         private static int GetDeviceIdFromEnv()

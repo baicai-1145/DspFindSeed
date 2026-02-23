@@ -12,25 +12,30 @@ namespace SeedCli
     /// </summary>
     internal static class PlanetGenF32
     {
+        private const int TypeCaseGas = 0;
+        private const int TypeCaseOcean = 1;
+        private const int TypeCaseVocano = 2;
+        private const int TypeCaseDesert = 3;
+        private const int TypeCaseIce = 4;
+
         // 复用原工程的 gasCoef（由 UniverseGen 按资源倍率设置）
         private static float GasCoef => global::DspFindSeed.PlanetGen.gasCoef;
 
         [ThreadStatic] private static List<int> _tmpTheme;
+        [ThreadStatic] private static int[] _cachedThemeIdsRef;
+        [ThreadStatic] private static global::DspFindSeed.ThemeProto[] _cachedThemeProtos;
 
-        public static PlanetData CreatePlanet(
+        public static PlanetData CreatePlanetShell(
             GalaxyData galaxy,
             StarData star,
-            int[] themeIds,
             int index,
             int orbitAround,
             int orbitIndex,
             int number,
-            bool gasGiant,
-            int info_seed,
-            int gen_seed)
+            int gen_seed,
+            int info_seed)
         {
             PlanetData planet = new PlanetData();
-            DotNet35Random rng = new DotNet35Random(info_seed);
             planet.index = index;
             planet.galaxy = star.galaxy;
             planet.star = star;
@@ -41,7 +46,6 @@ namespace SeedCli
             planet.number = number;
             planet.id = star.id * 100 + index + 1;
 
-            // 这一段基本不影响搜索，但保持结构一致
             if (orbitAround > 0)
             {
                 for (int i = 0; i < star.planetCount; ++i)
@@ -60,18 +64,103 @@ namespace SeedCli
                 Assert.NotNull(planet.orbitAroundPlanet);
             }
 
-            string roman = star.planetCount > 20 ? (index + 1).ToString() : NameGen.roman[index + 1];
-            planet.name = star.name + " " + roman + "号星";
+            if (!MixRuntimeFlags.SignatureOnlyFastPath)
+            {
+                string roman = star.planetCount > 20 ? (index + 1).ToString() : NameGen.roman[index + 1];
+                planet.name = star.name + " " + roman + "号星";
+            }
+            return planet;
+        }
 
-            if (CudaPlanetNative.TryEvalPlanetCoreF32(
-                info_seed,
-                orbitAround,
-                orbitIndex,
-                gasGiant,
-                star,
-                planet.orbitAroundPlanet,
-                star.galaxy.habitableCount,
-                out var core))
+        public static void ApplyCoreOrbitState(PlanetData planet, in CudaPlanetNative.PlanetCoreF32Out core)
+        {
+            if (planet == null)
+                return;
+            planet.orbitRadius = core.orbit_radius;
+            planet.orbitalPeriod = core.orbital_period;
+            planet.scale = core.scale;
+            planet.radius = core.radius;
+        }
+
+        public static void RecomputeCoreTypeByHabitableCount(
+            ref CudaPlanetNative.PlanetCoreF32Out core,
+            int infoSeed,
+            int orbitAround,
+            int orbitIndex,
+            bool gasGiant,
+            StarData star,
+            int galaxyHabitableCount)
+        {
+            if (gasGiant)
+            {
+                core.type_case = TypeCaseGas;
+                core.habitable_count_delta = 0;
+                core.precision = 64;
+                core.segment = 2;
+                core.radius = 80f;
+                return;
+            }
+
+            // num13/num14 已在 CUDA core 输出里给出，避免这里重复 RNG 开销。
+            // 当走纯 CPU fallback 时这两个值仍是默认 0，不影响 fallback 路径（该路径不走此函数）。
+            double num13 = core.num13;
+            double num14 = core.num14;
+
+            float num18 = Mathf.Ceil(star.galaxy.starCount * 0.29f);
+            if (num18 < 11f) num18 = 11f;
+            float num19 = num18 - galaxyHabitableCount;
+            float num20 = star.galaxy.starCount - star.index;
+            float num24 = Mathf.Clamp((num19 / Mathf.Max(1f, num20)) * 0.5f + 0.175f, 0.08f, 0.8f);
+            float num25 = Mathf.Pow(Mathf.Clamp01(core.habitable_bias / num24), num24 * 10f);
+
+            int typeCase;
+            int habitableDelta = 0;
+            float f2 = 1000f;
+            if (star.habitableRadius > 0f && core.sun_distance > 0f)
+                f2 = core.sun_distance / star.habitableRadius;
+
+            if ((num13 > num25 && star.index > 0) || (orbitAround > 0 && orbitIndex == 1 && star.index == 0))
+            {
+                typeCase = TypeCaseOcean;
+                habitableDelta = 1;
+            }
+            else if (f2 < 0.833333f)
+            {
+                float num26 = Mathf.Max(0.15f, f2 * 2.5f - 0.85f);
+                typeCase = num14 >= num26 ? TypeCaseVocano : TypeCaseDesert;
+            }
+            else if (f2 < 1.2f)
+            {
+                typeCase = TypeCaseDesert;
+            }
+            else
+            {
+                float num27 = 0.9f / f2 - 0.1f;
+                typeCase = num14 >= num27 ? TypeCaseIce : TypeCaseDesert;
+            }
+
+            core.type_case = typeCase;
+            core.habitable_count_delta = habitableDelta;
+            core.precision = 200;
+            core.segment = 5;
+            core.radius = 200f;
+        }
+
+        public static void ApplyCoreAndTheme(
+            PlanetData planet,
+            int[] themeIds,
+            ref CudaPlanetNative.PlanetCoreF32Out core)
+        {
+            if (planet == null || planet.star == null || planet.star.galaxy == null)
+                return;
+
+            planet.temperatureBias = core.temperature_bias;
+            planet.type = (EPlanetType)CudaPlanetNative.MapTypeCaseToPlanetType(core.type_case);
+
+            if (core.habitable_count_delta > 0)
+                ++planet.star.galaxy.habitableCount;
+
+            if (!MixRuntimeFlags.SignatureOnlyFastPath)
             {
                 planet.orbitRadius = core.orbit_radius;
                 planet.orbitInclination = core.orbit_inclination;
@@ -84,19 +173,44 @@ namespace SeedCli
                 planet.sunDistance = core.sun_distance;
                 planet.scale = core.scale;
                 planet.habitableBias = core.habitable_bias;
-                planet.temperatureBias = core.temperature_bias;
                 planet.radius = core.radius;
                 planet.luminosity = core.luminosity;
                 planet.precision = core.precision;
                 planet.segment = core.segment;
                 planet.singularity |= CudaPlanetNative.BuildSingularityFromFlags(core.singularity_flags);
-                planet.type = (EPlanetType)CudaPlanetNative.MapTypeCaseToPlanetType(core.type_case);
+            }
 
-                if (core.habitable_count_delta > 0)
-                    ++star.galaxy.habitableCount;
+            SetPlanetTheme(planet, themeIds, core.rand1, core.rand2, core.rand3, core.rand4, core.theme_seed);
+            if (!MixRuntimeFlags.SignatureOnlyFastPath)
+                planet.star.galaxy.astrosData[planet.id].uRadius = planet.realRadius;
+        }
 
-                SetPlanetTheme(planet, themeIds, core.rand1, core.rand2, core.rand3, core.rand4, core.theme_seed);
-                star.galaxy.astrosData[planet.id].uRadius = planet.realRadius;
+        public static PlanetData CreatePlanet(
+            GalaxyData galaxy,
+            StarData star,
+            int[] themeIds,
+            int index,
+            int orbitAround,
+            int orbitIndex,
+            int number,
+            bool gasGiant,
+            int info_seed,
+            int gen_seed)
+        {
+            PlanetData planet = CreatePlanetShell(galaxy, star, index, orbitAround, orbitIndex, number, gen_seed, info_seed);
+            DotNet35Random rng = new DotNet35Random(info_seed);
+
+            if (CudaPlanetNative.TryEvalPlanetCoreF32(
+                info_seed,
+                orbitAround,
+                orbitIndex,
+                gasGiant,
+                star,
+                planet.orbitAroundPlanet,
+                star.galaxy.habitableCount,
+                out var core))
+            {
+                ApplyCoreAndTheme(planet, themeIds, ref core);
                 return planet;
             }
 
@@ -287,7 +401,8 @@ namespace SeedCli
             planet.luminosity = Mathf.Round(planet.luminosity * 100f) / 100f;
 
             SetPlanetTheme(planet, themeIds, rand1, rand2, rand3, rand4, theme_seed);
-            star.galaxy.astrosData[planet.id].uRadius = planet.realRadius;
+            if (!MixRuntimeFlags.SignatureOnlyFastPath)
+                star.galaxy.astrosData[planet.id].uRadius = planet.realRadius;
             return planet;
         }
 
@@ -303,13 +418,13 @@ namespace SeedCli
             if (_tmpTheme == null) _tmpTheme = new List<int>();
             else _tmpTheme.Clear();
 
-            if (themeIds == null)
-                themeIds = global::DspFindSeed.ThemeProto.themeIds;
-
-            int length1 = themeIds.Length;
+            var themeProtos = ResolveThemeProtos(themeIds);
+            int length1 = themeProtos.Length;
             for (int i = 0; i < length1; ++i)
             {
-                var themeProto = global::DspFindSeed.LDB.themes.Select(themeIds[i]);
+                var themeProto = themeProtos[i];
+                if (themeProto == null)
+                    continue;
                 bool ok = false;
                 if (planet.star.index == 0 && planet.type == EPlanetType.Ocean)
                 {
@@ -354,7 +469,9 @@ namespace SeedCli
             {
                 for (int i = 0; i < length1; ++i)
                 {
-                    var themeProto = global::DspFindSeed.LDB.themes.Select(themeIds[i]);
+                    var themeProto = themeProtos[i];
+                    if (themeProto == null)
+                        continue;
                     bool ok = themeProto.PlanetType == EPlanetType.Desert;
                     if (ok)
                     {
@@ -375,7 +492,9 @@ namespace SeedCli
             {
                 for (int i = 0; i < length1; ++i)
                 {
-                    var themeProto = global::DspFindSeed.LDB.themes.Select(themeIds[i]);
+                    var themeProto = themeProtos[i];
+                    if (themeProto == null)
+                        continue;
                     if (themeProto.PlanetType == EPlanetType.Desert)
                         _tmpTheme.Add(themeProto.ID);
                 }
@@ -383,7 +502,26 @@ namespace SeedCli
 
             planet.theme = _tmpTheme[(int)(rand1 * _tmpTheme.Count) % _tmpTheme.Count];
 
-            var themeProto1 = global::DspFindSeed.LDB.themes.Select(planet.theme);
+            global::DspFindSeed.ThemeProto themeProto1 = null;
+            for (int i = 0; i < themeProtos.Length; ++i)
+            {
+                var tp = themeProtos[i];
+                if (tp != null && tp.ID == planet.theme)
+                {
+                    themeProto1 = tp;
+                    break;
+                }
+            }
+            if (themeProto1 == null)
+                themeProto1 = global::DspFindSeed.LDB.themes.Select(planet.theme);
+            if (themeProto1 == null) return;
+
+            planet.type = (EPlanetType)themeProto1.PlanetType.GetHashCode();
+            planet.waterItemId = themeProto1.WaterItemId;
+
+            if (MixRuntimeFlags.SignatureOnlyFastPath)
+                return;
+
             planet.algoId = 0;
             if (themeProto1 != null && themeProto1.Algos != null && themeProto1.Algos.Length != 0)
             {
@@ -392,14 +530,10 @@ namespace SeedCli
                 planet.mod_y = themeProto1.ModY.x + rand4 * (themeProto1.ModY.y - themeProto1.ModY.x);
             }
 
-            if (themeProto1 == null) return;
-
             planet.style = theme_seed % 60;
-            planet.type = (EPlanetType)themeProto1.PlanetType.GetHashCode();
             planet.ionHeight = themeProto1.IonHeight;
             planet.windStrength = themeProto1.Wind;
             planet.waterHeight = themeProto1.WaterHeight;
-            planet.waterItemId = themeProto1.WaterItemId;
             planet.levelized = themeProto1.UseHeightForBuild;
 
             if (planet.type != EPlanetType.Gas) return;
@@ -443,6 +577,27 @@ namespace SeedCli
             planet.gasSpeeds = gasSpeeds;
             planet.gasHeatValues = gasHeatValues;
             planet.gasTotalHeat = totalHeat;
+        }
+
+        private static global::DspFindSeed.ThemeProto[] ResolveThemeProtos(int[] themeIds)
+        {
+            if (themeIds == null)
+                themeIds = global::DspFindSeed.ThemeProto.themeIds;
+
+            if (ReferenceEquals(_cachedThemeIdsRef, themeIds) &&
+                _cachedThemeProtos != null &&
+                _cachedThemeProtos.Length == themeIds.Length)
+            {
+                return _cachedThemeProtos;
+            }
+
+            var arr = new global::DspFindSeed.ThemeProto[themeIds.Length];
+            for (int i = 0; i < themeIds.Length; ++i)
+                arr[i] = global::DspFindSeed.LDB.themes.Select(themeIds[i]);
+
+            _cachedThemeIdsRef = themeIds;
+            _cachedThemeProtos = arr;
+            return arr;
         }
     }
 }

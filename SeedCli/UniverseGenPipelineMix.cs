@@ -16,43 +16,74 @@ namespace SeedCli
 
         public static GalaxyData CreateGalaxy(global::DspFindSeed.GameDesc gameDesc, bool collisionFp64)
         {
+            bool signatureFastPath = MixRuntimeFlags.SignatureOnlyFastPath;
             var g = collisionFp64
-                ? UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64(gameDesc)
-                : UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64(gameDesc);
+                ? (signatureFastPath
+                    ? UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64_StarsOnly(gameDesc)
+                    : UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64_CollFp64(gameDesc))
+                : (signatureFastPath
+                    ? UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64_StarsOnly(gameDesc)
+                    : UniverseGenF32.CreateGalaxy_PtFp64_RandFp64_ParamsFp64(gameDesc));
             if (g == null || g.stars == null)
                 return g;
 
-            // UniverseGenF32 变体内部已生成过一遍行星，必须重置 habitableCount 再覆盖生成
+            // 非 fast-path 下 UniverseGenF32 可能已生成过行星；统一重置后按本管线覆盖生成。
             g.habitableCount = 0;
 
             var astrosData = g.astrosData;
             var stars = g.stars;
-            for (int i = 0; i < g.starCount; ++i)
+            bool useGalaxyCoreBatch = CudaPlanetNative.IsCoreEnabled() && g.starCount > 1;
+            bool chunkWideCoreBatch = useGalaxyCoreBatch && MixRuntimeFlags.ChunkWideCoreBatch;
+            bool manageGalaxyCoreBatchScope = useGalaxyCoreBatch && !chunkWideCoreBatch;
+            if (manageGalaxyCoreBatchScope)
+                StarGenPlanetsF32.BeginGalaxyBatch();
+            try
             {
-                StarGenPlanetsF32.CreateStarPlanetsF32(g, stars[i], gameDesc);
-                astrosData[stars[i].id * 100].uPos = astrosData[stars[i].id * 100].uPosNext = stars[i].uPosition;
-                astrosData[stars[i].id * 100].uRot = astrosData[stars[i].id * 100].uRotNext = Quaternion.identity;
-                astrosData[stars[i].id * 100].uRadius = stars[i].physicsRadius;
-            }
-
-            g.birthPlanetId = 0;
-            if (g.starCount > 0)
-            {
-                StarData birthStar = stars[0];
-                for (int i = 0; i < birthStar.planetCount; ++i)
+                bool writeAstroPose = !MixRuntimeFlags.SignatureOnlyFastPath;
+                for (int i = 0; i < g.starCount; ++i)
                 {
-                    PlanetData planet = birthStar.planets[i];
-                    var themeProto = global::DspFindSeed.LDB.themes.Select(planet.theme);
-                    if (themeProto != null && themeProto.Distribute == EThemeDistribute.Birth)
+                    StarGenPlanetsF32.CreateStarPlanetsF32(g, stars[i], gameDesc);
+                    if (writeAstroPose)
                     {
-                        g.birthPlanetId = planet.id;
-                        g.birthStarId = birthStar.id;
-                        break;
+                        astrosData[stars[i].id * 100].uPos = astrosData[stars[i].id * 100].uPosNext = stars[i].uPosition;
+                        astrosData[stars[i].id * 100].uRot = astrosData[stars[i].id * 100].uRotNext = Quaternion.identity;
+                        astrosData[stars[i].id * 100].uRadius = stars[i].physicsRadius;
                     }
                 }
             }
+            finally
+            {
+                if (manageGalaxyCoreBatchScope)
+                    StarGenPlanetsF32.FlushGalaxyBatch();
+            }
+
+            if (!chunkWideCoreBatch)
+                RefreshBirthPlanet(g);
 
             return g;
+        }
+
+        public static void RefreshBirthPlanet(GalaxyData g)
+        {
+            if (g == null || g.stars == null)
+                return;
+
+            g.birthPlanetId = 0;
+            if (g.starCount <= 0)
+                return;
+
+            StarData birthStar = g.stars[0];
+            for (int i = 0; i < birthStar.planetCount; ++i)
+            {
+                PlanetData planet = birthStar.planets[i];
+                var themeProto = global::DspFindSeed.LDB.themes.Select(planet.theme);
+                if (themeProto != null && themeProto.Distribute == EThemeDistribute.Birth)
+                {
+                    g.birthPlanetId = planet.id;
+                    g.birthStarId = birthStar.id;
+                    break;
+                }
+            }
         }
     }
 }
