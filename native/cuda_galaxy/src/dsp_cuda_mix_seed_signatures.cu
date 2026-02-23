@@ -1,5 +1,7 @@
 #include "dsp_cuda_galaxy.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -15,6 +17,7 @@ namespace
 {
 constexpr int kMBig = 2147483647;
 constexpr int kMSeed = 161803398;
+constexpr int kStarPlanMaxPlanets = 6;
 constexpr unsigned long long kFnvOffset = 14695981039346656037ull;
 constexpr unsigned long long kFnvPrime = 1099511628211ull;
 
@@ -257,6 +260,12 @@ struct PlanetRef
     int seed_idx;
     int star_idx;
     int planet_idx;
+};
+
+struct StarRef
+{
+    int seed_idx;
+    int star_idx;
 };
 
 inline void SetStarAgeLite(
@@ -887,6 +896,614 @@ inline float CalcPAndBonusCase(int star_type, int spectr, const EnumMap& m, int&
     return p;
 }
 
+__device__ __forceinline__ int DAddWrapI32(int a, int b)
+{
+    unsigned int ua = static_cast<unsigned int>(a);
+    unsigned int ub = static_cast<unsigned int>(b);
+    return static_cast<int>(ua + ub);
+}
+
+__device__ __forceinline__ int DSubWrapI32(int a, int b)
+{
+    unsigned int ua = static_cast<unsigned int>(a);
+    unsigned int ub = static_cast<unsigned int>(b);
+    return static_cast<int>(ua - ub);
+}
+
+struct DotNet35RandomDeviceLite
+{
+    int inext;
+    int inextp;
+    int seed_array[56];
+
+    __device__ explicit DotNet35RandomDeviceLite(int seed)
+    {
+        int subtraction = seed == static_cast<int>(0x80000000u) ? kMBig : (seed < 0 ? -seed : seed);
+        int mj = DSubWrapI32(kMSeed, subtraction);
+        seed_array[55] = mj;
+        int mk = 1;
+        for (int i = 1; i < 55; ++i)
+        {
+            int ii = (21 * i) % 55;
+            seed_array[ii] = mk;
+            mk = DSubWrapI32(mj, mk);
+            if (mk < 0)
+                mk = DAddWrapI32(mk, kMBig);
+            mj = seed_array[ii];
+        }
+        for (int k = 1; k < 5; ++k)
+        {
+            for (int i = 1; i < 56; ++i)
+            {
+                seed_array[i] = DSubWrapI32(seed_array[i], seed_array[1 + (i + 30) % 55]);
+                if (seed_array[i] < 0)
+                    seed_array[i] = DAddWrapI32(seed_array[i], kMBig);
+            }
+        }
+        inext = 0;
+        inextp = 31;
+    }
+
+    __device__ int InternalSample()
+    {
+        int loc_inext = inext + 1;
+        if (loc_inext >= 56)
+            loc_inext = 1;
+        int loc_inextp = inextp + 1;
+        if (loc_inextp >= 56)
+            loc_inextp = 1;
+
+        int ret = DSubWrapI32(seed_array[loc_inext], seed_array[loc_inextp]);
+        if (ret < 0)
+            ret = DAddWrapI32(ret, kMBig);
+        seed_array[loc_inext] = ret;
+        inext = loc_inext;
+        inextp = loc_inextp;
+        return ret;
+    }
+
+    __device__ double Sample()
+    {
+        int ret = InternalSample();
+        return static_cast<double>(ret) * 4.6566128752457969e-10;
+    }
+
+    __device__ int Next()
+    {
+        return static_cast<int>(Sample() * 2147483647.0);
+    }
+
+    __device__ double NextDouble()
+    {
+        return Sample();
+    }
+};
+
+__device__ __forceinline__ float DLerp(float a, float b, float t)
+{
+    return a + (b - a) * t;
+}
+
+__global__ void BuildStarPlanetPlansKernel(
+    const int* star_seeds,
+    const int* star_types,
+    const int* star_spectrs,
+    const int* star_indexes,
+    int star_count,
+    int star_type_main_seq,
+    int star_type_giant,
+    int star_type_white_dwarf,
+    int star_type_neutron_star,
+    int star_type_black_hole,
+    int spectr_m,
+    int spectr_k,
+    int spectr_g,
+    int spectr_f,
+    int spectr_a,
+    int spectr_b,
+    int spectr_o,
+    int* out_planet_counts,
+    int* out_orbit_arounds,
+    int* out_orbit_indexes,
+    int* out_numbers,
+    int* out_gas_giants,
+    int* out_info_seeds,
+    int* out_gen_seeds)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < 0 || idx >= star_count)
+        return;
+
+    const int base = idx * kStarPlanMaxPlanets;
+    for (int i = 0; i < kStarPlanMaxPlanets; ++i)
+    {
+        out_orbit_arounds[base + i] = 0;
+        out_orbit_indexes[base + i] = 0;
+        out_numbers[base + i] = 0;
+        out_gas_giants[base + i] = 0;
+        out_info_seeds[base + i] = 0;
+        out_gen_seeds[base + i] = 0;
+    }
+    out_planet_counts[idx] = 0;
+
+    auto push_plan = [&](int orbit_around, int orbit_index, int number, int gas_giant, int info_seed, int gen_seed) {
+        int pidx = out_planet_counts[idx];
+        if (pidx < 0 || pidx >= kStarPlanMaxPlanets)
+        {
+            out_planet_counts[idx] = -1;
+            return;
+        }
+        out_orbit_arounds[base + pidx] = orbit_around;
+        out_orbit_indexes[base + pidx] = orbit_index;
+        out_numbers[base + pidx] = number;
+        out_gas_giants[base + pidx] = gas_giant;
+        out_info_seeds[base + pidx] = info_seed;
+        out_gen_seeds[base + pidx] = gen_seed;
+        out_planet_counts[idx] = pidx + 1;
+    };
+
+    const int star_seed = star_seeds[idx];
+    const int star_type = star_types[idx];
+    const int star_spectr = star_spectrs[idx];
+    const int star_index = star_indexes[idx];
+
+    DotNet35RandomDeviceLite rng1(star_seed);
+    rng1.Next();
+    rng1.Next();
+    rng1.Next();
+    DotNet35RandomDeviceLite rng2(rng1.Next());
+
+    double num1 = rng2.NextDouble();
+    double num2 = rng2.NextDouble();
+    double num3 = rng2.NextDouble();
+    double num4 = rng2.NextDouble();
+    double num5 = rng2.NextDouble();
+    (void)num4;
+    (void)num5;
+    rng2.NextDouble();
+    rng2.NextDouble();
+
+    if (star_type == star_type_black_hole || star_type == star_type_neutron_star)
+    {
+        push_plan(0, 3, 1, 0, rng2.Next(), rng2.Next());
+        return;
+    }
+
+    if (star_type == star_type_white_dwarf)
+    {
+        if (num1 < 0.7)
+        {
+            push_plan(0, 3, 1, 0, rng2.Next(), rng2.Next());
+        }
+        else
+        {
+            if (num2 < 0.30000001192092896)
+            {
+                push_plan(0, 3, 1, 0, rng2.Next(), rng2.Next());
+                push_plan(0, 4, 2, 0, rng2.Next(), rng2.Next());
+            }
+            else
+            {
+                push_plan(0, 4, 1, 1, rng2.Next(), rng2.Next());
+                push_plan(1, 1, 1, 0, rng2.Next(), rng2.Next());
+            }
+        }
+        return;
+    }
+
+    if (star_type == star_type_giant)
+    {
+        if (num1 < 0.30000001192092896)
+        {
+            push_plan(0, num3 > 0.5 ? 3 : 2, 1, 0, rng2.Next(), rng2.Next());
+        }
+        else if (num1 < 0.800000011920929)
+        {
+            if (num2 < 0.25)
+            {
+                push_plan(0, num3 > 0.5 ? 3 : 2, 1, 0, rng2.Next(), rng2.Next());
+                push_plan(0, num3 > 0.5 ? 4 : 3, 2, 0, rng2.Next(), rng2.Next());
+            }
+            else
+            {
+                push_plan(0, 3, 1, 1, rng2.Next(), rng2.Next());
+                push_plan(1, 1, 1, 0, rng2.Next(), rng2.Next());
+            }
+        }
+        else
+        {
+            if (num2 < 0.15000000596046448)
+            {
+                push_plan(0, num3 > 0.5 ? 3 : 2, 1, 0, rng2.Next(), rng2.Next());
+                push_plan(0, num3 > 0.5 ? 4 : 3, 2, 0, rng2.Next(), rng2.Next());
+                push_plan(0, num3 > 0.5 ? 5 : 4, 3, 0, rng2.Next(), rng2.Next());
+            }
+            else if (num2 < 0.75)
+            {
+                push_plan(0, num3 > 0.5 ? 3 : 2, 1, 0, rng2.Next(), rng2.Next());
+                push_plan(0, 4, 2, 1, rng2.Next(), rng2.Next());
+                push_plan(2, 1, 1, 0, rng2.Next(), rng2.Next());
+            }
+            else
+            {
+                push_plan(0, num3 > 0.5 ? 4 : 3, 1, 1, rng2.Next(), rng2.Next());
+                push_plan(1, 1, 1, 0, rng2.Next(), rng2.Next());
+                push_plan(1, 2, 2, 0, rng2.Next(), rng2.Next());
+            }
+        }
+        return;
+    }
+
+    double pGas[10] = {};
+    int planet_count = 1;
+    if (star_index == 0)
+    {
+        planet_count = 4;
+        pGas[0] = 0.0;
+        pGas[1] = 0.0;
+        pGas[2] = 0.0;
+    }
+    else if (star_spectr == spectr_m)
+    {
+        planet_count = num1 >= 0.1 ? (num1 >= 0.3 ? (num1 >= 0.8 ? 4 : 3) : 2) : 1;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.2; pGas[1] = 0.2;
+        }
+        else
+        {
+            pGas[0] = 0.0; pGas[1] = 0.2; pGas[2] = 0.3;
+        }
+    }
+    else if (star_spectr == spectr_k)
+    {
+        planet_count = num1 >= 0.1 ? (num1 >= 0.2 ? (num1 >= 0.7 ? (num1 >= 0.95 ? 5 : 4) : 3) : 2) : 1;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.18; pGas[1] = 0.18;
+        }
+        else
+        {
+            pGas[0] = 0.0; pGas[1] = 0.18; pGas[2] = 0.28; pGas[3] = 0.28;
+        }
+    }
+    else if (star_spectr == spectr_g)
+    {
+        planet_count = num1 >= 0.4 ? (num1 >= 0.9 ? 5 : 4) : 3;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.18; pGas[1] = 0.18;
+        }
+        else
+        {
+            pGas[0] = 0.0; pGas[1] = 0.2; pGas[2] = 0.3; pGas[3] = 0.3;
+        }
+    }
+    else if (star_spectr == spectr_f)
+    {
+        planet_count = num1 >= 0.35 ? (num1 >= 0.8 ? 5 : 4) : 3;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.2; pGas[1] = 0.2;
+        }
+        else
+        {
+            pGas[0] = 0.0; pGas[1] = 0.22; pGas[2] = 0.31; pGas[3] = 0.31;
+        }
+    }
+    else if (star_spectr == spectr_a)
+    {
+        planet_count = num1 >= 0.3 ? (num1 >= 0.75 ? 5 : 4) : 3;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.2; pGas[1] = 0.2;
+        }
+        else
+        {
+            pGas[0] = 0.1; pGas[1] = 0.28; pGas[2] = 0.3; pGas[3] = 0.35;
+        }
+    }
+    else if (star_spectr == spectr_b)
+    {
+        planet_count = num1 >= 0.3 ? (num1 >= 0.75 ? 6 : 5) : 4;
+        if (planet_count <= 3)
+        {
+            pGas[0] = 0.2; pGas[1] = 0.2;
+        }
+        else
+        {
+            pGas[0] = 0.1; pGas[1] = 0.22; pGas[2] = 0.28; pGas[3] = 0.35; pGas[4] = 0.35;
+        }
+    }
+    else if (star_spectr == spectr_o)
+    {
+        planet_count = num1 >= 0.5 ? 6 : 5;
+        pGas[0] = 0.1; pGas[1] = 0.2; pGas[2] = 0.25; pGas[3] = 0.3; pGas[4] = 0.32; pGas[5] = 0.35;
+    }
+
+    int num8 = 0;
+    int num9 = 0;
+    int orbit_around = 0;
+    int num10 = 1;
+    for (int index = 0; index < planet_count; ++index)
+    {
+        int info_seed = rng2.Next();
+        int gen_seed = rng2.Next();
+        double num11 = rng2.NextDouble();
+        double num12 = rng2.NextDouble();
+        bool gas_giant = false;
+        if (orbit_around == 0)
+        {
+            ++num8;
+            if (index < planet_count - 1 && num11 < pGas[index])
+            {
+                gas_giant = true;
+                if (num10 < 3)
+                    num10 = 3;
+            }
+            while (star_index != 0 || num10 != 3)
+            {
+                int left = planet_count - index;
+                int slots = 9 - num10;
+                if (slots > left)
+                {
+                    float a = static_cast<float>(left) / static_cast<float>(slots);
+                    double prob = num10 <= 3
+                        ? static_cast<double>(DLerp(a, 1.0f, 0.15f) + 0.01f)
+                        : static_cast<double>(DLerp(a, 1.0f, 0.45f) + 0.01f);
+                    if (rng2.NextDouble() < prob)
+                        break;
+                }
+                else
+                {
+                    break;
+                }
+                ++num10;
+            }
+            if (!gas_giant && (star_index == 0 && num10 == 3))
+                gas_giant = true;
+        }
+        else
+        {
+            ++num9;
+            gas_giant = false;
+        }
+
+        push_plan(
+            orbit_around,
+            orbit_around == 0 ? num10 : num9,
+            orbit_around == 0 ? num8 : num9,
+            gas_giant ? 1 : 0,
+            info_seed,
+            gen_seed);
+
+        ++num10;
+        if (gas_giant)
+        {
+            orbit_around = num8;
+            num9 = 0;
+        }
+        if (num9 >= 1 && num12 < 0.8)
+        {
+            orbit_around = 0;
+            num9 = 0;
+        }
+    }
+}
+
+inline bool TryBuildStarPlanetPlansCuda(
+    int device_id,
+    const EnumMap& em,
+    std::vector<SeedCtx>& seeds,
+    const std::vector<StarRef>& star_refs,
+    std::vector<PlanetRef>& primary_refs,
+    std::vector<PlanetRef>& secondary_refs)
+{
+    const int star_count = static_cast<int>(star_refs.size());
+    if (star_count <= 0)
+    {
+        primary_refs.clear();
+        secondary_refs.clear();
+        return true;
+    }
+
+    std::vector<int> in_star_seeds(star_count);
+    std::vector<int> in_star_types(star_count);
+    std::vector<int> in_star_spectrs(star_count);
+    std::vector<int> in_star_indexes(star_count);
+    for (int i = 0; i < star_count; ++i)
+    {
+        const StarRef& ref = star_refs[i];
+        const StarCtx& sc = seeds[ref.seed_idx].stars[ref.star_idx];
+        in_star_seeds[i] = sc.star.seed;
+        in_star_types[i] = sc.star.type;
+        in_star_spectrs[i] = sc.star.spectr;
+        in_star_indexes[i] = sc.star.index;
+    }
+
+    const size_t n = static_cast<size_t>(star_count);
+    const size_t plans_n = n * static_cast<size_t>(kStarPlanMaxPlanets);
+    std::vector<int> out_planet_counts(star_count);
+    std::vector<int> out_orbit_arounds(plans_n);
+    std::vector<int> out_orbit_indexes(plans_n);
+    std::vector<int> out_numbers(plans_n);
+    std::vector<int> out_gas_giants(plans_n);
+    std::vector<int> out_info_seeds(plans_n);
+    std::vector<int> out_gen_seeds(plans_n);
+
+    if (device_id >= 0)
+    {
+        cudaError_t rc_set = cudaSetDevice(device_id);
+        if (rc_set != cudaSuccess)
+            return false;
+    }
+
+    int* d_star_seeds = nullptr;
+    int* d_star_types = nullptr;
+    int* d_star_spectrs = nullptr;
+    int* d_star_indexes = nullptr;
+    int* d_out_planet_counts = nullptr;
+    int* d_out_orbit_arounds = nullptr;
+    int* d_out_orbit_indexes = nullptr;
+    int* d_out_numbers = nullptr;
+    int* d_out_gas_giants = nullptr;
+    int* d_out_info_seeds = nullptr;
+    int* d_out_gen_seeds = nullptr;
+
+    auto cleanup = [&]() {
+        cudaFree(d_out_gen_seeds);
+        cudaFree(d_out_info_seeds);
+        cudaFree(d_out_gas_giants);
+        cudaFree(d_out_numbers);
+        cudaFree(d_out_orbit_indexes);
+        cudaFree(d_out_orbit_arounds);
+        cudaFree(d_out_planet_counts);
+        cudaFree(d_star_indexes);
+        cudaFree(d_star_spectrs);
+        cudaFree(d_star_types);
+        cudaFree(d_star_seeds);
+    };
+
+    auto alloc = [&](int** p, size_t bytes) -> bool {
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
+
+    const size_t stars_bytes = n * sizeof(int);
+    const size_t plans_bytes = plans_n * sizeof(int);
+    if (!alloc(&d_star_seeds, stars_bytes) ||
+        !alloc(&d_star_types, stars_bytes) ||
+        !alloc(&d_star_spectrs, stars_bytes) ||
+        !alloc(&d_star_indexes, stars_bytes) ||
+        !alloc(&d_out_planet_counts, stars_bytes) ||
+        !alloc(&d_out_orbit_arounds, plans_bytes) ||
+        !alloc(&d_out_orbit_indexes, plans_bytes) ||
+        !alloc(&d_out_numbers, plans_bytes) ||
+        !alloc(&d_out_gas_giants, plans_bytes) ||
+        !alloc(&d_out_info_seeds, plans_bytes) ||
+        !alloc(&d_out_gen_seeds, plans_bytes))
+    {
+        cleanup();
+        return false;
+    }
+
+    auto h2d = [&](void* dst, const void* src, size_t bytes) -> bool {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (!h2d(d_star_seeds, in_star_seeds.data(), stars_bytes) ||
+        !h2d(d_star_types, in_star_types.data(), stars_bytes) ||
+        !h2d(d_star_spectrs, in_star_spectrs.data(), stars_bytes) ||
+        !h2d(d_star_indexes, in_star_indexes.data(), stars_bytes))
+    {
+        cleanup();
+        return false;
+    }
+
+    const int block = 128;
+    const int grid = (star_count + block - 1) / block;
+    BuildStarPlanetPlansKernel<<<grid, block>>>(
+        d_star_seeds,
+        d_star_types,
+        d_star_spectrs,
+        d_star_indexes,
+        star_count,
+        em.star_type_main_seq,
+        em.star_type_giant,
+        em.star_type_white_dwarf,
+        em.star_type_neutron_star,
+        em.star_type_black_hole,
+        em.spectr_m,
+        em.spectr_k,
+        em.spectr_g,
+        em.spectr_f,
+        em.spectr_a,
+        em.spectr_b,
+        em.spectr_o,
+        d_out_planet_counts,
+        d_out_orbit_arounds,
+        d_out_orbit_indexes,
+        d_out_numbers,
+        d_out_gas_giants,
+        d_out_info_seeds,
+        d_out_gen_seeds);
+
+    cudaError_t rc = cudaGetLastError();
+    if (rc != cudaSuccess)
+    {
+        cleanup();
+        return false;
+    }
+
+    auto d2h = [&](void* dst, const void* src, size_t bytes) -> bool {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+    };
+    if (!d2h(out_planet_counts.data(), d_out_planet_counts, stars_bytes) ||
+        !d2h(out_orbit_arounds.data(), d_out_orbit_arounds, plans_bytes) ||
+        !d2h(out_orbit_indexes.data(), d_out_orbit_indexes, plans_bytes) ||
+        !d2h(out_numbers.data(), d_out_numbers, plans_bytes) ||
+        !d2h(out_gas_giants.data(), d_out_gas_giants, plans_bytes) ||
+        !d2h(out_info_seeds.data(), d_out_info_seeds, plans_bytes) ||
+        !d2h(out_gen_seeds.data(), d_out_gen_seeds, plans_bytes))
+    {
+        cleanup();
+        return false;
+    }
+    cleanup();
+
+    primary_refs.clear();
+    secondary_refs.clear();
+    primary_refs.reserve(static_cast<size_t>(star_count) * 3);
+    secondary_refs.reserve(static_cast<size_t>(star_count) * 2);
+    for (int i = 0; i < star_count; ++i)
+    {
+        const StarRef& ref = star_refs[i];
+        StarCtx& star_ctx = seeds[ref.seed_idx].stars[ref.star_idx];
+        const int pc = out_planet_counts[i];
+        if (pc < 0 || pc > kStarPlanMaxPlanets)
+            return false;
+
+        star_ctx.planets.clear();
+        star_ctx.planets.reserve(pc);
+        const int base = i * kStarPlanMaxPlanets;
+        for (int pi = 0; pi < pc; ++pi)
+        {
+            PlanetPlanLite p{};
+            p.index = pi;
+            p.orbit_around = out_orbit_arounds[base + pi];
+            p.orbit_index = out_orbit_indexes[base + pi];
+            p.number = out_numbers[base + pi];
+            p.gas_giant = out_gas_giants[base + pi] != 0;
+            p.info_seed = out_info_seeds[base + pi];
+            p.gen_seed = out_gen_seeds[base + pi];
+            p.id = star_ctx.star.id * 100 + pi + 1;
+            p.parent_planet_index = -1;
+            if (p.orbit_around > 0)
+            {
+                for (size_t j = 0; j < star_ctx.planets.size(); ++j)
+                {
+                    if (star_ctx.planets[j].number == p.orbit_around && star_ctx.planets[j].orbit_around == 0)
+                    {
+                        p.parent_planet_index = static_cast<int>(j);
+                        break;
+                    }
+                }
+            }
+            star_ctx.planets.push_back(p);
+        }
+        star_ctx.star.planet_count = static_cast<int>(star_ctx.planets.size());
+
+        for (int pi = 0; pi < static_cast<int>(star_ctx.planets.size()); ++pi)
+        {
+            PlanetRef pr{ref.seed_idx, ref.star_idx, pi};
+            if (star_ctx.planets[pi].orbit_around == 0)
+                primary_refs.push_back(pr);
+            else
+                secondary_refs.push_back(pr);
+        }
+    }
+
+    return true;
+}
+
 inline unsigned long long MixHash(unsigned long long h, int v)
 {
     h ^= static_cast<unsigned int>(v);
@@ -1099,6 +1716,9 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         if (hc > 1)
             host_threads = static_cast<int>(std::min<unsigned>(hc, 16));
     }
+    bool use_gpu_seedbuild_plan = true;
+    if (const char* gp = std::getenv("DSP_NATIVE_SEEDBUILD_GPU_PLAN"))
+        use_gpu_seedbuild_plan = std::atoi(gp) != 0;
 
     for (int group_base = 0; group_base < seed_count; group_base += group_cap)
     {
@@ -1151,11 +1771,20 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             worker_count = 1;
         std::vector<std::vector<PlanetRef>> primary_refs_tls(static_cast<size_t>(worker_count));
         std::vector<std::vector<PlanetRef>> secondary_refs_tls(static_cast<size_t>(worker_count));
+        std::vector<std::vector<StarRef>> star_refs_tls(static_cast<size_t>(worker_count));
         auto build_seed_range = [&](int begin, int end, int worker_idx) {
             auto& pri = primary_refs_tls[worker_idx];
             auto& sec = secondary_refs_tls[worker_idx];
-            pri.reserve(static_cast<size_t>(std::max(0, end - begin)) * 200);
-            sec.reserve(static_cast<size_t>(std::max(0, end - begin)) * 80);
+            auto& srefs = star_refs_tls[worker_idx];
+            if (!use_gpu_seedbuild_plan)
+            {
+                pri.reserve(static_cast<size_t>(std::max(0, end - begin)) * 200);
+                sec.reserve(static_cast<size_t>(std::max(0, end - begin)) * 80);
+            }
+            else
+            {
+                srefs.reserve(static_cast<size_t>(std::max(0, end - begin)) * static_cast<size_t>(star_count));
+            }
             for (int gi = begin; gi < end; ++gi)
             {
                 SeedCtx& seed_ctx = seeds[gi];
@@ -1224,14 +1853,21 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
 
                         sc.star = CreateStarLite(seed_ctx.star_count, poses[si], si + 1, star_seed, need_type, need_spectr, em);
                     }
-                    BuildStarPlanetPlans(sc, em);
-                    for (size_t pi = 0; pi < sc.planets.size(); ++pi)
+                    if (!use_gpu_seedbuild_plan)
                     {
-                        PlanetRef pr{gi, si, static_cast<int>(pi)};
-                        if (sc.planets[pi].orbit_around == 0)
-                            pri.push_back(pr);
-                        else
-                            sec.push_back(pr);
+                        BuildStarPlanetPlans(sc, em);
+                        for (size_t pi = 0; pi < sc.planets.size(); ++pi)
+                        {
+                            PlanetRef pr{gi, si, static_cast<int>(pi)};
+                            if (sc.planets[pi].orbit_around == 0)
+                                pri.push_back(pr);
+                            else
+                                sec.push_back(pr);
+                        }
+                    }
+                    else
+                    {
+                        srefs.push_back(StarRef{gi, si});
                     }
                     seed_ctx.stars[si] = std::move(sc);
                 }
@@ -1263,8 +1899,50 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         }
         for (int w = 0; w < worker_count; ++w)
         {
-            primary_refs.insert(primary_refs.end(), primary_refs_tls[w].begin(), primary_refs_tls[w].end());
-            secondary_refs.insert(secondary_refs.end(), secondary_refs_tls[w].begin(), secondary_refs_tls[w].end());
+            if (!use_gpu_seedbuild_plan)
+            {
+                primary_refs.insert(primary_refs.end(), primary_refs_tls[w].begin(), primary_refs_tls[w].end());
+                secondary_refs.insert(secondary_refs.end(), secondary_refs_tls[w].begin(), secondary_refs_tls[w].end());
+            }
+        }
+        if (use_gpu_seedbuild_plan)
+        {
+            std::vector<StarRef> star_refs;
+            for (int w = 0; w < worker_count; ++w)
+                star_refs.insert(star_refs.end(), star_refs_tls[w].begin(), star_refs_tls[w].end());
+
+            bool gpu_plan_ok = TryBuildStarPlanetPlansCuda(
+                cuda_device_id,
+                em,
+                seeds,
+                star_refs,
+                primary_refs,
+                secondary_refs);
+            if (!gpu_plan_ok)
+            {
+                primary_refs.clear();
+                secondary_refs.clear();
+                primary_refs.reserve(static_cast<size_t>(group_count) * 200);
+                secondary_refs.reserve(static_cast<size_t>(group_count) * 80);
+                for (int gi = 0; gi < group_count; ++gi)
+                {
+                    SeedCtx& seed_ctx = seeds[gi];
+                    for (size_t si = 0; si < seed_ctx.stars.size(); ++si)
+                    {
+                        StarCtx& sc = seed_ctx.stars[si];
+                        sc.planets.clear();
+                        BuildStarPlanetPlans(sc, em);
+                        for (size_t pi = 0; pi < sc.planets.size(); ++pi)
+                        {
+                            PlanetRef pr{gi, static_cast<int>(si), static_cast<int>(pi)};
+                            if (sc.planets[pi].orbit_around == 0)
+                                primary_refs.push_back(pr);
+                            else
+                                secondary_refs.push_back(pr);
+                        }
+                    }
+                }
+            }
         }
         if (stage_timing)
             stage_seed_build_ms += now_ms() - stage0;
