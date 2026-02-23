@@ -1291,13 +1291,375 @@ __global__ void BuildStarPlanetPlansKernel(
     }
 }
 
+constexpr int kLocalPlanetTypeGas = 0;
+constexpr int kLocalPlanetTypeOcean = 1;
+constexpr int kLocalPlanetTypeVocano = 2;
+constexpr int kLocalPlanetTypeDesert = 3;
+constexpr int kLocalPlanetTypeIce = 4;
+
+constexpr int kLocalSingularityLaySide = 1;
+constexpr int kLocalSingularityTidal1 = 2;
+constexpr int kLocalSingularityTidal2 = 4;
+constexpr int kLocalSingularityTidal4 = 8;
+constexpr int kLocalSingularityClockwise = 16;
+
+__device__ __forceinline__ void EvalPlanetCoreF32OneLocal(
+    int info_seed,
+    int orbit_around,
+    int orbit_index,
+    int gas_giant,
+    int star_index,
+    int galaxy_star_count,
+    int galaxy_habitable_count,
+    int boost_inclination_ns,
+    int compact_type_case,
+    float star_orbit_scaler,
+    double star_mass,
+    float star_habitable_radius,
+    float star_light_balance_radius,
+    float orbit_around_planet_real_radius,
+    float orbit_around_planet_orbit_radius,
+    double orbit_around_planet_orbital_period,
+    dsp_planet_core_f32_out_t* out_result)
+{
+    if (out_result == nullptr)
+        return;
+
+    DotNet35RandomDeviceLite rng(info_seed);
+    double num3 = rng.NextDouble();
+    double num4 = rng.NextDouble();
+    double num5 = rng.NextDouble();
+    double num6 = rng.NextDouble();
+    double num7 = rng.NextDouble();
+    double num8 = rng.NextDouble();
+    double num9 = rng.NextDouble();
+    double num10 = rng.NextDouble();
+    double num11 = rng.NextDouble();
+    double num12 = rng.NextDouble();
+    double num13 = rng.NextDouble();
+    double num14 = rng.NextDouble();
+    double rand1 = rng.NextDouble();
+    double num15 = rng.NextDouble();
+    double rand2 = rng.NextDouble();
+    double rand3 = rng.NextDouble();
+    double rand4 = rng.NextDouble();
+    int theme_seed = rng.InternalSample();
+
+    float a = powf(1.2f, static_cast<float>(num3 * (num4 - 0.5) * 0.5));
+    float orbit_radius = 0.0f;
+    if (orbit_around == 0)
+    {
+        if (orbit_index < 0 || orbit_index >= 18)
+            return;
+        const float orbit_radius_table[18] = {
+            0.0f, 0.4f, 0.7f, 1.0f, 1.4f, 1.9f, 2.5f, 3.3f, 4.3f,
+            5.5f, 6.9f, 8.4f, 10.0f, 11.7f, 13.5f, 15.4f, 17.5f, 19.7f};
+        float b = orbit_radius_table[orbit_index] * star_orbit_scaler;
+        float num16 = (a - 1.0f) / fmaxf(1.0f, b) + 1.0f;
+        orbit_radius = b * num16;
+    }
+    else
+    {
+        orbit_radius = static_cast<float>(
+            ((1600.0 * static_cast<double>(orbit_index) + 200.0) *
+                 static_cast<double>(powf(star_orbit_scaler, 0.3f)) *
+                 static_cast<double>(a * 0.5f + 0.5f) +
+             static_cast<double>(orbit_around_planet_real_radius)) /
+            40000.0);
+    }
+
+    float orbit_inclination = static_cast<float>(num5 * 16.0 - 8.0);
+    if (orbit_around > 0)
+        orbit_inclination *= 2.2f;
+    float orbit_longitude = static_cast<float>(num6 * 360.0);
+    if (boost_inclination_ns != 0)
+        orbit_inclination += (orbit_inclination > 0.0f) ? 3.0f : -3.0f;
+
+    double f1 = static_cast<double>(orbit_radius);
+    double f1_3 = f1 * f1 * f1;
+    double orbital_period = 0.0;
+    if (orbit_around > 0)
+    {
+        orbital_period = sqrt(39.4784176043574 * f1_3 / 1.08308421068537E-08);
+    }
+    else
+    {
+        orbital_period = sqrt(39.4784176043574 * f1_3 / (1.35385519905204E-06 * star_mass));
+    }
+
+    float orbit_phase = static_cast<float>(num7 * 360.0);
+    float obliquity = 0.0f;
+    int singularity_flags = 0;
+    if (num15 < 0.0399999991059303)
+    {
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 39.9);
+        obliquity += (obliquity < 0.0f) ? -70.0f : 70.0f;
+        singularity_flags |= kLocalSingularityLaySide;
+    }
+    else if (num15 < 0.100000001490116)
+    {
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 80.0);
+        obliquity += (obliquity < 0.0f) ? -30.0f : 30.0f;
+    }
+    else
+    {
+        obliquity = static_cast<float>(num8 * (num9 - 0.5) * 60.0);
+    }
+
+    double rotation_period = (num10 * num11 * 1000.0 + 400.0) *
+                             (orbit_around == 0 ? static_cast<double>(powf(orbit_radius, 0.25f)) : 1.0) *
+                             (gas_giant != 0 ? 0.2 : 1.0);
+    if (gas_giant == 0)
+    {
+        if (compact_type_case == 1)
+            rotation_period *= 0.5;
+        else if (compact_type_case == 2)
+            rotation_period *= 0.2;
+        else if (compact_type_case == 3)
+            rotation_period *= 0.15;
+    }
+    float rotation_phase = static_cast<float>(num12 * 360.0);
+    float sun_distance = (orbit_around == 0) ? orbit_radius : orbit_around_planet_orbit_radius;
+    float scale = 1.0f;
+
+    double num17 = (orbit_around == 0) ? orbital_period : orbit_around_planet_orbital_period;
+    rotation_period = 1.0 / (1.0 / num17 + 1.0 / rotation_period);
+
+    if (orbit_around == 0 && orbit_index <= 4 && gas_giant == 0)
+    {
+        if (num15 > 0.959999978542328)
+        {
+            obliquity *= 0.01f;
+            rotation_period = orbital_period;
+            singularity_flags |= kLocalSingularityTidal1;
+        }
+        else if (num15 > 0.930000007152557)
+        {
+            obliquity *= 0.1f;
+            rotation_period = orbital_period * 0.5;
+            singularity_flags |= kLocalSingularityTidal2;
+        }
+        else if (num15 > 0.899999976158142)
+        {
+            obliquity *= 0.2f;
+            rotation_period = orbital_period * 0.25;
+            singularity_flags |= kLocalSingularityTidal4;
+        }
+    }
+
+    if (num15 > 0.85 && num15 <= 0.9)
+    {
+        rotation_period = -rotation_period;
+        singularity_flags |= kLocalSingularityClockwise;
+    }
+
+    float habitable_bias = 0.0f;
+    float temperature_bias = 0.0f;
+    float radius = 0.0f;
+    int type_case = kLocalPlanetTypeDesert;
+    int habitable_count_delta = 0;
+
+    if (gas_giant != 0)
+    {
+        type_case = kLocalPlanetTypeGas;
+        radius = 80.0f;
+        scale = 10.0f;
+        habitable_bias = 100.0f;
+    }
+    else
+    {
+        float num18 = ceilf(static_cast<float>(galaxy_star_count) * 0.29f);
+        if (num18 < 11.0f)
+            num18 = 11.0f;
+        float num19 = num18 - static_cast<float>(galaxy_habitable_count);
+        float num20 = static_cast<float>(galaxy_star_count - star_index);
+        float f2 = 1000.0f;
+        float num21 = 1000.0f;
+        if (star_habitable_radius > 0.0f && sun_distance > 0.0f)
+        {
+            f2 = sun_distance / star_habitable_radius;
+            num21 = fabsf(logf(f2));
+        }
+
+        float num22 = fminf(fmaxf(sqrtf(star_habitable_radius), 1.0f), 2.0f) - 0.04f;
+        float num24 = fminf(fmaxf((num19 / fmaxf(1.0f, num20)) * 0.5f + 0.175f, 0.08f), 0.8f);
+
+        habitable_bias = num21 * num22;
+        temperature_bias = static_cast<float>(1.20000004768372 / (f2 + 0.2f) - 1.0);
+        float num25 = powf(fminf(fmaxf(habitable_bias / num24, 0.0f), 1.0f), num24 * 10.0f);
+
+        if ((num13 > num25 && star_index > 0) || (orbit_around > 0 && orbit_index == 1 && star_index == 0))
+        {
+            type_case = kLocalPlanetTypeOcean;
+            habitable_count_delta = 1;
+        }
+        else if (f2 < 0.833333f)
+        {
+            float num26 = fmaxf(0.15f, f2 * 2.5f - 0.85f);
+            type_case = (num14 >= num26) ? kLocalPlanetTypeVocano : kLocalPlanetTypeDesert;
+        }
+        else if (f2 < 1.2f)
+        {
+            type_case = kLocalPlanetTypeDesert;
+        }
+        else
+        {
+            float num27 = 0.9f / f2 - 0.1f;
+            type_case = (num14 >= num27) ? kLocalPlanetTypeIce : kLocalPlanetTypeDesert;
+        }
+
+        radius = 200.0f;
+    }
+
+    int precision = (type_case == kLocalPlanetTypeGas) ? 64 : 200;
+    int segment = (type_case == kLocalPlanetTypeGas) ? 2 : 5;
+
+    float luminosity = powf(star_light_balance_radius / (sun_distance + 0.01f), 0.6f);
+    if (luminosity > 1.0f)
+    {
+        luminosity = logf(luminosity) + 1.0f;
+        luminosity = logf(luminosity) + 1.0f;
+        luminosity = logf(luminosity) + 1.0f;
+    }
+    luminosity = roundf(luminosity * 100.0f) / 100.0f;
+
+    out_result->orbit_radius = orbit_radius;
+    out_result->orbit_inclination = orbit_inclination;
+    out_result->orbit_longitude = orbit_longitude;
+    out_result->orbital_period = orbital_period;
+    out_result->orbit_phase = orbit_phase;
+    out_result->obliquity = obliquity;
+    out_result->rotation_period = rotation_period;
+    out_result->rotation_phase = rotation_phase;
+    out_result->sun_distance = sun_distance;
+    out_result->scale = scale;
+    out_result->habitable_bias = habitable_bias;
+    out_result->temperature_bias = temperature_bias;
+    out_result->radius = radius;
+    out_result->luminosity = luminosity;
+    out_result->rand1 = rand1;
+    out_result->rand2 = rand2;
+    out_result->rand3 = rand3;
+    out_result->rand4 = rand4;
+    out_result->num13 = num13;
+    out_result->num14 = num14;
+    out_result->theme_seed = theme_seed;
+    out_result->type_case = type_case;
+    out_result->singularity_flags = singularity_flags;
+    out_result->habitable_count_delta = habitable_count_delta;
+    out_result->precision = precision;
+    out_result->segment = segment;
+}
+
+__global__ void EvalPlanetCoreFromPlansKernel(
+    const int* star_types,
+    const int* star_indexes,
+    const int* star_counts_in_galaxy,
+    const float* star_orbit_scalers,
+    const double* star_masses,
+    const float* star_habitable_radiuses,
+    const float* star_light_balance_radiuses,
+    const int* star_planet_counts,
+    const int* plan_orbit_arounds,
+    const int* plan_orbit_indexes,
+    const int* plan_numbers,
+    const int* plan_gas_giants,
+    const int* plan_info_seeds,
+    int star_count,
+    int star_type_white_dwarf,
+    int star_type_neutron_star,
+    int star_type_black_hole,
+    dsp_planet_core_f32_out_t* out_core)
+{
+    int sid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (sid < 0 || sid >= star_count)
+        return;
+
+    int pcount = star_planet_counts[sid];
+    if (pcount < 0)
+        pcount = 0;
+    if (pcount > kStarPlanMaxPlanets)
+        pcount = kStarPlanMaxPlanets;
+    int base = sid * kStarPlanMaxPlanets;
+    int stype = star_types[sid];
+    int sidx = star_indexes[sid];
+    int sgal = star_counts_in_galaxy[sid];
+    float s_orbit = star_orbit_scalers[sid];
+    double s_mass = star_masses[sid];
+    float s_hab = star_habitable_radiuses[sid];
+    float s_light = star_light_balance_radiuses[sid];
+
+    int boost_inclination_ns = (stype == star_type_neutron_star || stype == star_type_black_hole) ? 1 : 0;
+    int compact_type_case = 0;
+    if (stype == star_type_white_dwarf)
+        compact_type_case = 1;
+    else if (stype == star_type_neutron_star || stype == star_type_black_hole)
+        compact_type_case = 2;
+
+    for (int li = 0; li < pcount; ++li)
+    {
+        int p = base + li;
+        int orbit_around = plan_orbit_arounds[p];
+        int orbit_index = plan_orbit_indexes[p];
+        int gas_giant = plan_gas_giants[p];
+        int info_seed = plan_info_seeds[p];
+
+        float around_real_radius = 0.0f;
+        float around_orbit_radius = 0.0f;
+        double around_orbital_period = 0.0;
+
+        if (orbit_around > 0)
+        {
+            int parent = -1;
+            for (int q = 0; q < li; ++q)
+            {
+                int qp = base + q;
+                if (plan_orbit_arounds[qp] == 0 && plan_numbers[qp] == orbit_around)
+                {
+                    parent = qp;
+                    break;
+                }
+            }
+            if (parent >= base)
+            {
+                around_real_radius = out_core[parent].radius * out_core[parent].scale;
+                around_orbit_radius = out_core[parent].orbit_radius;
+                around_orbital_period = out_core[parent].orbital_period;
+            }
+        }
+
+        EvalPlanetCoreF32OneLocal(
+            info_seed,
+            orbit_around,
+            orbit_index,
+            gas_giant,
+            sidx,
+            sgal,
+            0,
+            boost_inclination_ns,
+            compact_type_case,
+            s_orbit,
+            s_mass,
+            s_hab,
+            s_light,
+            around_real_radius,
+            around_orbit_radius,
+            around_orbital_period,
+            out_core + p);
+    }
+}
+
 inline bool TryBuildStarPlanetPlansCuda(
     int device_id,
     const EnumMap& em,
     std::vector<SeedCtx>& seeds,
     const std::vector<StarRef>& star_refs,
+    int star_type_white_dwarf,
+    int star_type_neutron_star,
+    int star_type_black_hole,
     std::vector<PlanetRef>& primary_refs,
-    std::vector<PlanetRef>& secondary_refs)
+    std::vector<PlanetRef>& secondary_refs,
+    std::vector<dsp_planet_core_f32_out_t>& out_core_flat)
 {
     const int star_count = static_cast<int>(star_refs.size());
     if (star_count <= 0)
@@ -1311,6 +1673,11 @@ inline bool TryBuildStarPlanetPlansCuda(
     std::vector<int> in_star_types(star_count);
     std::vector<int> in_star_spectrs(star_count);
     std::vector<int> in_star_indexes(star_count);
+    std::vector<int> in_star_counts_in_galaxy(star_count);
+    std::vector<float> in_star_orbit_scalers(star_count);
+    std::vector<double> in_star_masses(star_count);
+    std::vector<float> in_star_habitable_radiuses(star_count);
+    std::vector<float> in_star_light_balance_radiuses(star_count);
     for (int i = 0; i < star_count; ++i)
     {
         const StarRef& ref = star_refs[i];
@@ -1319,6 +1686,11 @@ inline bool TryBuildStarPlanetPlansCuda(
         in_star_types[i] = sc.star.type;
         in_star_spectrs[i] = sc.star.spectr;
         in_star_indexes[i] = sc.star.index;
+        in_star_counts_in_galaxy[i] = seeds[ref.seed_idx].star_count;
+        in_star_orbit_scalers[i] = sc.star.orbit_scaler;
+        in_star_masses[i] = sc.star.mass;
+        in_star_habitable_radiuses[i] = sc.star.habitable_radius;
+        in_star_light_balance_radiuses[i] = sc.star.light_balance_radius;
     }
 
     const size_t n = static_cast<size_t>(star_count);
@@ -1349,8 +1721,20 @@ inline bool TryBuildStarPlanetPlansCuda(
     int* d_out_gas_giants = nullptr;
     int* d_out_info_seeds = nullptr;
     int* d_out_gen_seeds = nullptr;
+    int* d_star_counts_in_galaxy = nullptr;
+    float* d_star_orbit_scalers = nullptr;
+    double* d_star_masses = nullptr;
+    float* d_star_habitable_radiuses = nullptr;
+    float* d_star_light_balance_radiuses = nullptr;
+    dsp_planet_core_f32_out_t* d_out_core = nullptr;
 
     auto cleanup = [&]() {
+        cudaFree(d_out_core);
+        cudaFree(d_star_light_balance_radiuses);
+        cudaFree(d_star_habitable_radiuses);
+        cudaFree(d_star_masses);
+        cudaFree(d_star_orbit_scalers);
+        cudaFree(d_star_counts_in_galaxy);
         cudaFree(d_out_gen_seeds);
         cudaFree(d_out_info_seeds);
         cudaFree(d_out_gas_giants);
@@ -1367,20 +1751,38 @@ inline bool TryBuildStarPlanetPlansCuda(
     auto alloc = [&](int** p, size_t bytes) -> bool {
         return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
     };
+    auto allocf = [&](float** p, size_t bytes) -> bool {
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
+    auto allocd = [&](double** p, size_t bytes) -> bool {
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
+    auto alloc_core = [&](dsp_planet_core_f32_out_t** p, size_t bytes) -> bool {
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
 
     const size_t stars_bytes = n * sizeof(int);
+    const size_t stars_f_bytes = n * sizeof(float);
+    const size_t stars_d_bytes = n * sizeof(double);
     const size_t plans_bytes = plans_n * sizeof(int);
+    const size_t core_bytes = plans_n * sizeof(dsp_planet_core_f32_out_t);
     if (!alloc(&d_star_seeds, stars_bytes) ||
         !alloc(&d_star_types, stars_bytes) ||
         !alloc(&d_star_spectrs, stars_bytes) ||
         !alloc(&d_star_indexes, stars_bytes) ||
+        !alloc(&d_star_counts_in_galaxy, stars_bytes) ||
+        !allocf(&d_star_orbit_scalers, stars_f_bytes) ||
+        !allocd(&d_star_masses, stars_d_bytes) ||
+        !allocf(&d_star_habitable_radiuses, stars_f_bytes) ||
+        !allocf(&d_star_light_balance_radiuses, stars_f_bytes) ||
         !alloc(&d_out_planet_counts, stars_bytes) ||
         !alloc(&d_out_orbit_arounds, plans_bytes) ||
         !alloc(&d_out_orbit_indexes, plans_bytes) ||
         !alloc(&d_out_numbers, plans_bytes) ||
         !alloc(&d_out_gas_giants, plans_bytes) ||
         !alloc(&d_out_info_seeds, plans_bytes) ||
-        !alloc(&d_out_gen_seeds, plans_bytes))
+        !alloc(&d_out_gen_seeds, plans_bytes) ||
+        !alloc_core(&d_out_core, core_bytes))
     {
         cleanup();
         return false;
@@ -1392,7 +1794,12 @@ inline bool TryBuildStarPlanetPlansCuda(
     if (!h2d(d_star_seeds, in_star_seeds.data(), stars_bytes) ||
         !h2d(d_star_types, in_star_types.data(), stars_bytes) ||
         !h2d(d_star_spectrs, in_star_spectrs.data(), stars_bytes) ||
-        !h2d(d_star_indexes, in_star_indexes.data(), stars_bytes))
+        !h2d(d_star_indexes, in_star_indexes.data(), stars_bytes) ||
+        !h2d(d_star_counts_in_galaxy, in_star_counts_in_galaxy.data(), stars_bytes) ||
+        cudaMemcpy(d_star_orbit_scalers, in_star_orbit_scalers.data(), stars_f_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_star_masses, in_star_masses.data(), stars_d_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_star_habitable_radiuses, in_star_habitable_radiuses.data(), stars_f_bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_star_light_balance_radiuses, in_star_light_balance_radiuses.data(), stars_f_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
     {
         cleanup();
         return false;
@@ -1433,6 +1840,33 @@ inline bool TryBuildStarPlanetPlansCuda(
         return false;
     }
 
+    EvalPlanetCoreFromPlansKernel<<<grid, block>>>(
+        d_star_types,
+        d_star_indexes,
+        d_star_counts_in_galaxy,
+        d_star_orbit_scalers,
+        d_star_masses,
+        d_star_habitable_radiuses,
+        d_star_light_balance_radiuses,
+        d_out_planet_counts,
+        d_out_orbit_arounds,
+        d_out_orbit_indexes,
+        d_out_numbers,
+        d_out_gas_giants,
+        d_out_info_seeds,
+        star_count,
+        star_type_white_dwarf,
+        star_type_neutron_star,
+        star_type_black_hole,
+        d_out_core);
+
+    rc = cudaGetLastError();
+    if (rc != cudaSuccess)
+    {
+        cleanup();
+        return false;
+    }
+
     auto d2h = [&](void* dst, const void* src, size_t bytes) -> bool {
         return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
     };
@@ -1443,6 +1877,12 @@ inline bool TryBuildStarPlanetPlansCuda(
         !d2h(out_gas_giants.data(), d_out_gas_giants, plans_bytes) ||
         !d2h(out_info_seeds.data(), d_out_info_seeds, plans_bytes) ||
         !d2h(out_gen_seeds.data(), d_out_gen_seeds, plans_bytes))
+    {
+        cleanup();
+        return false;
+    }
+    out_core_flat.resize(plans_n);
+    if (!d2h(out_core_flat.data(), d_out_core, core_bytes))
     {
         cleanup();
         return false;
@@ -1467,6 +1907,7 @@ inline bool TryBuildStarPlanetPlansCuda(
         for (int pi = 0; pi < pc; ++pi)
         {
             PlanetPlanLite p{};
+            const dsp_planet_core_f32_out_t& core = out_core_flat[base + pi];
             p.index = pi;
             p.orbit_around = out_orbit_arounds[base + pi];
             p.orbit_index = out_orbit_indexes[base + pi];
@@ -1475,6 +1916,17 @@ inline bool TryBuildStarPlanetPlansCuda(
             p.info_seed = out_info_seeds[base + pi];
             p.gen_seed = out_gen_seeds[base + pi];
             p.id = star_ctx.star.id * 100 + pi + 1;
+            p.core.orbit_radius = core.orbit_radius;
+            p.core.orbital_period = core.orbital_period;
+            p.core.scale = core.scale;
+            p.core.radius = core.radius;
+            p.core.habitable_bias = core.habitable_bias;
+            p.core.sun_distance = core.sun_distance;
+            p.core.temperature_bias = core.temperature_bias;
+            p.core.num13 = core.num13;
+            p.core.num14 = core.num14;
+            p.core.rand1 = core.rand1;
+            p.core.theme_seed = core.theme_seed;
             p.parent_planet_index = -1;
             if (p.orbit_around > 0)
             {
@@ -1682,6 +2134,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
 
     const int iter_count = 4;
     const int max_pose_count = star_count * iter_count;
+    const int pose_copy_count = star_count;
     const int group_cap = ResolveGroupSize(seed_count, star_count, iter_count);
     bool debug_dump = false;
     if (const char* dbg = std::getenv("DSP_NATIVE_SIG_DEBUG"))
@@ -1725,7 +2178,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         int group_count = std::min(group_cap, seed_count - group_base);
         std::vector<int> pose_seeds(group_count);
         std::vector<int> pose_raw_counts(group_count, 0);
-        std::vector<dsp_vec3d_t> pose_raw(static_cast<size_t>(group_count) * static_cast<size_t>(max_pose_count));
+        std::vector<dsp_vec3d_t> pose_raw(static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count));
 
         for (int gi = 0; gi < group_count; ++gi)
         {
@@ -1734,10 +2187,12 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         }
 
         double stage0 = stage_timing ? now_ms() : 0.0;
-        int rc = dsp_cuda_generate_temp_poses_params_fp64_batch(
+        int rc = dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             pose_seeds.data(),
             group_count,
             max_pose_count,
+            pose_copy_count,
+            iter_count,
             2.0,
             2.3,
             3.5,
@@ -1745,7 +2200,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             collision_fp64,
             cuda_device_id,
             pose_raw.data(),
-            max_pose_count,
+            pose_copy_count,
             pose_raw_counts.data());
         if (stage_timing)
             stage_pose_ms += now_ms() - stage0;
@@ -1793,16 +2248,16 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 seed_ctx.birth_planet_id = 0;
 
                 const int raw_count = pose_raw_counts[gi];
-                const dsp_vec3d_t* raw_base = pose_raw.data() + static_cast<size_t>(gi) * static_cast<size_t>(max_pose_count);
+                const dsp_vec3d_t* raw_base = pose_raw.data() + static_cast<size_t>(gi) * static_cast<size_t>(pose_copy_count);
+                int pose_count = raw_count / iter_count;
+                if (pose_count < 0)
+                    pose_count = 0;
+                if (pose_count > star_count)
+                    pose_count = star_count;
                 std::vector<dsp_vec3d_t> poses;
-                poses.reserve(star_count);
-                for (int i = 0; i < raw_count; ++i)
-                {
-                    if (i % iter_count == 0)
-                        poses.push_back(raw_base[i]);
-                }
-                if (static_cast<int>(poses.size()) > star_count)
-                    poses.resize(star_count);
+                poses.reserve(pose_count);
+                for (int i = 0; i < pose_count; ++i)
+                    poses.push_back(raw_base[i]);
 
                 seed_ctx.star_count = static_cast<int>(poses.size());
                 seed_ctx.stars.resize(seed_ctx.star_count);
@@ -1905,21 +2360,33 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 secondary_refs.insert(secondary_refs.end(), secondary_refs_tls[w].begin(), secondary_refs_tls[w].end());
             }
         }
+        bool core_ready_from_plan = false;
         if (use_gpu_seedbuild_plan)
         {
             std::vector<StarRef> star_refs;
             for (int w = 0; w < worker_count; ++w)
                 star_refs.insert(star_refs.end(), star_refs_tls[w].begin(), star_refs_tls[w].end());
+            std::vector<dsp_planet_core_f32_out_t> out_core_flat;
 
             bool gpu_plan_ok = TryBuildStarPlanetPlansCuda(
                 cuda_device_id,
                 em,
                 seeds,
                 star_refs,
+                star_type_white_dwarf,
+                star_type_neutron_star,
+                star_type_black_hole,
                 primary_refs,
-                secondary_refs);
+                secondary_refs,
+                out_core_flat);
+            core_ready_from_plan = gpu_plan_ok;
             if (!gpu_plan_ok)
             {
+                if (stage_timing || debug_dump)
+                {
+                    std::printf("[native-sig-info] gpu-seedbuild-plan fallback-to-host group_count=%d\n", group_count);
+                    std::fflush(stdout);
+                }
                 primary_refs.clear();
                 secondary_refs.clear();
                 primary_refs.reserve(static_cast<size_t>(group_count) * 200);
@@ -2091,25 +2558,28 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             return DSP_CUDA_OK;
         };
 
-        rc = run_core_phase(primary_refs, false);
-        if (rc != DSP_CUDA_OK)
+        if (!core_ready_from_plan)
         {
-            if (stage_timing || debug_dump)
+            rc = run_core_phase(primary_refs, false);
+            if (rc != DSP_CUDA_OK)
             {
-                std::printf("[native-sig-error] run_core_phase primary rc=%d refs=%zu\n", rc, primary_refs.size());
-                std::fflush(stdout);
+                if (stage_timing || debug_dump)
+                {
+                    std::printf("[native-sig-error] run_core_phase primary rc=%d refs=%zu\n", rc, primary_refs.size());
+                    std::fflush(stdout);
+                }
+                return rc;
             }
-            return rc;
-        }
-        rc = run_core_phase(secondary_refs, true);
-        if (rc != DSP_CUDA_OK)
-        {
-            if (stage_timing || debug_dump)
+            rc = run_core_phase(secondary_refs, true);
+            if (rc != DSP_CUDA_OK)
             {
-                std::printf("[native-sig-error] run_core_phase secondary rc=%d refs=%zu\n", rc, secondary_refs.size());
-                std::fflush(stdout);
+                if (stage_timing || debug_dump)
+                {
+                    std::printf("[native-sig-error] run_core_phase secondary rc=%d refs=%zu\n", rc, secondary_refs.size());
+                    std::fflush(stdout);
+                }
+                return rc;
             }
-            return rc;
         }
 
         stage0 = stage_timing ? now_ms() : 0.0;

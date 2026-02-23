@@ -1164,6 +1164,25 @@ __global__ void RefreshPlanetVeinSpotsByThemeBatchKernel(
         }
     }
 }
+
+__global__ void GatherTempPosesHeadKernel(
+    const dsp_vec3d_t* in_poses,
+    int seed_count,
+    int in_stride,
+    int head_count,
+    int sample_step,
+    dsp_vec3d_t* out_poses,
+    int out_stride)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seed_count * head_count;
+    if (idx >= total)
+        return;
+    int seed_idx = idx / head_count;
+    int local_idx = idx - seed_idx * head_count;
+    int src_idx = local_idx * sample_step;
+    out_poses[seed_idx * out_stride + local_idx] = in_poses[seed_idx * in_stride + src_idx];
+}
 } // namespace
 
 extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
@@ -1258,6 +1277,131 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     {
         if (debug_enter)
             std::fprintf(stderr, "[cuda-galaxy-error] pose_batch post-kernel rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
+        return DSP_CUDA_ERR_CUDA;
+    }
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
+    const int* seeds,
+    int seed_count,
+    int max_count,
+    int head_count,
+    int sample_step,
+    double min_dist,
+    double min_step_len,
+    double max_step_len,
+    double flatten,
+    int collision_fp64,
+    int device_id,
+    dsp_vec3d_t* out_poses,
+    int out_stride,
+    int* out_counts)
+{
+    bool debug_enter = false;
+    if (const char* de = std::getenv("DSP_NATIVE_SIG_DEBUG_ENTER"))
+        debug_enter = std::atoi(de) != 0;
+    if (seeds == nullptr || out_poses == nullptr || out_counts == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (seed_count <= 0 || max_count <= 0 || head_count <= 0 || head_count > max_count || out_stride < head_count)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if (sample_step <= 0)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    if ((head_count - 1) * sample_step >= max_count)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+
+    if (device_id >= 0)
+    {
+        cudaError_t set_device_rc = cudaSetDevice(device_id);
+        if (set_device_rc != cudaSuccess)
+        {
+            if (debug_enter)
+                std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
+            return DSP_CUDA_ERR_CUDA;
+        }
+    }
+
+    const int device_stride = max_count;
+    const size_t seeds_bytes = static_cast<size_t>(seed_count) * sizeof(int);
+    const size_t counts_bytes = static_cast<size_t>(seed_count) * sizeof(int);
+    const size_t poses_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(device_stride) * sizeof(dsp_vec3d_t);
+
+    int* d_seeds = nullptr;
+    int* d_counts = nullptr;
+    dsp_vec3d_t* d_poses = nullptr;
+    dsp_vec3d_t* d_drunk = nullptr;
+    dsp_vec3d_t* d_head_poses = nullptr;
+
+    cudaError_t rc = EnsureBatchBuffers(
+        device_id,
+        seeds_bytes,
+        counts_bytes,
+        poses_bytes,
+        &d_seeds,
+        &d_counts,
+        &d_poses,
+        &d_drunk);
+    if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head EnsureBatchBuffers rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
+        return DSP_CUDA_ERR_CUDA;
+    }
+
+    rc = cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice);
+    if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head H2D seeds rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
+        return DSP_CUDA_ERR_CUDA;
+    }
+
+    int block_size = 128;
+    int grid_size = (seed_count + block_size - 1) / block_size;
+    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size>>>(
+        d_seeds,
+        seed_count,
+        max_count,
+        min_dist,
+        min_step_len,
+        max_step_len,
+        flatten,
+        collision_fp64,
+        d_poses,
+        d_drunk,
+        device_stride,
+        d_counts);
+
+    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaMemcpy(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost);
+    if (rc == cudaSuccess)
+    {
+        const size_t head_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(out_stride) * sizeof(dsp_vec3d_t);
+        rc = cudaMalloc(reinterpret_cast<void**>(&d_head_poses), head_bytes);
+        if (rc == cudaSuccess)
+        {
+            int block = 128;
+            int grid = (seed_count * head_count + block - 1) / block;
+            GatherTempPosesHeadKernel<<<grid, block>>>(
+                d_poses,
+                seed_count,
+                device_stride,
+                head_count,
+                sample_step,
+                d_head_poses,
+                out_stride);
+            rc = cudaGetLastError();
+            if (rc == cudaSuccess)
+                rc = cudaMemcpy(out_poses, d_head_poses, head_bytes, cudaMemcpyDeviceToHost);
+        }
+    }
+    cudaFree(d_head_poses);
+
+    if (rc != cudaSuccess)
+    {
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head post-kernel rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
     }
     return DSP_CUDA_OK;
