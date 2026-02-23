@@ -27,6 +27,7 @@ public static class StarGen
   };
   public static float specifyBirthStarMass = 0.0f;
   public static float specifyBirthStarAge = 0.0f;
+  public static bool SkipNameGeneration = false;
   [ThreadStatic] private static double[] pGas;
   private const double PI = 3.14159265358979;
 
@@ -38,6 +39,7 @@ public static class StarGen
     EStarType needtype,
     ESpectrType needSpectr = ESpectrType.X)
   {
+    bool fastMode = StarGen.SkipNameGeneration;
     StarData star = new StarData()
     {
       galaxy = galaxy,
@@ -50,10 +52,17 @@ public static class StarGen
     int seed1 = dotNet35Random1.Next();
     int Seed = dotNet35Random1.Next();
     star.position = pos;
-    float num1 = (float) pos.magnitude / 32f;
-    if ((double) num1 > 1.0)
-      num1 = Mathf.Log(Mathf.Log(Mathf.Log(Mathf.Log(Mathf.Log(num1) + 1f) + 1f) + 1f) + 1f) + 1f;
-    star.resourceCoef = Mathf.Pow(7f, num1) * 0.6f;
+    if (fastMode)
+    {
+      star.resourceCoef = 0.6f;
+    }
+    else
+    {
+      float num1 = (float) pos.magnitude / 32f;
+      if ((double) num1 > 1.0)
+        num1 = Mathf.Log(Mathf.Log(Mathf.Log(Mathf.Log(Mathf.Log(num1) + 1f) + 1f) + 1f) + 1f) + 1f;
+      star.resourceCoef = Mathf.Pow(7f, num1) * 0.6f;
+    }
     DotNet35Random dotNet35Random2 = new DotNet35Random(Seed);
     double r1 = dotNet35Random2.NextDouble();
     double r2 = dotNet35Random2.NextDouble();
@@ -63,7 +72,7 @@ public static class StarGen
     double num3 = (dotNet35Random2.NextDouble() - 0.5) * 0.2;
     double num4 = dotNet35Random2.NextDouble() * 0.2 + 0.9;
     double y = dotNet35Random2.NextDouble() * 0.4 - 0.2;
-    double num5 = Math.Pow(2.0, y);
+    double num5 = fastMode ? 0.0 : Math.Pow(2.0, y);
     float num6 = Mathf.Lerp(-0.98f, 0.88f, star.level);
     float averageValue = (double) num6 >= 0.0 ? num6 + 0.65f : num6 - 0.65f;
     float standardDeviation = 0.33f;
@@ -143,10 +152,13 @@ public static class StarGen
     else if (num10 < -4.0)
       num10 = -4.0;
     star.spectr = (ESpectrType) Mathf.RoundToInt((float) num10 + 4f);
-    star.color = Mathf.Clamp01((float) ((num10 + 3.5) * 0.200000002980232));
-    star.classFactor = (float) num10;
-    star.luminosity = Mathf.Pow(num9, 0.7f);
-    star.radius = (float) (Math.Pow((double) star.mass, 0.4) * num5);
+    if (!fastMode)
+    {
+      star.color = Mathf.Clamp01((float) ((num10 + 3.5) * 0.200000002980232));
+      star.classFactor = (float) num10;
+      star.luminosity = Mathf.Pow(num9, 0.7f);
+      star.radius = (float) (Math.Pow((double) star.mass, 0.4) * num5);
+    }
     star.acdiskRadius = 0.0f;
     float p2 = (float) num10 + 2f;
     star.habitableRadius = Mathf.Pow(1.7f, p2) + 0.25f * Mathf.Min(1f, star.orbitScaler);
@@ -155,17 +167,24 @@ public static class StarGen
     if ((double) star.orbitScaler < 1.0)
       star.orbitScaler = Mathf.Lerp(star.orbitScaler, 1f, 0.6f);
     StarGen.SetStarAge(star, star.age, rn, rt);
-    star.dysonRadius = star.orbitScaler * 0.28f;
-    if ((double) star.dysonRadius * 40000.0 < (double) star.physicsRadius * 1.5)
-      star.dysonRadius = (float) ((double) star.physicsRadius * 1.5 / 40000.0);
+    if (!fastMode)
+    {
+      star.dysonRadius = star.orbitScaler * 0.28f;
+      if ((double) star.dysonRadius * 40000.0 < (double) star.physicsRadius * 1.5)
+        star.dysonRadius = (float) ((double) star.physicsRadius * 1.5 / 40000.0);
+    }
     star.uPosition = star.position * 2400000.0;
-    star.name = NameGen.RandomStarName(seed1, star, galaxy);
-    star.overrideName = "";
+    if (!StarGen.SkipNameGeneration)
+      star.name = NameGen.RandomStarName(seed1, star, galaxy);
+    else
+      star.name = string.Empty;
+    star.overrideName = string.Empty;
     return star;
   }
 
   public static StarData CreateBirthStar(GalaxyData galaxy, int seed)
   {
+    bool fastMode = StarGen.SkipNameGeneration;
     StarData birthStar = new StarData();
     birthStar.galaxy = galaxy;
     birthStar.index = 0;
@@ -176,8 +195,8 @@ public static class StarGen
     DotNet35Random dotNet35Random1 = new DotNet35Random(seed);
     int seed1 = dotNet35Random1.Next();
     int Seed = dotNet35Random1.Next();
-    birthStar.name = NameGen.RandomName(seed1);
-    birthStar.overrideName = "";
+    birthStar.name = string.Empty;
+    birthStar.overrideName = string.Empty;
     birthStar.position = VectorLF3.zero;
     DotNet35Random dotNet35Random2 = new DotNet35Random(Seed);
     double r1 = dotNet35Random2.NextDouble();
@@ -186,7 +205,7 @@ public static class StarGen
     double rn = dotNet35Random2.NextDouble();
     double rt = dotNet35Random2.NextDouble();
     double num2 = dotNet35Random2.NextDouble() * 0.2 + 0.9;
-    double num3 = Math.Pow(2.0, dotNet35Random2.NextDouble() * 0.4 - 0.2);
+    double num3 = fastMode ? 0.0 : Math.Pow(2.0, dotNet35Random2.NextDouble() * 0.4 - 0.2);
     float p1 = Mathf.Clamp(StarGen.RandNormal(0.0f, 0.08f, r1, r2), -0.2f, 0.2f);
     birthStar.mass = Mathf.Pow(2f, p1);
     if ((double) StarGen.specifyBirthStarMass > 0.100000001490116)
@@ -208,10 +227,13 @@ public static class StarGen
     else if (num5 < -4.0)
       num5 = -4.0;
     birthStar.spectr = (ESpectrType) Mathf.RoundToInt((float) num5 + 4f);
-    birthStar.color = Mathf.Clamp01((float) ((num5 + 3.5) * 0.200000002980232));
-    birthStar.classFactor = (float) num5;
-    birthStar.luminosity = Mathf.Pow(num4, 0.7f);
-    birthStar.radius = (float) (Math.Pow((double) birthStar.mass, 0.4) * num3);
+    if (!fastMode)
+    {
+      birthStar.color = Mathf.Clamp01((float) ((num5 + 3.5) * 0.200000002980232));
+      birthStar.classFactor = (float) num5;
+      birthStar.luminosity = Mathf.Pow(num4, 0.7f);
+      birthStar.radius = (float) (Math.Pow((double) birthStar.mass, 0.4) * num3);
+    }
     birthStar.acdiskRadius = 0.0f;
     float p2 = (float) num5 + 2f;
     birthStar.habitableRadius = Mathf.Pow(1.7f, p2) + 0.2f * Mathf.Min(1f, birthStar.orbitScaler);
@@ -220,12 +242,18 @@ public static class StarGen
     if ((double) birthStar.orbitScaler < 1.0)
       birthStar.orbitScaler = Mathf.Lerp(birthStar.orbitScaler, 1f, 0.6f);
     StarGen.SetStarAge(birthStar, birthStar.age, rn, rt);
-    birthStar.dysonRadius = birthStar.orbitScaler * 0.28f;
-    if ((double) birthStar.dysonRadius * 40000.0 < (double) birthStar.physicsRadius * 1.5)
-      birthStar.dysonRadius = (float) ((double) birthStar.physicsRadius * 1.5 / 40000.0);
+    if (!fastMode)
+    {
+      birthStar.dysonRadius = birthStar.orbitScaler * 0.28f;
+      if ((double) birthStar.dysonRadius * 40000.0 < (double) birthStar.physicsRadius * 1.5)
+        birthStar.dysonRadius = (float) ((double) birthStar.physicsRadius * 1.5 / 40000.0);
+    }
     birthStar.uPosition = VectorLF3.zero;
-    birthStar.name = NameGen.RandomStarName(seed1, birthStar, galaxy);
-    birthStar.overrideName = "";
+    if (!StarGen.SkipNameGeneration)
+      birthStar.name = NameGen.RandomStarName(seed1, birthStar, galaxy);
+    else
+      birthStar.name = string.Empty;
+    birthStar.overrideName = string.Empty;
     return birthStar;
   }
 

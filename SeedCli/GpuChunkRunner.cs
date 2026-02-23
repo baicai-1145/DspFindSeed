@@ -25,24 +25,31 @@ namespace SeedCli
             _mixThreads = mixThreads < 1 ? 1 : mixThreads;
         }
 
+        public bool PrefetchChunk(int seedBase, int chunkSize, bool timingDebug, GpuChunkBuffers buffers, out long prefetchTicks)
+        {
+            prefetchTicks = 0;
+            if (chunkSize <= 0)
+                return false;
+
+            PrepareChunkBuffers(seedBase, chunkSize, buffers);
+            long tp0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
+            var seedSlice = new ArraySegment<int>(buffers.SeedBuffer, 0, chunkSize);
+            bool prefetched = UniverseGenF32.PrecomputeTempPosesParamsFp64Batch(seedSlice, _starCount, collisionFp64: _mixCollisionFp64);
+            if (timingDebug)
+                prefetchTicks = Stopwatch.GetTimestamp() - tp0;
+            return prefetched;
+        }
+
         public ChunkRunResult RunChunk(int seedBase, int chunkSize, bool enableBatchPrefetch, bool timingDebug, GpuChunkBuffers buffers)
         {
             MixRuntimeFlags.ChunkWideCoreBatch = false;
-            buffers.EnsureCapacity(chunkSize);
-            for (int i = 0; i < chunkSize; ++i)
-            {
-                buffers.SeedBuffer[i] = seedBase + i;
-                buffers.GalaxyBuffer[i] = null;
-            }
+            PrepareChunkBuffers(seedBase, chunkSize, buffers);
 
             var result = new ChunkRunResult();
             if (enableBatchPrefetch)
             {
-                long tp0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
-                var seedSlice = new ArraySegment<int>(buffers.SeedBuffer, 0, chunkSize);
-                result.Prefetched = UniverseGenF32.PrecomputeTempPosesParamsFp64Batch(seedSlice, _starCount, collisionFp64: _mixCollisionFp64);
-                if (timingDebug)
-                    result.PrefetchTicks = Stopwatch.GetTimestamp() - tp0;
+                result.Prefetched = PrefetchChunk(seedBase, chunkSize, timingDebug, buffers, out var prefetchTicks);
+                result.PrefetchTicks = prefetchTicks;
             }
 
             long tg0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
@@ -178,6 +185,16 @@ namespace SeedCli
             if (timingDebug)
                 result.CreateGalaxyTicks = Stopwatch.GetTimestamp() - tg0;
             return result;
+        }
+
+        private static void PrepareChunkBuffers(int seedBase, int chunkSize, GpuChunkBuffers buffers)
+        {
+            buffers.EnsureCapacity(chunkSize);
+            for (int i = 0; i < chunkSize; ++i)
+            {
+                buffers.SeedBuffer[i] = seedBase + i;
+                buffers.GalaxyBuffer[i] = null;
+            }
         }
 
         public static void ClearPrefetch()

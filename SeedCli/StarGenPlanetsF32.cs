@@ -45,34 +45,96 @@ namespace SeedCli
         }
 
         [ThreadStatic] private static List<PlanetBuildContext> _pendingGalaxyBatch;
+        [ThreadStatic] private static Stack<PlanetBuildContext> _ctxPool;
+        [ThreadStatic] private static Stack<List<PlanetBuildPlan>> _planPool;
+
+        private static PlanetBuildContext RentBuildContext()
+        {
+            PlanetBuildContext ctx;
+            var ctxPool = _ctxPool;
+            if (ctxPool != null && ctxPool.Count > 0)
+                ctx = ctxPool.Pop();
+            else
+                ctx = new PlanetBuildContext();
+
+            var planPool = _planPool;
+            if (planPool != null && planPool.Count > 0)
+                ctx.plans = planPool.Pop();
+            else
+                ctx.plans = new List<PlanetBuildPlan>(8);
+            ctx.plans.Clear();
+            ctx.coreResults = null;
+            return ctx;
+        }
+
+        private static void ReturnBuildContext(PlanetBuildContext ctx)
+        {
+            if (ctx == null)
+                return;
+
+            if (ctx.coreResults != null)
+            {
+                MixObjectPool.ReturnCoreArray(ctx.coreResults);
+                ctx.coreResults = null;
+            }
+
+            if (ctx.plans != null)
+            {
+                ctx.plans.Clear();
+                var planPool = _planPool;
+                if (planPool == null)
+                {
+                    planPool = new Stack<List<PlanetBuildPlan>>(128);
+                    _planPool = planPool;
+                }
+                planPool.Push(ctx.plans);
+                ctx.plans = null;
+            }
+
+            ctx.galaxy = null;
+            ctx.star = null;
+            ctx.themeIds = null;
+            ctx.num4 = 0;
+            ctx.num5 = 0;
+            ctx.num6 = 0;
+            ctx.num7 = 0;
+
+            var ctxPool = _ctxPool;
+            if (ctxPool == null)
+            {
+                ctxPool = new Stack<PlanetBuildContext>(256);
+                _ctxPool = ctxPool;
+            }
+            ctxPool.Push(ctx);
+        }
 
         public static void BeginGalaxyBatch()
         {
-            _pendingGalaxyBatch = new List<PlanetBuildContext>(96);
+            if (_pendingGalaxyBatch == null)
+                _pendingGalaxyBatch = new List<PlanetBuildContext>(96);
+            else
+                _pendingGalaxyBatch.Clear();
         }
 
         public static void FlushGalaxyBatch()
         {
             var pending = _pendingGalaxyBatch;
-            _pendingGalaxyBatch = null;
             if (pending == null || pending.Count == 0)
                 return;
             FinalizeBufferedPlanetsBatch(pending);
+            pending.Clear();
         }
 
         // 复用原 StarGen.pGas 表（定义在 DspFindSeed.StarGen）
         public static void CreateStarPlanetsF32(GalaxyData galaxy, StarData star, global::DspFindSeed.GameDesc gameDesc)
         {
-            var buildCtx = new PlanetBuildContext
-            {
-                galaxy = galaxy,
-                star = star,
-                themeIds = gameDesc.savedThemeIds,
-                boostInclinationNs = star.type >= EStarType.NeutronStar ? 1 : 0,
-                compactTypeCase = star.type == EStarType.WhiteDwarf ? 1 : (star.type == EStarType.NeutronStar ? 2 : (star.type == EStarType.BlackHole ? 3 : 0)),
-                batchEnabled = CudaPlanetNative.IsCoreEnabled(),
-                plans = new List<PlanetBuildPlan>(8)
-            };
+            var buildCtx = RentBuildContext();
+            buildCtx.galaxy = galaxy;
+            buildCtx.star = star;
+            buildCtx.themeIds = gameDesc.savedThemeIds;
+            buildCtx.boostInclinationNs = star.type >= EStarType.NeutronStar ? 1 : 0;
+            buildCtx.compactTypeCase = star.type == EStarType.WhiteDwarf ? 1 : (star.type == EStarType.NeutronStar ? 2 : (star.type == EStarType.BlackHole ? 3 : 0));
+            buildCtx.batchEnabled = CudaPlanetNative.IsCoreEnabled();
 
             DotNet35Random rng1 = new DotNet35Random(star.seed);
             rng1.Next(); rng1.Next(); rng1.Next();
@@ -396,6 +458,7 @@ namespace SeedCli
 
             FinalizeBufferedPlanets(buildCtx);
             ApplyAsteroidBelts(star, num4, num5, num6, num7);
+            ReturnBuildContext(buildCtx);
         }
 
         private static PlanetData CreatePlanetBuffered(
@@ -503,86 +566,169 @@ namespace SeedCli
         {
             if (contexts == null || contexts.Count == 0)
                 return;
-            bool hasWork = false;
-            for (int i = 0; i < contexts.Count; ++i)
+            try
             {
-                var ctx = contexts[i];
-                if (ctx?.plans == null || ctx.plans.Count == 0)
-                    continue;
-                ctx.coreResults = MixObjectPool.RentCoreArray(ctx.plans.Count);
-                hasWork = true;
-            }
-            if (!hasWork)
-                return;
-
-            var phaseCtx = new List<PlanetBuildContext>(4096);
-            var phasePlanIdx = new List<int>(4096);
-
-            bool CollectPhase(bool primary, out int phaseCount, out CudaPlanetNative.PlanetCoreBatchArrays arrays)
-            {
-                phaseCtx.Clear();
-                phasePlanIdx.Clear();
-                phaseCount = 0;
-                arrays = default(CudaPlanetNative.PlanetCoreBatchArrays);
-
-                for (int ci = 0; ci < contexts.Count; ++ci)
+                bool hasWork = false;
+                for (int i = 0; i < contexts.Count; ++i)
                 {
-                    var ctx = contexts[ci];
-                    if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
+                    var ctx = contexts[i];
+                    if (ctx?.plans == null || ctx.plans.Count == 0)
                         continue;
-                    for (int pi = 0; pi < ctx.plans.Count; ++pi)
-                    {
-                        bool isPrimary = ctx.plans[pi].orbitAround == 0;
-                        if (primary == isPrimary)
-                            phaseCount++;
-                    }
+                    ctx.coreResults = MixObjectPool.RentCoreArray(ctx.plans.Count);
+                    hasWork = true;
                 }
-                if (phaseCount == 0)
-                    return false;
+                if (!hasWork)
+                    return;
 
-                arrays = CudaPlanetNative.AcquireCoreBatchArrays(phaseCount);
-                int wi = 0;
-                for (int ci = 0; ci < contexts.Count; ++ci)
+                void FallbackAll()
                 {
-                    var ctx = contexts[ci];
-                    if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
-                        continue;
-                    for (int pi = 0; pi < ctx.plans.Count; ++pi)
+                    GalaxyData currentGalaxy = null;
+                    int runningHabitable = 0;
+                    for (int ci = 0; ci < contexts.Count; ++ci)
                     {
-                        var plan = ctx.plans[pi];
-                        bool isPrimary = plan.orbitAround == 0;
-                        if (primary != isPrimary)
+                        var ctx = contexts[ci];
+                        if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
                             continue;
-                        var planet = ctx.star.planets[plan.index];
-                        var aroundPlanet = planet.orbitAroundPlanet;
-                        arrays.infoSeeds[wi] = plan.infoSeed;
-                        arrays.orbitArounds[wi] = plan.orbitAround;
-                        arrays.orbitIndexes[wi] = plan.orbitIndex;
-                        arrays.gasGiants[wi] = plan.gasGiant ? 1 : 0;
-                        arrays.starIndexes[wi] = ctx.star.index;
-                        arrays.galaxyStarCounts[wi] = ctx.star.galaxy.starCount;
-                        arrays.galaxyHabitableCounts[wi] = 0;
-                        arrays.boostInclinationNs[wi] = ctx.boostInclinationNs;
-                        arrays.compactTypeCases[wi] = ctx.compactTypeCase;
-                        arrays.starOrbitScalers[wi] = ctx.star.orbitScaler;
-                        arrays.starMasses[wi] = ctx.star.mass;
-                        arrays.starHabitableRadii[wi] = ctx.star.habitableRadius;
-                        arrays.starLightBalanceRadii[wi] = ctx.star.lightBalanceRadius;
-                        arrays.aroundRealRadii[wi] = aroundPlanet != null ? aroundPlanet.realRadius : 0f;
-                        arrays.aroundOrbitRadii[wi] = aroundPlanet != null ? aroundPlanet.orbitRadius : 0f;
-                        arrays.aroundOrbitalPeriods[wi] = aroundPlanet != null ? aroundPlanet.orbitalPeriod : 0.0;
-                        phaseCtx.Add(ctx);
-                        phasePlanIdx.Add(pi);
-                        wi++;
+
+                        var galaxy = ctx.star?.galaxy;
+                        if (galaxy == null)
+                            continue;
+                        if (!ReferenceEquals(currentGalaxy, galaxy))
+                        {
+                            currentGalaxy = galaxy;
+                            runningHabitable = galaxy.habitableCount;
+                        }
+                        galaxy.habitableCount = runningHabitable;
+                        RebuildFallback(ctx);
+                        runningHabitable = galaxy.habitableCount;
+                        ApplyAsteroidBelts(ctx.star, ctx.num4, ctx.num5, ctx.num6, ctx.num7);
                     }
                 }
-                return true;
-            }
 
-            void FallbackAll()
-            {
-                GalaxyData currentGalaxy = null;
-                int runningHabitable = 0;
+                void ReleaseCoreResults()
+                {
+                    for (int ci = 0; ci < contexts.Count; ++ci)
+                    {
+                        var ctx = contexts[ci];
+                        if (ctx == null || ctx.coreResults == null)
+                            continue;
+                        MixObjectPool.ReturnCoreArray(ctx.coreResults);
+                        ctx.coreResults = null;
+                    }
+                }
+
+                int CountPhase(bool primary)
+                {
+                    int count = 0;
+                    for (int ci = 0; ci < contexts.Count; ++ci)
+                    {
+                        var ctx = contexts[ci];
+                        if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
+                            continue;
+                        for (int pi = 0; pi < ctx.plans.Count; ++pi)
+                        {
+                            bool isPrimary = ctx.plans[pi].orbitAround == 0;
+                            if (primary == isPrimary)
+                                count++;
+                        }
+                    }
+                    return count;
+                }
+
+                void FillPhase(bool primary, CudaPlanetNative.PlanetCoreBatchArrays arrays)
+                {
+                    int wi = 0;
+                    for (int ci = 0; ci < contexts.Count; ++ci)
+                    {
+                        var ctx = contexts[ci];
+                        if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
+                            continue;
+                        for (int pi = 0; pi < ctx.plans.Count; ++pi)
+                        {
+                            var plan = ctx.plans[pi];
+                            bool isPrimary = plan.orbitAround == 0;
+                            if (primary != isPrimary)
+                                continue;
+                            var planet = ctx.star.planets[plan.index];
+                            var aroundPlanet = planet.orbitAroundPlanet;
+                            arrays.infoSeeds[wi] = plan.infoSeed;
+                            arrays.orbitArounds[wi] = plan.orbitAround;
+                            arrays.orbitIndexes[wi] = plan.orbitIndex;
+                            arrays.gasGiants[wi] = plan.gasGiant ? 1 : 0;
+                            arrays.starIndexes[wi] = ctx.star.index;
+                            arrays.galaxyStarCounts[wi] = ctx.star.galaxy.starCount;
+                            arrays.galaxyHabitableCounts[wi] = 0;
+                            arrays.boostInclinationNs[wi] = ctx.boostInclinationNs;
+                            arrays.compactTypeCases[wi] = ctx.compactTypeCase;
+                            arrays.starOrbitScalers[wi] = ctx.star.orbitScaler;
+                            arrays.starMasses[wi] = ctx.star.mass;
+                            arrays.starHabitableRadii[wi] = ctx.star.habitableRadius;
+                            arrays.starLightBalanceRadii[wi] = ctx.star.lightBalanceRadius;
+                            arrays.aroundRealRadii[wi] = aroundPlanet != null ? aroundPlanet.realRadius : 0f;
+                            arrays.aroundOrbitRadii[wi] = aroundPlanet != null ? aroundPlanet.orbitRadius : 0f;
+                            arrays.aroundOrbitalPeriods[wi] = aroundPlanet != null ? aroundPlanet.orbitalPeriod : 0.0;
+                            wi++;
+                        }
+                    }
+                }
+
+                void ReplayPhase(bool primary, CudaPlanetNative.PlanetCoreF32Out[] phaseOut, bool applyPrimaryOrbitState)
+                {
+                    int ri = 0;
+                    for (int ci = 0; ci < contexts.Count; ++ci)
+                    {
+                        var ctx = contexts[ci];
+                        if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
+                            continue;
+                        for (int pi = 0; pi < ctx.plans.Count; ++pi)
+                        {
+                            var plan = ctx.plans[pi];
+                            bool isPrimary = plan.orbitAround == 0;
+                            if (primary != isPrimary)
+                                continue;
+                            var core = phaseOut[ri++];
+                            ctx.coreResults[pi] = core;
+                            if (applyPrimaryOrbitState)
+                            {
+                                var p = ctx.star.planets[plan.index];
+                                PlanetGenF32.ApplyCoreOrbitState(p, core);
+                            }
+                        }
+                    }
+                }
+
+                bool RunPhase(bool primary, bool applyPrimaryOrbitState)
+                {
+                    int phaseCount = CountPhase(primary);
+                    if (phaseCount == 0)
+                        return true;
+                    var arrays = CudaPlanetNative.AcquireCoreBatchArrays(phaseCount);
+                    FillPhase(primary, arrays);
+                    var phaseOut = MixObjectPool.RentCoreArray(phaseCount);
+                    try
+                    {
+                        if (!CudaPlanetNative.TryEvalPlanetCoreF32BatchRaw(arrays, phaseCount, phaseOut))
+                        {
+                            FallbackAll();
+                            ReleaseCoreResults();
+                            return false;
+                        }
+                        ReplayPhase(primary, phaseOut, applyPrimaryOrbitState);
+                        return true;
+                    }
+                    finally
+                    {
+                        MixObjectPool.ReturnCoreArray(phaseOut);
+                    }
+                }
+
+                if (!RunPhase(primary: true, applyPrimaryOrbitState: true))
+                    return;
+                if (!RunPhase(primary: false, applyPrimaryOrbitState: false))
+                    return;
+
+                GalaxyData currentGalaxyFinal = null;
+                int runningHabitableFinal = 0;
                 for (int ci = 0; ci < contexts.Count; ++ci)
                 {
                     var ctx = contexts[ci];
@@ -592,105 +738,40 @@ namespace SeedCli
                     var galaxy = ctx.star?.galaxy;
                     if (galaxy == null)
                         continue;
-                    if (!ReferenceEquals(currentGalaxy, galaxy))
+                    if (!ReferenceEquals(currentGalaxyFinal, galaxy))
                     {
-                        currentGalaxy = galaxy;
-                        runningHabitable = galaxy.habitableCount;
+                        currentGalaxyFinal = galaxy;
+                        runningHabitableFinal = galaxy.habitableCount;
                     }
-                    galaxy.habitableCount = runningHabitable;
-                    RebuildFallback(ctx);
-                    runningHabitable = galaxy.habitableCount;
-                    ApplyAsteroidBelts(ctx.star, ctx.num4, ctx.num5, ctx.num6, ctx.num7);
-                }
-            }
 
-            void ReleaseCoreResults()
-            {
-                for (int ci = 0; ci < contexts.Count; ++ci)
-                {
-                    var ctx = contexts[ci];
-                    if (ctx == null || ctx.coreResults == null)
-                        continue;
+                    galaxy.habitableCount = runningHabitableFinal;
+                    var coreResults = ctx.coreResults;
+                    for (int i = 0; i < ctx.plans.Count; ++i)
+                    {
+                        var plan = ctx.plans[i];
+                        var p = ctx.star.planets[plan.index];
+                        var core = coreResults[i];
+                        PlanetGenF32.RecomputeAndApplyCoreThemeFast(
+                            p,
+                            ctx.themeIds,
+                            plan.infoSeed,
+                            plan.orbitAround,
+                            plan.orbitIndex,
+                            plan.gasGiant,
+                            ctx.star,
+                            ref core);
+                    }
+
+                    runningHabitableFinal = galaxy.habitableCount;
+                    ApplyAsteroidBelts(ctx.star, ctx.num4, ctx.num5, ctx.num6, ctx.num7);
                     MixObjectPool.ReturnCoreArray(ctx.coreResults);
                     ctx.coreResults = null;
                 }
             }
-
-            if (CollectPhase(primary: true, out var primaryCount, out var primaryArrays))
+            finally
             {
-                var phaseOut = new CudaPlanetNative.PlanetCoreF32Out[primaryCount];
-                if (!CudaPlanetNative.TryEvalPlanetCoreF32BatchRaw(primaryArrays, primaryCount, phaseOut))
-                {
-                    FallbackAll();
-                    ReleaseCoreResults();
-                    return;
-                }
-                for (int i = 0; i < phaseOut.Length; ++i)
-                {
-                    var ctx = phaseCtx[i];
-                    int planIdx = phasePlanIdx[i];
-                    ctx.coreResults[planIdx] = phaseOut[i];
-                    var p = ctx.star.planets[ctx.plans[planIdx].index];
-                    PlanetGenF32.ApplyCoreOrbitState(p, phaseOut[i]);
-                }
-            }
-
-            if (CollectPhase(primary: false, out var secondaryCount, out var secondaryArrays))
-            {
-                var phaseOut = new CudaPlanetNative.PlanetCoreF32Out[secondaryCount];
-                if (!CudaPlanetNative.TryEvalPlanetCoreF32BatchRaw(secondaryArrays, secondaryCount, phaseOut))
-                {
-                    FallbackAll();
-                    ReleaseCoreResults();
-                    return;
-                }
-                for (int i = 0; i < phaseOut.Length; ++i)
-                {
-                    var ctx = phaseCtx[i];
-                    int planIdx = phasePlanIdx[i];
-                    ctx.coreResults[planIdx] = phaseOut[i];
-                }
-            }
-
-            GalaxyData currentGalaxyFinal = null;
-            int runningHabitableFinal = 0;
-            for (int ci = 0; ci < contexts.Count; ++ci)
-            {
-                var ctx = contexts[ci];
-                if (ctx == null || ctx.plans == null || ctx.plans.Count == 0)
-                    continue;
-
-                var galaxy = ctx.star?.galaxy;
-                if (galaxy == null)
-                    continue;
-                if (!ReferenceEquals(currentGalaxyFinal, galaxy))
-                {
-                    currentGalaxyFinal = galaxy;
-                    runningHabitableFinal = galaxy.habitableCount;
-                }
-
-                galaxy.habitableCount = runningHabitableFinal;
-                var coreResults = ctx.coreResults;
-                for (int i = 0; i < ctx.plans.Count; ++i)
-                {
-                    var plan = ctx.plans[i];
-                    var p = ctx.star.planets[plan.index];
-                    var core = coreResults[i];
-                    PlanetGenF32.RecomputeCoreTypeByHabitableCount(
-                        ref core,
-                        plan.infoSeed,
-                        plan.orbitAround,
-                        plan.orbitIndex,
-                        plan.gasGiant,
-                        ctx.star,
-                        galaxy.habitableCount);
-                    PlanetGenF32.ApplyCoreAndTheme(p, ctx.themeIds, ref core);
-                }
-
-                runningHabitableFinal = galaxy.habitableCount;
-                ApplyAsteroidBelts(ctx.star, ctx.num4, ctx.num5, ctx.num6, ctx.num7);
-                MixObjectPool.ReturnCoreArray(ctx.coreResults);
-                ctx.coreResults = null;
+                for (int i = 0; i < contexts.Count; ++i)
+                    ReturnBuildContext(contexts[i]);
             }
         }
 
@@ -771,15 +852,15 @@ namespace SeedCli
                 var plan = ctx.plans[i];
                 var p = ctx.star.planets[plan.index];
                 var core = coreResults[i];
-                PlanetGenF32.RecomputeCoreTypeByHabitableCount(
-                    ref core,
+                PlanetGenF32.RecomputeAndApplyCoreThemeFast(
+                    p,
+                    ctx.themeIds,
                     plan.infoSeed,
                     plan.orbitAround,
                     plan.orbitIndex,
                     plan.gasGiant,
                     ctx.star,
-                    ctx.star.galaxy.habitableCount);
-                PlanetGenF32.ApplyCoreAndTheme(p, ctx.themeIds, ref core);
+                    ref core);
             }
         }
 

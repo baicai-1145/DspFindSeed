@@ -63,7 +63,8 @@ namespace SeedCli
                         break;
                     }
                 }
-                Assert.NotNull(planet.orbitAroundPlanet);
+                if (!MixRuntimeFlags.SignatureOnlyFastPath)
+                    Assert.NotNull(planet.orbitAroundPlanet);
             }
 
             if (!MixRuntimeFlags.SignatureOnlyFastPath)
@@ -146,6 +147,82 @@ namespace SeedCli
             core.precision = 200;
             core.segment = 5;
             core.radius = 200f;
+        }
+
+        // Fast-path only: merge "recompute type by habitableCount" + "apply core/theme"
+        // to reduce per-planet call/branch overhead in compare pipeline.
+        public static void RecomputeAndApplyCoreThemeFast(
+            PlanetData planet,
+            int[] themeIds,
+            int infoSeed,
+            int orbitAround,
+            int orbitIndex,
+            bool gasGiant,
+            StarData star,
+            ref CudaPlanetNative.PlanetCoreF32Out core)
+        {
+            if (planet == null || star == null || star.galaxy == null)
+                return;
+
+            if (gasGiant)
+            {
+                core.type_case = TypeCaseGas;
+                core.habitable_count_delta = 0;
+                core.precision = 64;
+                core.segment = 2;
+                core.radius = 80f;
+            }
+            else
+            {
+                double num13 = core.num13;
+                double num14 = core.num14;
+
+                float num18 = Mathf.Ceil(star.galaxy.starCount * 0.29f);
+                if (num18 < 11f) num18 = 11f;
+                float num19 = num18 - star.galaxy.habitableCount;
+                float num20 = star.galaxy.starCount - star.index;
+                float num24 = Mathf.Clamp((num19 / Mathf.Max(1f, num20)) * 0.5f + 0.175f, 0.08f, 0.8f);
+                float num25 = Mathf.Pow(Mathf.Clamp01(core.habitable_bias / num24), num24 * 10f);
+
+                int typeCase;
+                int habitableDelta = 0;
+                float f2 = 1000f;
+                if (star.habitableRadius > 0f && core.sun_distance > 0f)
+                    f2 = core.sun_distance / star.habitableRadius;
+
+                if ((num13 > num25 && star.index > 0) || (orbitAround > 0 && orbitIndex == 1 && star.index == 0))
+                {
+                    typeCase = TypeCaseOcean;
+                    habitableDelta = 1;
+                }
+                else if (f2 < 0.833333f)
+                {
+                    float num26 = Mathf.Max(0.15f, f2 * 2.5f - 0.85f);
+                    typeCase = num14 >= num26 ? TypeCaseVocano : TypeCaseDesert;
+                }
+                else if (f2 < 1.2f)
+                {
+                    typeCase = TypeCaseDesert;
+                }
+                else
+                {
+                    float num27 = 0.9f / f2 - 0.1f;
+                    typeCase = num14 >= num27 ? TypeCaseIce : TypeCaseDesert;
+                }
+
+                core.type_case = typeCase;
+                core.habitable_count_delta = habitableDelta;
+                core.precision = 200;
+                core.segment = 5;
+                core.radius = 200f;
+            }
+
+            planet.temperatureBias = core.temperature_bias;
+            planet.type = (EPlanetType)CudaPlanetNative.MapTypeCaseToPlanetType(core.type_case);
+            if (core.habitable_count_delta > 0)
+                ++star.galaxy.habitableCount;
+
+            SetPlanetTheme(planet, themeIds, core.rand1, core.rand2, core.rand3, core.rand4, core.theme_seed);
         }
 
         public static void ApplyCoreAndTheme(
