@@ -2480,7 +2480,10 @@ __global__ void EvalThemeVeinHashKernel(
     unsigned long long* out_galaxy_sigs,
     unsigned long long* out_planet_sigs,
     unsigned long long* out_vein_sigs,
-    unsigned long long* out_pipeline_sigs)
+    unsigned long long* out_pipeline_sigs,
+    int* out_birth_star_ids,
+    int* out_birth_planet_ids,
+    int* out_debug_theme_indexes)
 {
     int seed_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (seed_idx < 0 || seed_idx >= seed_count)
@@ -2672,6 +2675,8 @@ __global__ void EvalThemeVeinHashKernel(
             }
             if (theme_idx < 0 || theme_idx >= theme_count)
                 theme_idx = 0;
+            if (out_debug_theme_indexes != nullptr)
+                out_debug_theme_indexes[pflat] = theme_idx;
 
             if (pindex >= 0 && pindex < kMaxAssigned)
                 assigned_theme_ids[pindex] = theme_ids[theme_idx];
@@ -3052,6 +3057,10 @@ __global__ void EvalThemeVeinHashKernel(
     out_vein_sigs[seed_idx] = h_vein;
     out_galaxy_sigs[seed_idx] = h_galaxy;
     out_pipeline_sigs[seed_idx] = h_pipeline;
+    if (out_birth_star_ids != nullptr)
+        out_birth_star_ids[seed_idx] = birth_star_id;
+    if (out_birth_planet_ids != nullptr)
+        out_birth_planet_ids[seed_idx] = birth_planet_id;
 }
 
 inline bool TryEvalThemeVeinHashGpu(
@@ -3079,7 +3088,10 @@ inline bool TryEvalThemeVeinHashGpu(
     unsigned long long* out_galaxy_sigs,
     unsigned long long* out_planet_sigs,
     unsigned long long* out_vein_sigs,
-    unsigned long long* out_pipeline_sigs)
+    unsigned long long* out_pipeline_sigs,
+    int* out_debug_birth_star_ids,
+    int* out_debug_birth_planet_ids,
+    int* out_debug_theme_indexes)
 {
     if (seed_count <= 0)
         return false;
@@ -3133,8 +3145,14 @@ inline bool TryEvalThemeVeinHashGpu(
     unsigned long long* d_out_planet_sigs = nullptr;
     unsigned long long* d_out_vein_sigs = nullptr;
     unsigned long long* d_out_pipeline_sigs = nullptr;
+    int* d_out_birth_star_ids = nullptr;
+    int* d_out_birth_planet_ids = nullptr;
+    int* d_out_theme_indexes = nullptr;
 
     auto cleanup = [&]() {
+        cudaFree(d_out_theme_indexes);
+        cudaFree(d_out_birth_planet_ids);
+        cudaFree(d_out_birth_star_ids);
         cudaFree(d_out_pipeline_sigs);
         cudaFree(d_out_vein_sigs);
         cudaFree(d_out_planet_sigs);
@@ -3253,7 +3271,10 @@ inline bool TryEvalThemeVeinHashGpu(
         !alloc_u64(&d_out_galaxy_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_planet_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_vein_sigs, static_cast<size_t>(seed_count)) ||
-        !alloc_u64(&d_out_pipeline_sigs, static_cast<size_t>(seed_count)))
+        !alloc_u64(&d_out_pipeline_sigs, static_cast<size_t>(seed_count)) ||
+        (out_debug_birth_star_ids != nullptr && !alloc_int(&d_out_birth_star_ids, static_cast<size_t>(seed_count))) ||
+        (out_debug_birth_planet_ids != nullptr && !alloc_int(&d_out_birth_planet_ids, static_cast<size_t>(seed_count))) ||
+        (out_debug_theme_indexes != nullptr && !alloc_int(&d_out_theme_indexes, static_cast<size_t>(total_planets))))
     {
         cleanup();
         return false;
@@ -3351,7 +3372,10 @@ inline bool TryEvalThemeVeinHashGpu(
         d_out_galaxy_sigs,
         d_out_planet_sigs,
         d_out_vein_sigs,
-        d_out_pipeline_sigs);
+        d_out_pipeline_sigs,
+        d_out_birth_star_ids,
+        d_out_birth_planet_ids,
+        d_out_theme_indexes);
 
     cudaError_t rc = cudaGetLastError();
     if (rc == cudaSuccess)
@@ -3362,6 +3386,12 @@ inline bool TryEvalThemeVeinHashGpu(
         rc = cudaMemcpy(out_vein_sigs, d_out_vein_sigs, static_cast<size_t>(seed_count) * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
     if (rc == cudaSuccess)
         rc = cudaMemcpy(out_pipeline_sigs, d_out_pipeline_sigs, static_cast<size_t>(seed_count) * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    if (rc == cudaSuccess && out_debug_birth_star_ids != nullptr && d_out_birth_star_ids != nullptr)
+        rc = cudaMemcpy(out_debug_birth_star_ids, d_out_birth_star_ids, static_cast<size_t>(seed_count) * sizeof(int), cudaMemcpyDeviceToHost);
+    if (rc == cudaSuccess && out_debug_birth_planet_ids != nullptr && d_out_birth_planet_ids != nullptr)
+        rc = cudaMemcpy(out_debug_birth_planet_ids, d_out_birth_planet_ids, static_cast<size_t>(seed_count) * sizeof(int), cudaMemcpyDeviceToHost);
+    if (rc == cudaSuccess && out_debug_theme_indexes != nullptr && d_out_theme_indexes != nullptr)
+        rc = cudaMemcpy(out_debug_theme_indexes, d_out_theme_indexes, static_cast<size_t>(total_planets) * sizeof(int), cudaMemcpyDeviceToHost);
 
     cleanup();
     return rc == cudaSuccess;
@@ -3625,6 +3655,14 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     bool trust_gpu_theme_vein_hash = false;
     if (const char* gh = std::getenv("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST"))
         trust_gpu_theme_vein_hash = std::atoi(gh) != 0;
+    bool unsafe_gpu_theme_vein_hash = false;
+    if (const char* gh = std::getenv("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE"))
+        unsafe_gpu_theme_vein_hash = std::atoi(gh) != 0;
+    if (trust_gpu_theme_vein_hash && !unsafe_gpu_theme_vein_hash)
+        trust_gpu_theme_vein_hash = false;
+    bool debug_theme_compare = false;
+    if (const char* dc = std::getenv("DSP_NATIVE_SIG_DEBUG_THEME_COMPARE"))
+        debug_theme_compare = std::atoi(dc) != 0;
 
     for (int group_base = 0; group_base < seed_count; group_base += group_cap)
     {
@@ -4093,10 +4131,20 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         }
 
         bool gpu_theme_vein_hash_ready = false;
-        if (use_gpu_theme_vein_hash)
+        std::vector<int> gpu_theme_idx_dbg;
+        SigGpuFlatSoA gpu_flat_dbg;
+        bool gpu_theme_dbg_ready = false;
+        if (use_gpu_theme_vein_hash && (trust_gpu_theme_vein_hash || debug_theme_compare))
         {
             double t_gpu_sig = stage_timing ? now_ms() : 0.0;
             SigGpuFlatSoA flat{};
+            std::vector<int> gpu_birth_star_dbg;
+            std::vector<int> gpu_birth_planet_dbg;
+            if (debug_theme_compare)
+            {
+                gpu_birth_star_dbg.resize(static_cast<size_t>(group_count), 0);
+                gpu_birth_planet_dbg.resize(static_cast<size_t>(group_count), 0);
+            }
             bool flat_ready = false;
             if (gpu_sig_direct_path && core_ready_from_plan)
             {
@@ -4114,6 +4162,13 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             {
                 BuildSigGpuFlatSoA(seeds, flat);
                 flat_ready = true;
+            }
+            if (debug_theme_compare)
+            {
+                const int total_planets_dbg = flat.star_planet_offsets.empty() ? 0 : flat.star_planet_offsets.back();
+                gpu_theme_idx_dbg.assign(static_cast<size_t>(std::max(0, total_planets_dbg)), 0);
+                gpu_flat_dbg = flat;
+                gpu_theme_dbg_ready = true;
             }
             bool gpu_sig_ok = TryEvalThemeVeinHashGpu(
                 cuda_device_id,
@@ -4140,9 +4195,25 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 out_galaxy_sigs + group_base,
                 out_planet_sigs + group_base,
                 out_vein_sigs + group_base,
-                out_pipeline_sigs + group_base);
+                out_pipeline_sigs + group_base,
+                debug_theme_compare ? gpu_birth_star_dbg.data() : nullptr,
+                debug_theme_compare ? gpu_birth_planet_dbg.data() : nullptr,
+                debug_theme_compare ? gpu_theme_idx_dbg.data() : nullptr);
             if (stage_timing)
                 stage_theme_ms += now_ms() - t_gpu_sig;
+            if (debug_theme_compare && !gpu_birth_star_dbg.empty() && !gpu_birth_planet_dbg.empty())
+            {
+                std::fprintf(stderr,
+                    "[native-sig-theme-debug] groupBase=%d gpuBirth(seed0): star=%d planet=%d sig(g/p/v/pi)=0x%016llX/0x%016llX/0x%016llX/0x%016llX\n",
+                    group_base,
+                    gpu_birth_star_dbg[0],
+                    gpu_birth_planet_dbg[0],
+                    static_cast<unsigned long long>(out_galaxy_sigs[group_base + 0]),
+                    static_cast<unsigned long long>(out_planet_sigs[group_base + 0]),
+                    static_cast<unsigned long long>(out_vein_sigs[group_base + 0]),
+                    static_cast<unsigned long long>(out_pipeline_sigs[group_base + 0]));
+                std::fflush(stderr);
+            }
             if (gpu_sig_ok && trust_gpu_theme_vein_hash)
             {
                 gpu_theme_vein_hash_ready = true;
@@ -4161,7 +4232,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 std::printf("[native-sig-info] gpu-theme-vein-hash fallback-to-host group_count=%d\n", group_count);
                 std::fflush(stdout);
             }
-            else if (stage_timing || debug_dump)
+            else if (stage_timing || debug_dump || debug_theme_compare)
             {
                 std::printf("[native-sig-info] gpu-theme-vein-hash trust-disabled fallback-to-host group_count=%d\n", group_count);
                 std::fflush(stdout);
@@ -4341,6 +4412,100 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             return theme_rc.load(std::memory_order_relaxed);
         if (stage_timing)
             stage_theme_ms += now_ms() - stage0;
+        if (debug_theme_compare && !seeds.empty())
+        {
+            const SeedCtx& s0 = seeds[0];
+            std::fprintf(stderr,
+                "[native-sig-theme-debug] groupBase=%d hostBirth(seed0): star=%d planet=%d\n",
+                group_base,
+                s0.birth_star_id,
+                s0.birth_planet_id);
+            std::fflush(stderr);
+        }
+        if (debug_theme_compare && gpu_theme_dbg_ready)
+        {
+            std::vector<int> host_theme_idx_dbg;
+            const int total_planets_dbg = gpu_flat_dbg.star_planet_offsets.empty() ? 0 : gpu_flat_dbg.star_planet_offsets.back();
+            host_theme_idx_dbg.reserve(static_cast<size_t>(std::max(0, total_planets_dbg)));
+            for (const SeedCtx& seed_ctx : seeds)
+            {
+                for (const StarCtx& star_ctx : seed_ctx.stars)
+                {
+                    for (const PlanetPlanLite& pp : star_ctx.planets)
+                        host_theme_idx_dbg.push_back(pp.theme_index);
+                }
+            }
+            int cmp_n = std::min(static_cast<int>(host_theme_idx_dbg.size()), static_cast<int>(gpu_theme_idx_dbg.size()));
+            int first_diff = -1;
+            for (int i = 0; i < cmp_n; ++i)
+            {
+                if (host_theme_idx_dbg[i] != gpu_theme_idx_dbg[i])
+                {
+                    first_diff = i;
+                    break;
+                }
+            }
+            if (first_diff >= 0)
+            {
+                std::fprintf(stderr,
+                    "[native-sig-theme-debug] groupBase=%d firstThemeDiff idx=%d host=%d gpu=%d total=%d\n",
+                    group_base,
+                    first_diff,
+                    host_theme_idx_dbg[first_diff],
+                    gpu_theme_idx_dbg[first_diff],
+                    cmp_n);
+                int star_flat_dbg = -1;
+                for (int s = 0; s + 1 < static_cast<int>(gpu_flat_dbg.star_planet_offsets.size()); ++s)
+                {
+                    if (gpu_flat_dbg.star_planet_offsets[s] <= first_diff && first_diff < gpu_flat_dbg.star_planet_offsets[s + 1])
+                    {
+                        star_flat_dbg = s;
+                        break;
+                    }
+                }
+                if (star_flat_dbg >= 0)
+                {
+                    int seed_dbg = -1;
+                    for (int si = 0; si + 1 < static_cast<int>(gpu_flat_dbg.seed_star_offsets.size()); ++si)
+                    {
+                        if (gpu_flat_dbg.seed_star_offsets[si] <= star_flat_dbg && star_flat_dbg < gpu_flat_dbg.seed_star_offsets[si + 1])
+                        {
+                            seed_dbg = si;
+                            break;
+                        }
+                    }
+                    int p_local_dbg = first_diff - gpu_flat_dbg.star_planet_offsets[star_flat_dbg];
+                    std::fprintf(
+                        stderr,
+                        "[native-sig-theme-debug] diffPos seed=%d starFlat=%d starId=%d starType=%d starSpectr=%d starIndex=%d starHab=%.9g pLocal=%d orbitIdx=%d orbitAround=%d gas=%d tempBias=%.9g habBias=%.9g sunDist=%.9g num13=%.17g num14=%.17g rand1=%.17g\n",
+                        seed_dbg,
+                        star_flat_dbg,
+                        gpu_flat_dbg.star_ids[star_flat_dbg],
+                        gpu_flat_dbg.star_types[star_flat_dbg],
+                        gpu_flat_dbg.star_spectrs[star_flat_dbg],
+                        gpu_flat_dbg.star_indexes[star_flat_dbg],
+                        static_cast<double>(gpu_flat_dbg.star_habitable_radiuses[star_flat_dbg]),
+                        p_local_dbg,
+                        gpu_flat_dbg.planet_orbit_indexes[first_diff],
+                        gpu_flat_dbg.planet_orbit_arounds[first_diff],
+                        gpu_flat_dbg.planet_gas_giants[first_diff],
+                        static_cast<double>(gpu_flat_dbg.planet_core_temperature_bias[first_diff]),
+                        static_cast<double>(gpu_flat_dbg.planet_core_habitable_bias[first_diff]),
+                        static_cast<double>(gpu_flat_dbg.planet_core_sun_distance[first_diff]),
+                        gpu_flat_dbg.planet_core_num13[first_diff],
+                        gpu_flat_dbg.planet_core_num14[first_diff],
+                        gpu_flat_dbg.planet_core_rand1[first_diff]);
+                }
+            }
+            else
+            {
+                std::fprintf(stderr,
+                    "[native-sig-theme-debug] groupBase=%d themeIdxAllEqual total=%d\n",
+                    group_base,
+                    cmp_n);
+            }
+            std::fflush(stderr);
+        }
 
         struct SolidRef
         {
@@ -4456,14 +4621,16 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             unsigned long long h_vein = kFnvOffset;
             unsigned long long h_pipeline = kFnvOffset;
 
+            int birth_star_hash = seed_ctx.birth_star_id;
+            int birth_planet_hash = seed_ctx.birth_planet_id;
             h_galaxy = MixHash(h_galaxy, seed_ctx.star_count);
             h_planet = MixHash(h_planet, seed_ctx.star_count);
-            h_planet = MixHash(h_planet, seed_ctx.birth_star_id);
-            h_planet = MixHash(h_planet, seed_ctx.birth_planet_id);
+            h_planet = MixHash(h_planet, birth_star_hash);
+            h_planet = MixHash(h_planet, birth_planet_hash);
             h_vein = MixHash(h_vein, seed_ctx.star_count);
             h_pipeline = MixHash(h_pipeline, seed_ctx.star_count);
-            h_pipeline = MixHash(h_pipeline, seed_ctx.birth_star_id);
-            h_pipeline = MixHash(h_pipeline, seed_ctx.birth_planet_id);
+            h_pipeline = MixHash(h_pipeline, birth_star_hash);
+            h_pipeline = MixHash(h_pipeline, birth_planet_hash);
 
             for (const StarCtx& star_ctx : seed_ctx.stars)
             {
@@ -4530,6 +4697,17 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             out_planet_sigs[group_base + gi] = h_planet;
             out_vein_sigs[group_base + gi] = h_vein;
             out_pipeline_sigs[group_base + gi] = h_pipeline;
+            if (debug_theme_compare && gi == 0)
+            {
+                std::fprintf(stderr,
+                    "[native-sig-theme-debug] groupBase=%d hostSig(seed0): g/p/v/pi=0x%016llX/0x%016llX/0x%016llX/0x%016llX\n",
+                    group_base,
+                    static_cast<unsigned long long>(h_galaxy),
+                    static_cast<unsigned long long>(h_planet),
+                    static_cast<unsigned long long>(h_vein),
+                    static_cast<unsigned long long>(h_pipeline));
+                std::fflush(stderr);
+            }
 
             if (debug_dump && (group_base + gi) == 0)
             {
