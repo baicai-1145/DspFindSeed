@@ -1679,6 +1679,7 @@ inline bool TryBuildStarPlanetPlansCuda(
     int star_type_black_hole,
     bool build_core_refs,
     bool need_info_seed,
+    int scatter_threads,
     std::vector<PlanetRef>& primary_refs,
     std::vector<PlanetRef>& secondary_refs,
     std::vector<CoreLite>& out_core_flat,
@@ -1984,9 +1985,7 @@ inline bool TryBuildStarPlanetPlansCuda(
         primary_refs.reserve(static_cast<size_t>(star_count) * 3);
         secondary_refs.reserve(static_cast<size_t>(star_count) * 2);
     }
-    double t_scatter_begin = timing_out != nullptr ? now_ms_local() : 0.0;
-    for (int i = 0; i < star_count; ++i)
-    {
+    auto scatter_one = [&](int i) -> bool {
         int seed_idx = map_seed_idx[i];
         int star_idx = map_star_idx[i];
         StarCtx& star_ctx = seeds[seed_idx].stars[star_idx];
@@ -1994,12 +1993,14 @@ inline bool TryBuildStarPlanetPlansCuda(
         if (pc < 0 || pc > kStarPlanMaxPlanets)
             return false;
 
-        star_ctx.planets.clear();
-        star_ctx.planets.reserve(pc);
+        star_ctx.planets.resize(pc);
         const int base = i * kStarPlanMaxPlanets;
+        int primary_number_to_index[kStarPlanMaxPlanets + 1];
+        for (int t = 0; t <= kStarPlanMaxPlanets; ++t)
+            primary_number_to_index[t] = -1;
         for (int pi = 0; pi < pc; ++pi)
         {
-            PlanetPlanLite p{};
+            PlanetPlanLite& p = star_ctx.planets[pi];
             const CoreLite& core = out_core_flat[base + pi];
             p.index = pi;
             p.orbit_around = out_orbit_arounds[base + pi];
@@ -2011,31 +2012,84 @@ inline bool TryBuildStarPlanetPlansCuda(
             p.id = star_ctx.star.id * 100 + pi + 1;
             p.core = core;
             p.parent_planet_index = -1;
-            if (p.orbit_around > 0)
-            {
-                for (size_t j = 0; j < star_ctx.planets.size(); ++j)
+            if (p.orbit_around == 0 && p.number >= 0 && p.number <= kStarPlanMaxPlanets)
+                primary_number_to_index[p.number] = pi;
+        }
+        for (int pi = 0; pi < pc; ++pi)
+        {
+            PlanetPlanLite& p = star_ctx.planets[pi];
+            if (p.orbit_around > 0 && p.orbit_around <= kStarPlanMaxPlanets)
+                p.parent_planet_index = primary_number_to_index[p.orbit_around];
+        }
+        star_ctx.star.planet_count = static_cast<int>(star_ctx.planets.size());
+        return true;
+    };
+
+    double t_scatter_begin = timing_out != nullptr ? now_ms_local() : 0.0;
+    if (!build_core_refs && scatter_threads > 1 && star_count >= 1024)
+    {
+        int tcount = std::min(scatter_threads, star_count);
+        if (tcount < 1)
+            tcount = 1;
+        std::atomic<int> scatter_ok(1);
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(tcount - 1));
+        const int chunk_size = (star_count + tcount - 1) / tcount;
+        for (int w = 1; w < tcount; ++w)
+        {
+            int begin = w * chunk_size;
+            int end = std::min(star_count, begin + chunk_size);
+            if (begin >= end)
+                break;
+            workers.emplace_back([&, begin, end]() {
+                for (int i = begin; i < end; ++i)
                 {
-                    if (star_ctx.planets[j].number == p.orbit_around && star_ctx.planets[j].orbit_around == 0)
+                    if (scatter_ok.load(std::memory_order_relaxed) == 0)
+                        break;
+                    if (!scatter_one(i))
                     {
-                        p.parent_planet_index = static_cast<int>(j);
+                        scatter_ok.store(0, std::memory_order_relaxed);
                         break;
                     }
                 }
-            }
-            star_ctx.planets.push_back(p);
+            });
         }
-        star_ctx.star.planet_count = static_cast<int>(star_ctx.planets.size());
-
-        if (!build_core_refs)
-            continue;
-
-        for (int pi = 0; pi < static_cast<int>(star_ctx.planets.size()); ++pi)
+        int begin0 = 0;
+        int end0 = std::min(star_count, chunk_size);
+        for (int i = begin0; i < end0; ++i)
         {
-            PlanetRef pr{seed_idx, star_idx, pi};
-            if (star_ctx.planets[pi].orbit_around == 0)
-                primary_refs.push_back(pr);
-            else
-                secondary_refs.push_back(pr);
+            if (!scatter_one(i))
+            {
+                scatter_ok.store(0, std::memory_order_relaxed);
+                break;
+            }
+        }
+        for (auto& th : workers)
+            th.join();
+        if (scatter_ok.load(std::memory_order_relaxed) == 0)
+            return false;
+    }
+    else
+    {
+        for (int i = 0; i < star_count; ++i)
+        {
+            if (!scatter_one(i))
+                return false;
+
+            if (!build_core_refs)
+                continue;
+
+            int seed_idx = map_seed_idx[i];
+            int star_idx = map_star_idx[i];
+            const StarCtx& star_ctx = seeds[seed_idx].stars[star_idx];
+            for (int pi = 0; pi < static_cast<int>(star_ctx.planets.size()); ++pi)
+            {
+                PlanetRef pr{seed_idx, star_idx, pi};
+                if (star_ctx.planets[pi].orbit_around == 0)
+                    primary_refs.push_back(pr);
+                else
+                    secondary_refs.push_back(pr);
+            }
         }
     }
     if (timing_out != nullptr)
@@ -2749,6 +2803,13 @@ __global__ void EvalThemeVeinHashKernel(
             }
 
             DotNet35RandomDeviceLite rng(pgen_seed);
+            rng.InternalSample();
+            rng.InternalSample();
+            rng.InternalSample();
+            rng.InternalSample();
+            rng.InternalSample();
+            DotNet35RandomDeviceLite rng2(rng.InternalSample());
+            (void)rng2;
             int bonus_case = 0;
             float p = DCalcPAndBonusCase(stype, sspectr, em, bonus_case);
             const bool use_fp32 = use_fp32_prob_compare != 0;
@@ -2758,20 +2819,22 @@ __global__ void EvalThemeVeinHashKernel(
             {
                 if (9 < vmax)
                 {
-                    float prob = is_birth_star ? (1.0f - powf(1.0f - 0.007f, p)) : (1.0f - powf(1.0f - 0.004f, p));
-                    if (ProbHitDevice(rng, prob, use_fp32))
+                    ++vein_counts_local[9];
+                    ++vein_counts_local[9];
+                    for (int i = 1; i < 12 && ProbHitDevice(rng, 0.449999988079071f, use_fp32); ++i)
                         ++vein_counts_local[9];
                 }
                 if (10 < vmax)
                 {
-                    float prob = is_birth_star ? (1.0f - powf(1.0f - 0.005f, p)) : (1.0f - powf(1.0f - 0.0025f, p));
-                    if (ProbHitDevice(rng, prob, use_fp32))
+                    ++vein_counts_local[10];
+                    ++vein_counts_local[10];
+                    for (int i = 1; i < 12 && ProbHitDevice(rng, 0.449999988079071f, use_fp32); ++i)
                         ++vein_counts_local[10];
                 }
                 if (12 < vmax)
                 {
-                    float prob = is_birth_star ? (1.0f - powf(1.0f - 0.0125f, p)) : (1.0f - powf(1.0f - 0.00625f, p));
-                    if (ProbHitDevice(rng, prob, use_fp32))
+                    ++vein_counts_local[12];
+                    for (int i = 1; i < 12 && ProbHitDevice(rng, 0.5f, use_fp32); ++i)
                         ++vein_counts_local[12];
                 }
             }
@@ -2779,8 +2842,8 @@ __global__ void EvalThemeVeinHashKernel(
             {
                 if (14 < vmax)
                 {
-                    float prob = is_birth_star ? (1.0f - powf(1.0f - 0.009f, p)) : (1.0f - powf(1.0f - 0.007f, p));
-                    if (ProbHitDevice(rng, prob, use_fp32))
+                    ++vein_counts_local[14];
+                    for (int i = 1; i < 12 && ProbHitDevice(rng, 0.649999976158142f, use_fp32); ++i)
                         ++vein_counts_local[14];
                 }
             }
@@ -3398,9 +3461,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     }
     else
     {
-        unsigned hc = std::thread::hardware_concurrency();
-        if (hc > 1)
-            host_threads = static_cast<int>(std::min<unsigned>(hc, 16));
+        host_threads = 8;
     }
     bool use_gpu_seedbuild_plan = true;
     if (const char* gp = std::getenv("DSP_NATIVE_SEEDBUILD_GPU_PLAN"))
@@ -3408,6 +3469,9 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     bool use_gpu_theme_vein_hash = false;
     if (const char* gh = std::getenv("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_EXPERIMENTAL"))
         use_gpu_theme_vein_hash = std::atoi(gh) != 0;
+    bool trust_gpu_theme_vein_hash = false;
+    if (const char* gh = std::getenv("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST"))
+        trust_gpu_theme_vein_hash = std::atoi(gh) != 0;
 
     for (int group_base = 0; group_base < seed_count; group_base += group_cap)
     {
@@ -3536,7 +3600,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 for (int si = 0; si < seed_ctx.star_count; ++si)
                 {
                     int star_seed = galaxy_rng.Next();
-                    StarCtx sc{};
+                    StarCtx& sc = seed_ctx.stars[si];
                     if (si == 0)
                     {
                         sc.star = CreateBirthStarLite(seed_ctx.star_count, star_seed, em);
@@ -3571,7 +3635,6 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                                 sec.push_back(pr);
                         }
                     }
-                    seed_ctx.stars[si] = std::move(sc);
                 }
             }
         };
@@ -3634,6 +3697,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 star_type_black_hole,
                 false,
                 false,
+                worker_count,
                 primary_refs,
                 secondary_refs,
                 out_core_flat,
@@ -3863,6 +3927,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             }
         }
 
+        bool gpu_theme_vein_hash_ready = false;
         if (use_gpu_theme_vein_hash)
         {
             double t_gpu_sig = stage_timing ? now_ms() : 0.0;
@@ -3896,12 +3961,23 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 out_pipeline_sigs + group_base);
             if (stage_timing)
                 stage_theme_ms += now_ms() - t_gpu_sig;
-            if (!gpu_sig_ok && (stage_timing || debug_dump))
+            if (gpu_sig_ok && trust_gpu_theme_vein_hash)
+            {
+                gpu_theme_vein_hash_ready = true;
+            }
+            else if (!gpu_sig_ok && (stage_timing || debug_dump))
             {
                 std::printf("[native-sig-info] gpu-theme-vein-hash fallback-to-host group_count=%d\n", group_count);
                 std::fflush(stdout);
             }
+            else if (stage_timing || debug_dump)
+            {
+                std::printf("[native-sig-info] gpu-theme-vein-hash trust-disabled fallback-to-host group_count=%d\n", group_count);
+                std::fflush(stdout);
+            }
         }
+        if (gpu_theme_vein_hash_ready)
+            continue;
 
         stage0 = stage_timing ? now_ms() : 0.0;
         std::atomic<int> theme_rc(DSP_CUDA_OK);
