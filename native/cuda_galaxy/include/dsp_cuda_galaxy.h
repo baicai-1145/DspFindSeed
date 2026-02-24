@@ -39,6 +39,28 @@ typedef struct dsp_planet_core_f32_out_t {
     int segment;
 } dsp_planet_core_f32_out_t;
 
+typedef struct dsp_cuda_pose_batch_head_timing_t {
+    double h2d_seeds_ms;
+    double gen_kernel_ms;
+    double d2h_counts_ms;
+    double gather_kernel_ms;
+    double d2h_head_ms;
+    double gen_phase1_ms;
+    double gen_phase2_ms;
+    double gen_seed_p50_ms;
+    double gen_seed_p95_ms;
+    double gen_seed_max_ms;
+    double gen_attempts_total;
+    double gen_collision_rejects_total;
+    double gen_sphere_rejects_total;
+    double gen_gate_skips_total;
+    double d2h_head_submit_ms;
+    double d2h_head_sync_wait_ms;
+    double d2h_head_bytes_mb;
+    double d2h_head_bw_gbps;
+    double total_ms;
+} dsp_cuda_pose_batch_head_timing_t;
+
 enum {
     DSP_CUDA_OK = 0,
     DSP_CUDA_ERR_INVALID_ARGUMENT = -1,
@@ -87,6 +109,9 @@ int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     dsp_vec3d_t* out_poses,
     int out_stride,
     int* out_counts);
+
+int dsp_cuda_get_last_pose_batch_head_timing(
+    dsp_cuda_pose_batch_head_timing_t* out_timing);
 
 int dsp_cuda_debug_rng_nextdouble(
     int seed,

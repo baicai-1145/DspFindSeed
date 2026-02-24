@@ -1659,6 +1659,17 @@ __global__ void EvalPlanetCoreFromPlansKernel(
     }
 }
 
+struct SeedBuildCudaTiming
+{
+    double h2d_ms;
+    double plan_kernel_ms;
+    double core_kernel_ms;
+    double d2h_ms;
+    double host_pack_ms;
+    double alloc_ms;
+    double scatter_ms;
+};
+
 inline bool TryBuildStarPlanetPlansCuda(
     int device_id,
     const EnumMap& em,
@@ -1670,8 +1681,16 @@ inline bool TryBuildStarPlanetPlansCuda(
     bool need_info_seed,
     std::vector<PlanetRef>& primary_refs,
     std::vector<PlanetRef>& secondary_refs,
-    std::vector<CoreLite>& out_core_flat)
+    std::vector<CoreLite>& out_core_flat,
+    SeedBuildCudaTiming* timing_out)
 {
+    if (timing_out != nullptr)
+        *timing_out = SeedBuildCudaTiming{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    auto now_ms_local = []() -> double {
+        using clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+    };
+    double t_host_pack_begin = timing_out != nullptr ? now_ms_local() : 0.0;
     size_t star_count_all = 0;
     for (const SeedCtx& seed_ctx : seeds)
         star_count_all += seed_ctx.stars.size();
@@ -1716,6 +1735,8 @@ inline bool TryBuildStarPlanetPlansCuda(
             ++star_flat;
         }
     }
+    if (timing_out != nullptr)
+        timing_out->host_pack_ms += (now_ms_local() - t_host_pack_begin);
 
     const size_t n = static_cast<size_t>(star_count);
     const size_t plans_n = n * static_cast<size_t>(kStarPlanMaxPlanets);
@@ -1752,8 +1773,14 @@ inline bool TryBuildStarPlanetPlansCuda(
     float* d_star_habitable_radiuses = nullptr;
     float* d_star_light_balance_radiuses = nullptr;
     CoreLite* d_out_core = nullptr;
+    cudaEvent_t ev_plan_begin = nullptr;
+    cudaEvent_t ev_plan_end = nullptr;
+    cudaEvent_t ev_core_end = nullptr;
 
     auto cleanup = [&]() {
+        if (ev_core_end != nullptr) cudaEventDestroy(ev_core_end);
+        if (ev_plan_end != nullptr) cudaEventDestroy(ev_plan_end);
+        if (ev_plan_begin != nullptr) cudaEventDestroy(ev_plan_begin);
         cudaFree(d_out_core);
         cudaFree(d_star_light_balance_radiuses);
         cudaFree(d_star_habitable_radiuses);
@@ -1791,6 +1818,7 @@ inline bool TryBuildStarPlanetPlansCuda(
     const size_t stars_d_bytes = n * sizeof(double);
     const size_t plans_bytes = plans_n * sizeof(int);
     const size_t core_bytes = plans_n * sizeof(CoreLite);
+    double t_alloc_begin = timing_out != nullptr ? now_ms_local() : 0.0;
     if (!alloc(&d_star_seeds, stars_bytes) ||
         !alloc(&d_star_types, stars_bytes) ||
         !alloc(&d_star_spectrs, stars_bytes) ||
@@ -1812,10 +1840,13 @@ inline bool TryBuildStarPlanetPlansCuda(
         cleanup();
         return false;
     }
+    if (timing_out != nullptr)
+        timing_out->alloc_ms += (now_ms_local() - t_alloc_begin);
 
     auto h2d = [&](void* dst, const void* src, size_t bytes) -> bool {
         return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
     };
+    double t_h2d_begin = timing_out != nullptr ? now_ms_local() : 0.0;
     if (!h2d(d_star_seeds, in_star_seeds.data(), stars_bytes) ||
         !h2d(d_star_types, in_star_types.data(), stars_bytes) ||
         !h2d(d_star_spectrs, in_star_spectrs.data(), stars_bytes) ||
@@ -1829,9 +1860,22 @@ inline bool TryBuildStarPlanetPlansCuda(
         cleanup();
         return false;
     }
+    if (timing_out != nullptr)
+        timing_out->h2d_ms += (now_ms_local() - t_h2d_begin);
 
     const int block = 128;
     const int grid = (star_count + block - 1) / block;
+    if (timing_out != nullptr)
+    {
+        if (cudaEventCreate(&ev_plan_begin) != cudaSuccess ||
+            cudaEventCreate(&ev_plan_end) != cudaSuccess ||
+            cudaEventCreate(&ev_core_end) != cudaSuccess)
+        {
+            cleanup();
+            return false;
+        }
+        cudaEventRecord(ev_plan_begin);
+    }
     BuildStarPlanetPlansKernel<<<grid, block>>>(
         d_star_seeds,
         d_star_types,
@@ -1857,6 +1901,8 @@ inline bool TryBuildStarPlanetPlansCuda(
         d_out_gas_giants,
         d_out_info_seeds,
         d_out_gen_seeds);
+    if (timing_out != nullptr)
+        cudaEventRecord(ev_plan_end);
 
     cudaError_t rc = cudaGetLastError();
     if (rc != cudaSuccess)
@@ -1884,6 +1930,8 @@ inline bool TryBuildStarPlanetPlansCuda(
         star_type_neutron_star,
         star_type_black_hole,
         d_out_core);
+    if (timing_out != nullptr)
+        cudaEventRecord(ev_core_end);
 
     rc = cudaGetLastError();
     if (rc != cudaSuccess)
@@ -1895,6 +1943,7 @@ inline bool TryBuildStarPlanetPlansCuda(
     auto d2h = [&](void* dst, const void* src, size_t bytes) -> bool {
         return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
     };
+    double t_d2h_begin = timing_out != nullptr ? now_ms_local() : 0.0;
     if (!d2h(out_planet_counts.data(), d_out_planet_counts, stars_bytes) ||
         !d2h(out_orbit_arounds.data(), d_out_orbit_arounds, plans_bytes) ||
         !d2h(out_orbit_indexes.data(), d_out_orbit_indexes, plans_bytes) ||
@@ -1916,6 +1965,16 @@ inline bool TryBuildStarPlanetPlansCuda(
         cleanup();
         return false;
     }
+    if (timing_out != nullptr)
+    {
+        timing_out->d2h_ms += (now_ms_local() - t_d2h_begin);
+        cudaEventSynchronize(ev_core_end);
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, ev_plan_begin, ev_plan_end) == cudaSuccess)
+            timing_out->plan_kernel_ms += static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev_plan_end, ev_core_end) == cudaSuccess)
+            timing_out->core_kernel_ms += static_cast<double>(ms);
+    }
     cleanup();
 
     primary_refs.clear();
@@ -1925,6 +1984,7 @@ inline bool TryBuildStarPlanetPlansCuda(
         primary_refs.reserve(static_cast<size_t>(star_count) * 3);
         secondary_refs.reserve(static_cast<size_t>(star_count) * 2);
     }
+    double t_scatter_begin = timing_out != nullptr ? now_ms_local() : 0.0;
     for (int i = 0; i < star_count; ++i)
     {
         int seed_idx = map_seed_idx[i];
@@ -1978,6 +2038,8 @@ inline bool TryBuildStarPlanetPlansCuda(
                 secondary_refs.push_back(pr);
         }
     }
+    if (timing_out != nullptr)
+        timing_out->scatter_ms += (now_ms_local() - t_scatter_begin);
 
     return true;
 }
@@ -3289,7 +3351,36 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
     };
     double stage_pose_ms = 0.0;
+    double stage_pose_h2d_ms = 0.0;
+    double stage_pose_gen_kernel_ms = 0.0;
+    double stage_pose_d2h_counts_ms = 0.0;
+    double stage_pose_gather_kernel_ms = 0.0;
+    double stage_pose_d2h_head_ms = 0.0;
+    double stage_pose_gen_phase1_ms = 0.0;
+    double stage_pose_gen_phase2_ms = 0.0;
+    double stage_pose_gen_seed_p50_ms = 0.0;
+    double stage_pose_gen_seed_p95_ms = 0.0;
+    double stage_pose_gen_seed_max_ms = 0.0;
+    double stage_pose_gen_seed_profile_weight = 0.0;
+    double stage_pose_gen_attempts_total = 0.0;
+    double stage_pose_gen_collision_total = 0.0;
+    double stage_pose_gen_sphere_total = 0.0;
+    double stage_pose_gen_gate_total = 0.0;
+    double stage_pose_d2h_head_submit_ms = 0.0;
+    double stage_pose_d2h_head_sync_wait_ms = 0.0;
+    double stage_pose_d2h_head_bytes_mb = 0.0;
     double stage_seed_build_ms = 0.0;
+    double stage_seed_build_host_ctx_ms = 0.0;
+    double stage_seed_build_host_merge_ms = 0.0;
+    double stage_seed_build_gpu_plan_call_ms = 0.0;
+    double stage_seed_build_fallback_host_ms = 0.0;
+    double stage_seed_build_h2d_ms = 0.0;
+    double stage_seed_build_plan_kernel_ms = 0.0;
+    double stage_seed_build_core_kernel_ms = 0.0;
+    double stage_seed_build_d2h_ms = 0.0;
+    double stage_seed_build_host_pack_ms = 0.0;
+    double stage_seed_build_alloc_ms = 0.0;
+    double stage_seed_build_scatter_ms = 0.0;
     double stage_core_pack_ms = 0.0;
     double stage_core_kernel_ms = 0.0;
     double stage_core_unpack_ms = 0.0;
@@ -3349,6 +3440,31 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             pose_raw_counts.data());
         if (stage_timing)
             stage_pose_ms += now_ms() - stage0;
+        if (stage_timing)
+        {
+            dsp_cuda_pose_batch_head_timing_t pose_timing{};
+            if (dsp_cuda_get_last_pose_batch_head_timing(&pose_timing) == DSP_CUDA_OK)
+            {
+                stage_pose_h2d_ms += pose_timing.h2d_seeds_ms;
+                stage_pose_gen_kernel_ms += pose_timing.gen_kernel_ms;
+                stage_pose_d2h_counts_ms += pose_timing.d2h_counts_ms;
+                stage_pose_gather_kernel_ms += pose_timing.gather_kernel_ms;
+                stage_pose_d2h_head_ms += pose_timing.d2h_head_ms;
+                stage_pose_gen_phase1_ms += pose_timing.gen_phase1_ms * static_cast<double>(group_count);
+                stage_pose_gen_phase2_ms += pose_timing.gen_phase2_ms * static_cast<double>(group_count);
+                stage_pose_gen_seed_p50_ms += pose_timing.gen_seed_p50_ms * static_cast<double>(group_count);
+                stage_pose_gen_seed_p95_ms = std::max(stage_pose_gen_seed_p95_ms, pose_timing.gen_seed_p95_ms);
+                stage_pose_gen_seed_max_ms = std::max(stage_pose_gen_seed_max_ms, pose_timing.gen_seed_max_ms);
+                stage_pose_gen_seed_profile_weight += static_cast<double>(group_count);
+                stage_pose_gen_attempts_total += pose_timing.gen_attempts_total;
+                stage_pose_gen_collision_total += pose_timing.gen_collision_rejects_total;
+                stage_pose_gen_sphere_total += pose_timing.gen_sphere_rejects_total;
+                stage_pose_gen_gate_total += pose_timing.gen_gate_skips_total;
+                stage_pose_d2h_head_submit_ms += pose_timing.d2h_head_submit_ms;
+                stage_pose_d2h_head_sync_wait_ms += pose_timing.d2h_head_sync_wait_ms;
+                stage_pose_d2h_head_bytes_mb += pose_timing.d2h_head_bytes_mb;
+            }
+        }
         if (rc != DSP_CUDA_OK)
         {
             if (stage_timing || debug_dump || debug_enter)
@@ -3360,6 +3476,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         }
 
         stage0 = stage_timing ? now_ms() : 0.0;
+        const double stage_seed_build_begin = stage0;
         std::vector<SeedCtx> seeds;
         seeds.resize(group_count);
         std::vector<PlanetRef> primary_refs;
@@ -3482,6 +3599,12 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             for (auto& th : workers)
                 th.join();
         }
+        if (stage_timing)
+        {
+            const double after_build_ms = now_ms();
+            stage_seed_build_host_ctx_ms += (after_build_ms - stage0);
+            stage0 = after_build_ms;
+        }
         for (int w = 0; w < worker_count; ++w)
         {
             if (!use_gpu_seedbuild_plan)
@@ -3490,10 +3613,17 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 secondary_refs.insert(secondary_refs.end(), secondary_refs_tls[w].begin(), secondary_refs_tls[w].end());
             }
         }
+        if (stage_timing)
+        {
+            const double after_merge_ms = now_ms();
+            stage_seed_build_host_merge_ms += (after_merge_ms - stage0);
+            stage0 = after_merge_ms;
+        }
         bool core_ready_from_plan = false;
         if (use_gpu_seedbuild_plan)
         {
             std::vector<CoreLite> out_core_flat;
+            SeedBuildCudaTiming seedbuild_timing{};
 
             bool gpu_plan_ok = TryBuildStarPlanetPlansCuda(
                 cuda_device_id,
@@ -3506,7 +3636,24 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 false,
                 primary_refs,
                 secondary_refs,
-                out_core_flat);
+                out_core_flat,
+                stage_timing ? &seedbuild_timing : nullptr);
+            if (stage_timing)
+            {
+                const double after_gpu_plan_ms = now_ms();
+                stage_seed_build_gpu_plan_call_ms += (after_gpu_plan_ms - stage0);
+                stage0 = after_gpu_plan_ms;
+            }
+            if (stage_timing)
+            {
+                stage_seed_build_h2d_ms += seedbuild_timing.h2d_ms;
+                stage_seed_build_plan_kernel_ms += seedbuild_timing.plan_kernel_ms;
+                stage_seed_build_core_kernel_ms += seedbuild_timing.core_kernel_ms;
+                stage_seed_build_d2h_ms += seedbuild_timing.d2h_ms;
+                stage_seed_build_host_pack_ms += seedbuild_timing.host_pack_ms;
+                stage_seed_build_alloc_ms += seedbuild_timing.alloc_ms;
+                stage_seed_build_scatter_ms += seedbuild_timing.scatter_ms;
+            }
             core_ready_from_plan = gpu_plan_ok;
             if (!gpu_plan_ok)
             {
@@ -3537,10 +3684,16 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                         }
                     }
                 }
+                if (stage_timing)
+                {
+                    const double after_fallback_ms = now_ms();
+                    stage_seed_build_fallback_host_ms += (after_fallback_ms - stage0);
+                    stage0 = after_fallback_ms;
+                }
             }
         }
         if (stage_timing)
-            stage_seed_build_ms += now_ms() - stage0;
+            stage_seed_build_ms += now_ms() - stage_seed_build_begin;
 
         auto run_group_parallel = [&](const auto& fn) {
             if (worker_count <= 1 || group_count <= 1)
@@ -4168,13 +4321,43 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     if (stage_timing)
     {
         const double total_ms = now_ms() - stage_total_begin_ms;
+        const double pose_gen_seed_p50_ms =
+            (stage_pose_gen_seed_profile_weight > 0.0)
+                ? (stage_pose_gen_seed_p50_ms / stage_pose_gen_seed_profile_weight)
+                : 0.0;
+        const double pose_gen_phase1_avg_ms =
+            (stage_pose_gen_seed_profile_weight > 0.0)
+                ? (stage_pose_gen_phase1_ms / stage_pose_gen_seed_profile_weight)
+                : 0.0;
+        const double pose_gen_phase2_avg_ms =
+            (stage_pose_gen_seed_profile_weight > 0.0)
+                ? (stage_pose_gen_phase2_ms / stage_pose_gen_seed_profile_weight)
+                : 0.0;
+        const double pose_d2h_head_bw_gbps =
+            (stage_pose_d2h_head_ms > 1e-9)
+                ? (stage_pose_d2h_head_bytes_mb * 1024.0 * 1024.0) / (stage_pose_d2h_head_ms * 1.0e6)
+                : 0.0;
         std::printf(
             "[native-sig-timing] seeds=%d stars=%d groupCap=%d totalMs=%.3f "
             "poseMs=%.3f seedBuildMs=%.3f corePackMs=%.3f coreKernelMs=%.3f coreUnpackMs=%.3f "
-            "themeMs=%.3f veinPackMs=%.3f veinKernelMs=%.3f hashMs=%.3f\n",
+            "themeMs=%.3f veinPackMs=%.3f veinKernelMs=%.3f hashMs=%.3f "
+            "poseH2D=%.3f poseGenK=%.3f poseD2HCounts=%.3f poseGatherK=%.3f poseD2HHead=%.3f "
+            "poseGenPhase1Avg=%.3f poseGenPhase2Avg=%.3f poseGenSeedP50=%.3f poseGenSeedP95=%.3f poseGenSeedMax=%.3f "
+            "poseGenAttempts=%.0f poseGenCollisionRejects=%.0f poseGenSphereRejects=%.0f poseGenGateSkips=%.0f "
+            "poseD2HHeadSubmit=%.3f poseD2HHeadWait=%.3f poseD2HHeadMB=%.3f poseD2HHeadBW=%.3f "
+            "seedBuildHostCtx=%.3f seedBuildHostMerge=%.3f seedBuildGpuCall=%.3f seedBuildFallbackHost=%.3f "
+            "seedBuildH2D=%.3f seedBuildPlanK=%.3f seedBuildCoreK=%.3f seedBuildD2H=%.3f "
+            "seedBuildHostPack=%.3f seedBuildAlloc=%.3f seedBuildScatter=%.3f\n",
             seed_count, star_count, group_cap, total_ms,
             stage_pose_ms, stage_seed_build_ms, stage_core_pack_ms, stage_core_kernel_ms, stage_core_unpack_ms,
-            stage_theme_ms, stage_vein_pack_ms, stage_vein_kernel_ms, stage_hash_ms);
+            stage_theme_ms, stage_vein_pack_ms, stage_vein_kernel_ms, stage_hash_ms,
+            stage_pose_h2d_ms, stage_pose_gen_kernel_ms, stage_pose_d2h_counts_ms, stage_pose_gather_kernel_ms, stage_pose_d2h_head_ms,
+            pose_gen_phase1_avg_ms, pose_gen_phase2_avg_ms, pose_gen_seed_p50_ms, stage_pose_gen_seed_p95_ms, stage_pose_gen_seed_max_ms,
+            stage_pose_gen_attempts_total, stage_pose_gen_collision_total, stage_pose_gen_sphere_total, stage_pose_gen_gate_total,
+            stage_pose_d2h_head_submit_ms, stage_pose_d2h_head_sync_wait_ms, stage_pose_d2h_head_bytes_mb, pose_d2h_head_bw_gbps,
+            stage_seed_build_host_ctx_ms, stage_seed_build_host_merge_ms, stage_seed_build_gpu_plan_call_ms, stage_seed_build_fallback_host_ms,
+            stage_seed_build_h2d_ms, stage_seed_build_plan_kernel_ms, stage_seed_build_core_kernel_ms, stage_seed_build_d2h_ms,
+            stage_seed_build_host_pack_ms, stage_seed_build_alloc_ms, stage_seed_build_scatter_ms);
         std::fflush(stdout);
     }
 

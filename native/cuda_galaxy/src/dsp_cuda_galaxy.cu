@@ -6,11 +6,24 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
+#include <vector>
+#include <chrono>
 
 namespace
 {
 constexpr int kMBig = 2147483647;
 constexpr int kMSeed = 161803398;
+
+struct PoseGenSeedProfile
+{
+    unsigned long long phase1_cycles;
+    unsigned long long phase2_cycles;
+    unsigned int attempts;
+    unsigned int collision_rejects;
+    unsigned int sphere_rejects;
+    unsigned int gate_skips;
+};
 
 struct BatchDeviceBuffers
 {
@@ -20,12 +33,14 @@ struct BatchDeviceBuffers
     dsp_vec3d_t* d_poses;
     dsp_vec3d_t* d_drunk;
     dsp_vec3d_t* d_head_poses;
+    PoseGenSeedProfile* d_gen_profiles;
     cudaStream_t stream;
     size_t seeds_capacity_bytes;
     size_t counts_capacity_bytes;
     size_t poses_capacity_bytes;
     size_t drunk_capacity_bytes;
     size_t head_poses_capacity_bytes;
+    size_t gen_profiles_capacity_bytes;
 
     BatchDeviceBuffers()
         : device_id(-2),
@@ -34,17 +49,21 @@ struct BatchDeviceBuffers
           d_poses(nullptr),
           d_drunk(nullptr),
           d_head_poses(nullptr),
+          d_gen_profiles(nullptr),
           stream(nullptr),
           seeds_capacity_bytes(0),
           counts_capacity_bytes(0),
           poses_capacity_bytes(0),
           drunk_capacity_bytes(0),
-          head_poses_capacity_bytes(0)
+          head_poses_capacity_bytes(0),
+          gen_profiles_capacity_bytes(0)
     {
     }
 };
 
 thread_local BatchDeviceBuffers g_batch_buffers;
+thread_local dsp_cuda_pose_batch_head_timing_t g_last_pose_batch_head_timing =
+    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
 struct PlanetCoreBatchDeviceBuffers
 {
@@ -118,6 +137,11 @@ void ReleaseBatchDeviceBuffers(BatchDeviceBuffers& buffers)
         cudaFree(buffers.d_head_poses);
         buffers.d_head_poses = nullptr;
     }
+    if (buffers.d_gen_profiles != nullptr)
+    {
+        cudaFree(buffers.d_gen_profiles);
+        buffers.d_gen_profiles = nullptr;
+    }
     if (buffers.d_drunk != nullptr)
     {
         cudaFree(buffers.d_drunk);
@@ -143,6 +167,7 @@ void ReleaseBatchDeviceBuffers(BatchDeviceBuffers& buffers)
     buffers.poses_capacity_bytes = 0;
     buffers.drunk_capacity_bytes = 0;
     buffers.head_poses_capacity_bytes = 0;
+    buffers.gen_profiles_capacity_bytes = 0;
 }
 
 void ReleasePlanetCoreBatchDeviceBuffers(PlanetCoreBatchDeviceBuffers& buffers)
@@ -208,11 +233,13 @@ cudaError_t EnsureBatchBuffers(
     size_t counts_bytes,
     size_t poses_bytes,
     size_t head_poses_bytes,
+    size_t gen_profiles_bytes,
     int** d_seeds,
     int** d_counts,
     dsp_vec3d_t** d_poses,
     dsp_vec3d_t** d_drunk,
     dsp_vec3d_t** d_head_poses,
+    PoseGenSeedProfile** d_gen_profiles,
     cudaStream_t* stream)
 {
     BatchDeviceBuffers& buffers = g_batch_buffers;
@@ -246,6 +273,12 @@ cudaError_t EnsureBatchBuffers(
         if (rc != cudaSuccess)
             return rc;
     }
+    if (gen_profiles_bytes > 0)
+    {
+        rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_gen_profiles), &buffers.gen_profiles_capacity_bytes, gen_profiles_bytes);
+        if (rc != cudaSuccess)
+            return rc;
+    }
 
     *d_seeds = buffers.d_seeds;
     *d_counts = buffers.d_counts;
@@ -253,6 +286,8 @@ cudaError_t EnsureBatchBuffers(
     *d_drunk = buffers.d_drunk;
     if (d_head_poses != nullptr)
         *d_head_poses = buffers.d_head_poses;
+    if (d_gen_profiles != nullptr)
+        *d_gen_profiles = buffers.d_gen_profiles;
     if (stream != nullptr)
         *stream = buffers.stream;
     return cudaSuccess;
@@ -437,9 +472,17 @@ __device__ int GenerateRandomPosesParamsFp64(
     double flatten,
     bool collision_fp64,
     dsp_vec3d_t* poses,
-    dsp_vec3d_t* drunk)
+    dsp_vec3d_t* drunk,
+    PoseGenSeedProfile* profile)
 {
     DotNet35RandomDevice rng(seed);
+    unsigned int attempts = 0;
+    unsigned int collision_rejects = 0;
+    unsigned int sphere_rejects = 0;
+    unsigned int gate_skips = 0;
+    unsigned long long phase1_cycles = 0;
+    unsigned long long phase2_cycles = 0;
+    const unsigned long long phase1_begin = (profile != nullptr) ? clock64() : 0ULL;
 
     int poses_count = 0;
     int drunk_count = 0;
@@ -462,6 +505,7 @@ __device__ int GenerateRandomPosesParamsFp64(
         int tries = 0;
         while (tries++ < 256)
         {
+            ++attempts;
             double xd = rng.NextDouble() * 2.0 - 1.0;
             double yd = (rng.NextDouble() * 2.0 - 1.0) * flatten;
             double zd = rng.NextDouble() * 2.0 - 1.0;
@@ -479,12 +523,32 @@ __device__ int GenerateRandomPosesParamsFp64(
                     drunk[drunk_count++] = pt;
                     poses[poses_count++] = pt;
                     if (poses_count >= max_count)
+                    {
+                        if (profile != nullptr)
+                        {
+                            phase1_cycles = clock64() - phase1_begin;
+                            profile->phase1_cycles = phase1_cycles;
+                            profile->phase2_cycles = 0ULL;
+                            profile->attempts = attempts;
+                            profile->collision_rejects = collision_rejects;
+                            profile->sphere_rejects = sphere_rejects;
+                            profile->gate_skips = gate_skips;
+                        }
                         return poses_count;
+                    }
                     break;
                 }
+                ++collision_rejects;
+            }
+            else
+            {
+                ++sphere_rejects;
             }
         }
     }
+    const unsigned long long phase2_begin = (profile != nullptr) ? clock64() : 0ULL;
+    if (profile != nullptr)
+        phase1_cycles = phase2_begin - phase1_begin;
 
     int outer = 0;
     while (outer++ < 256)
@@ -496,6 +560,7 @@ __device__ int GenerateRandomPosesParamsFp64(
                 int tries = 0;
                 while (tries++ < 256)
                 {
+                    ++attempts;
                     double xd = rng.NextDouble() * 2.0 - 1.0;
                     double yd = (rng.NextDouble() * 2.0 - 1.0) * flatten;
                     double zd = rng.NextDouble() * 2.0 - 1.0;
@@ -517,15 +582,46 @@ __device__ int GenerateRandomPosesParamsFp64(
                             drunk[i] = pt;
                             poses[poses_count++] = pt;
                             if (poses_count >= max_count)
+                            {
+                                if (profile != nullptr)
+                                {
+                                    phase2_cycles = clock64() - phase2_begin;
+                                    profile->phase1_cycles = phase1_cycles;
+                                    profile->phase2_cycles = phase2_cycles;
+                                    profile->attempts = attempts;
+                                    profile->collision_rejects = collision_rejects;
+                                    profile->sphere_rejects = sphere_rejects;
+                                    profile->gate_skips = gate_skips;
+                                }
                                 return poses_count;
+                            }
                             break;
                         }
+                        ++collision_rejects;
+                    }
+                    else
+                    {
+                        ++sphere_rejects;
                     }
                 }
+            }
+            else
+            {
+                ++gate_skips;
             }
         }
     }
 
+    if (profile != nullptr)
+    {
+        phase2_cycles = clock64() - phase2_begin;
+        profile->phase1_cycles = phase1_cycles;
+        profile->phase2_cycles = phase2_cycles;
+        profile->attempts = attempts;
+        profile->collision_rejects = collision_rejects;
+        profile->sphere_rejects = sphere_rejects;
+        profile->gate_skips = gate_skips;
+    }
     return poses_count;
 }
 
@@ -541,7 +637,8 @@ __global__ void GenerateTempPosesParamsFp64BatchKernel(
     dsp_vec3d_t* out_poses,
     dsp_vec3d_t* out_drunk,
     int out_stride,
-    int* out_counts)
+    int* out_counts,
+    PoseGenSeedProfile* out_profiles)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= seed_count)
@@ -558,7 +655,8 @@ __global__ void GenerateTempPosesParamsFp64BatchKernel(
         flatten,
         collision_fp64 != 0,
         poses_seg,
-        drunk_seg);
+        drunk_seg,
+        out_profiles != nullptr ? (out_profiles + idx) : nullptr);
     out_counts[idx] = count;
 }
 
@@ -1270,10 +1368,12 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         counts_bytes,
         poses_bytes,
         0,
+        0,
         &d_seeds,
         &d_counts,
         &d_poses,
         &d_drunk,
+        nullptr,
         nullptr,
         &stream);
     if (rc != cudaSuccess)
@@ -1305,7 +1405,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         d_poses,
         d_drunk,
         out_stride,
-        d_counts);
+        d_counts,
+        nullptr);
 
     rc = cudaGetLastError();
     if (rc == cudaSuccess)
@@ -1340,6 +1441,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     int out_stride,
     int* out_counts)
 {
+    g_last_pose_batch_head_timing =
+        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     bool debug_enter = false;
     if (const char* de = std::getenv("DSP_NATIVE_SIG_DEBUG_ENTER"))
         debug_enter = std::atoi(de) != 0;
@@ -1351,6 +1454,15 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         return DSP_CUDA_ERR_INVALID_ARGUMENT;
     if ((head_count - 1) * sample_step >= max_count)
         return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    bool op_timing = false;
+    if (const char* st = std::getenv("DSP_NATIVE_SIG_STAGE_TIMING"))
+        op_timing = std::atoi(st) != 0;
+    if (const char* ot = std::getenv("DSP_NATIVE_OP_TIMING"))
+        op_timing = op_timing || (std::atoi(ot) != 0);
+    auto now_ms_host = []() -> double {
+        using clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+    };
 
     if (device_id >= 0)
     {
@@ -1368,13 +1480,24 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     const size_t counts_bytes = static_cast<size_t>(seed_count) * sizeof(int);
     const size_t poses_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(device_stride) * sizeof(dsp_vec3d_t);
     const size_t head_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(out_stride) * sizeof(dsp_vec3d_t);
+    const size_t gen_profiles_bytes = static_cast<size_t>(seed_count) * sizeof(PoseGenSeedProfile);
 
     int* d_seeds = nullptr;
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
     dsp_vec3d_t* d_head_poses = nullptr;
+    PoseGenSeedProfile* d_gen_profiles = nullptr;
     cudaStream_t stream = nullptr;
+    cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr, ev3 = nullptr, ev4 = nullptr, ev5 = nullptr;
+    auto destroy_events = [&]() {
+        if (ev5 != nullptr) cudaEventDestroy(ev5);
+        if (ev4 != nullptr) cudaEventDestroy(ev4);
+        if (ev3 != nullptr) cudaEventDestroy(ev3);
+        if (ev2 != nullptr) cudaEventDestroy(ev2);
+        if (ev1 != nullptr) cudaEventDestroy(ev1);
+        if (ev0 != nullptr) cudaEventDestroy(ev0);
+    };
 
     cudaError_t rc = EnsureBatchBuffers(
         device_id,
@@ -1382,11 +1505,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         counts_bytes,
         poses_bytes,
         head_bytes,
+        op_timing ? gen_profiles_bytes : 0,
         &d_seeds,
         &d_counts,
         &d_poses,
         &d_drunk,
         &d_head_poses,
+        &d_gen_profiles,
         &stream);
     if (rc != cudaSuccess)
     {
@@ -1394,6 +1519,23 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head EnsureBatchBuffers rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
     }
+    if (op_timing)
+    {
+        rc = cudaEventCreate(&ev0);
+        if (rc == cudaSuccess) rc = cudaEventCreate(&ev1);
+        if (rc == cudaSuccess) rc = cudaEventCreate(&ev2);
+        if (rc == cudaSuccess) rc = cudaEventCreate(&ev3);
+        if (rc == cudaSuccess) rc = cudaEventCreate(&ev4);
+        if (rc == cudaSuccess) rc = cudaEventCreate(&ev5);
+        if (rc != cudaSuccess)
+        {
+            destroy_events();
+            ev0 = ev1 = ev2 = ev3 = ev4 = ev5 = nullptr;
+            op_timing = false;
+        }
+    }
+    if (op_timing)
+        cudaEventRecord(ev0, stream);
 
     rc = cudaMemcpyAsync(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess)
@@ -1402,6 +1544,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head H2D seeds rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
     }
+    if (op_timing)
+        cudaEventRecord(ev1, stream);
 
     int block_size = 128;
     int grid_size = (seed_count + block_size - 1) / block_size;
@@ -1417,11 +1561,16 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         d_poses,
         d_drunk,
         device_stride,
-        d_counts);
+        d_counts,
+        op_timing ? d_gen_profiles : nullptr);
+    if (op_timing)
+        cudaEventRecord(ev2, stream);
 
     rc = cudaGetLastError();
     if (rc == cudaSuccess)
         rc = cudaMemcpyAsync(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
+    if (rc == cudaSuccess && op_timing)
+        cudaEventRecord(ev3, stream);
     if (rc == cudaSuccess)
     {
         int block = 128;
@@ -1434,12 +1583,106 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             sample_step,
             d_head_poses,
             out_stride);
+        if (op_timing)
+            cudaEventRecord(ev4, stream);
         rc = cudaGetLastError();
         if (rc == cudaSuccess)
+        {
+            double t_submit_begin = op_timing ? now_ms_host() : 0.0;
             rc = cudaMemcpyAsync(out_poses, d_head_poses, head_bytes, cudaMemcpyDeviceToHost, stream);
+            if (rc == cudaSuccess && op_timing)
+                g_last_pose_batch_head_timing.d2h_head_submit_ms += (now_ms_host() - t_submit_begin);
+        }
+        if (rc == cudaSuccess && op_timing)
+            cudaEventRecord(ev5, stream);
         if (rc == cudaSuccess)
+        {
+            double t_sync_begin = op_timing ? now_ms_host() : 0.0;
             rc = cudaStreamSynchronize(stream);
+            if (rc == cudaSuccess && op_timing)
+                g_last_pose_batch_head_timing.d2h_head_sync_wait_ms += (now_ms_host() - t_sync_begin);
+        }
     }
+    if (rc == cudaSuccess && op_timing)
+    {
+        float ms = 0.0f;
+        if (cudaEventElapsedTime(&ms, ev0, ev1) == cudaSuccess) g_last_pose_batch_head_timing.h2d_seeds_ms = static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev1, ev2) == cudaSuccess) g_last_pose_batch_head_timing.gen_kernel_ms = static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev2, ev3) == cudaSuccess) g_last_pose_batch_head_timing.d2h_counts_ms = static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev3, ev4) == cudaSuccess) g_last_pose_batch_head_timing.gather_kernel_ms = static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev4, ev5) == cudaSuccess) g_last_pose_batch_head_timing.d2h_head_ms = static_cast<double>(ms);
+        if (cudaEventElapsedTime(&ms, ev0, ev5) == cudaSuccess) g_last_pose_batch_head_timing.total_ms = static_cast<double>(ms);
+        g_last_pose_batch_head_timing.d2h_head_bytes_mb = static_cast<double>(head_bytes) / (1024.0 * 1024.0);
+        if (g_last_pose_batch_head_timing.d2h_head_ms > 1e-9)
+            g_last_pose_batch_head_timing.d2h_head_bw_gbps =
+                static_cast<double>(head_bytes) / (g_last_pose_batch_head_timing.d2h_head_ms * 1.0e6);
+    }
+    if (rc == cudaSuccess && op_timing && d_gen_profiles != nullptr)
+    {
+        std::vector<PoseGenSeedProfile> host_profiles(seed_count);
+        cudaError_t rc_prof = cudaMemcpy(
+            host_profiles.data(),
+            d_gen_profiles,
+            gen_profiles_bytes,
+            cudaMemcpyDeviceToHost);
+        if (rc_prof == cudaSuccess)
+        {
+            int profile_device = device_id;
+            if (profile_device < 0)
+            {
+                if (cudaGetDevice(&profile_device) != cudaSuccess)
+                    profile_device = 0;
+            }
+            int clock_khz = 0;
+            if (cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, profile_device) == cudaSuccess && clock_khz > 0)
+            {
+                std::vector<double> seed_ms;
+                seed_ms.reserve(seed_count);
+                double phase1_ms = 0.0;
+                double phase2_ms = 0.0;
+                double attempts_total = 0.0;
+                double collision_total = 0.0;
+                double sphere_total = 0.0;
+                double gate_total = 0.0;
+                for (int i = 0; i < seed_count; ++i)
+                {
+                    const PoseGenSeedProfile& p = host_profiles[i];
+                    phase1_ms += static_cast<double>(p.phase1_cycles) / static_cast<double>(clock_khz);
+                    phase2_ms += static_cast<double>(p.phase2_cycles) / static_cast<double>(clock_khz);
+                    seed_ms.push_back(static_cast<double>(p.phase1_cycles + p.phase2_cycles) / static_cast<double>(clock_khz));
+                    attempts_total += static_cast<double>(p.attempts);
+                    collision_total += static_cast<double>(p.collision_rejects);
+                    sphere_total += static_cast<double>(p.sphere_rejects);
+                    gate_total += static_cast<double>(p.gate_skips);
+                }
+                std::sort(seed_ms.begin(), seed_ms.end());
+                auto percentile = [&](double q) -> double {
+                    if (seed_ms.empty())
+                        return 0.0;
+                    double pos = q * static_cast<double>(seed_ms.size() - 1);
+                    size_t idx = static_cast<size_t>(pos);
+                    size_t idx2 = std::min(idx + 1, seed_ms.size() - 1);
+                    double frac = pos - static_cast<double>(idx);
+                    return seed_ms[idx] * (1.0 - frac) + seed_ms[idx2] * frac;
+                };
+                g_last_pose_batch_head_timing.gen_phase1_ms = phase1_ms;
+                g_last_pose_batch_head_timing.gen_phase2_ms = phase2_ms;
+                g_last_pose_batch_head_timing.gen_seed_p50_ms = percentile(0.50);
+                g_last_pose_batch_head_timing.gen_seed_p95_ms = percentile(0.95);
+                g_last_pose_batch_head_timing.gen_seed_max_ms = seed_ms.empty() ? 0.0 : seed_ms.back();
+                g_last_pose_batch_head_timing.gen_attempts_total = attempts_total;
+                g_last_pose_batch_head_timing.gen_collision_rejects_total = collision_total;
+                g_last_pose_batch_head_timing.gen_sphere_rejects_total = sphere_total;
+                g_last_pose_batch_head_timing.gen_gate_skips_total = gate_total;
+                if (seed_count > 0)
+                {
+                    g_last_pose_batch_head_timing.gen_phase1_ms /= static_cast<double>(seed_count);
+                    g_last_pose_batch_head_timing.gen_phase2_ms /= static_cast<double>(seed_count);
+                }
+            }
+        }
+    }
+    destroy_events();
 
     if (rc != cudaSuccess)
     {
@@ -1447,6 +1690,15 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head post-kernel rc=%d %s\n", static_cast<int>(rc), cudaGetErrorString(rc));
         return DSP_CUDA_ERR_CUDA;
     }
+    return DSP_CUDA_OK;
+}
+
+extern "C" int dsp_cuda_get_last_pose_batch_head_timing(
+    dsp_cuda_pose_batch_head_timing_t* out_timing)
+{
+    if (out_timing == nullptr)
+        return DSP_CUDA_ERR_INVALID_ARGUMENT;
+    *out_timing = g_last_pose_batch_head_timing;
     return DSP_CUDA_OK;
 }
 
