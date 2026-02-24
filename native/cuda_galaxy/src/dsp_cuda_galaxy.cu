@@ -422,48 +422,76 @@ struct DotNet35RandomDevice
     }
 };
 
-__device__ bool CheckCollisionF32(const dsp_vec3d_t* pts, int count, const dsp_vec3d_t& pt, double min_dist)
+__device__ __forceinline__ bool CheckCollisionF32Fast(
+    const dsp_vec3d_t* pts,
+    int count,
+    const dsp_vec3d_t& pt,
+    float min_dist_f,
+    double min2_f32)
 {
-    float min_dist_f = static_cast<float>(min_dist);
-    double min2 = static_cast<double>(min_dist_f) * static_cast<double>(min_dist_f);
     for (int i = 0; i < count; ++i)
     {
         const dsp_vec3d_t& p = pts[i];
         float dx = static_cast<float>(pt.x - p.x);
+        if (dx >= min_dist_f || dx <= -min_dist_f)
+            continue;
         float dy = static_cast<float>(pt.y - p.y);
+        if (dy >= min_dist_f || dy <= -min_dist_f)
+            continue;
         float dz = static_cast<float>(pt.z - p.z);
+        if (dz >= min_dist_f || dz <= -min_dist_f)
+            continue;
         double dist2 = static_cast<double>(dx) * static_cast<double>(dx) +
                        static_cast<double>(dy) * static_cast<double>(dy) +
                        static_cast<double>(dz) * static_cast<double>(dz);
-        if (dist2 < min2)
+        if (dist2 < min2_f32)
             return true;
     }
     return false;
 }
 
-__device__ bool CheckCollisionFp64(const dsp_vec3d_t* pts, int count, const dsp_vec3d_t& pt, double min_dist)
+__device__ __forceinline__ bool CheckCollisionFp64Fast(
+    const dsp_vec3d_t* pts,
+    int count,
+    const dsp_vec3d_t& pt,
+    double min_dist,
+    double min2_fp64)
 {
-    double min2 = min_dist * min_dist;
     for (int i = 0; i < count; ++i)
     {
         const dsp_vec3d_t& p = pts[i];
         double dx = pt.x - p.x;
+        if (dx >= min_dist || dx <= -min_dist)
+            continue;
         double dy = pt.y - p.y;
+        if (dy >= min_dist || dy <= -min_dist)
+            continue;
         double dz = pt.z - p.z;
-        if (dx * dx + dy * dy + dz * dz < min2)
+        if (dz >= min_dist || dz <= -min_dist)
+            continue;
+        if (dx * dx + dy * dy + dz * dz < min2_fp64)
             return true;
     }
     return false;
 }
 
-__device__ bool CheckCollision(const dsp_vec3d_t* pts, int count, const dsp_vec3d_t& pt, double min_dist, bool collision_fp64)
+__device__ __forceinline__ bool CheckCollisionFast(
+    const dsp_vec3d_t* pts,
+    int count,
+    const dsp_vec3d_t& pt,
+    double min_dist,
+    float min_dist_f,
+    double min2_fp64,
+    double min2_f32,
+    bool collision_fp64)
 {
     if (collision_fp64)
-        return CheckCollisionFp64(pts, count, pt, min_dist);
-    return CheckCollisionF32(pts, count, pt, min_dist);
+        return CheckCollisionFp64Fast(pts, count, pt, min_dist, min2_fp64);
+    return CheckCollisionF32Fast(pts, count, pt, min_dist_f, min2_f32);
 }
 
-__device__ int GenerateRandomPosesParamsFp64(
+template <bool CollectProfile>
+__device__ __forceinline__ int GenerateRandomPosesParamsFp64Impl(
     int seed,
     int max_count,
     double min_dist,
@@ -476,13 +504,17 @@ __device__ int GenerateRandomPosesParamsFp64(
     PoseGenSeedProfile* profile)
 {
     DotNet35RandomDevice rng(seed);
+    const float min_dist_f = static_cast<float>(min_dist);
+    const double min2_f32 = static_cast<double>(min_dist_f) * static_cast<double>(min_dist_f);
+    const double min2_fp64 = min_dist * min_dist;
+    const double step_span = max_step_len - min_step_len;
     unsigned int attempts = 0;
     unsigned int collision_rejects = 0;
     unsigned int sphere_rejects = 0;
     unsigned int gate_skips = 0;
     unsigned long long phase1_cycles = 0;
     unsigned long long phase2_cycles = 0;
-    const unsigned long long phase1_begin = (profile != nullptr) ? clock64() : 0ULL;
+    const unsigned long long phase1_begin = CollectProfile ? clock64() : 0ULL;
 
     int poses_count = 0;
     int drunk_count = 0;
@@ -505,7 +537,8 @@ __device__ int GenerateRandomPosesParamsFp64(
         int tries = 0;
         while (tries++ < 256)
         {
-            ++attempts;
+            if (CollectProfile)
+                ++attempts;
             double xd = rng.NextDouble() * 2.0 - 1.0;
             double yd = (rng.NextDouble() * 2.0 - 1.0) * flatten;
             double zd = rng.NextDouble() * 2.0 - 1.0;
@@ -515,16 +548,16 @@ __device__ int GenerateRandomPosesParamsFp64(
             if (dd <= 1.0 && dd >= 1e-8)
             {
                 double inv_len = 1.0 / sqrt(dd);
-                double scale = (num10 * (max_step_len - min_step_len) + min_dist) * inv_len;
+                double scale = (num10 * step_span + min_dist) * inv_len;
                 dsp_vec3d_t pt{xd * scale, yd * scale, zd * scale};
 
-                if (!CheckCollision(poses, poses_count, pt, min_dist, collision_fp64))
+                if (!CheckCollisionFast(poses, poses_count, pt, min_dist, min_dist_f, min2_fp64, min2_f32, collision_fp64))
                 {
                     drunk[drunk_count++] = pt;
                     poses[poses_count++] = pt;
                     if (poses_count >= max_count)
                     {
-                        if (profile != nullptr)
+                        if (CollectProfile)
                         {
                             phase1_cycles = clock64() - phase1_begin;
                             profile->phase1_cycles = phase1_cycles;
@@ -538,16 +571,18 @@ __device__ int GenerateRandomPosesParamsFp64(
                     }
                     break;
                 }
-                ++collision_rejects;
+                if (CollectProfile)
+                    ++collision_rejects;
             }
             else
             {
-                ++sphere_rejects;
+                if (CollectProfile)
+                    ++sphere_rejects;
             }
         }
     }
-    const unsigned long long phase2_begin = (profile != nullptr) ? clock64() : 0ULL;
-    if (profile != nullptr)
+    const unsigned long long phase2_begin = CollectProfile ? clock64() : 0ULL;
+    if (CollectProfile)
         phase1_cycles = phase2_begin - phase1_begin;
 
     int outer = 0;
@@ -560,7 +595,8 @@ __device__ int GenerateRandomPosesParamsFp64(
                 int tries = 0;
                 while (tries++ < 256)
                 {
-                    ++attempts;
+                    if (CollectProfile)
+                        ++attempts;
                     double xd = rng.NextDouble() * 2.0 - 1.0;
                     double yd = (rng.NextDouble() * 2.0 - 1.0) * flatten;
                     double zd = rng.NextDouble() * 2.0 - 1.0;
@@ -570,20 +606,20 @@ __device__ int GenerateRandomPosesParamsFp64(
                     if (dd <= 1.0 && dd >= 1e-8)
                     {
                         double inv_len = 1.0 / sqrt(dd);
-                        double scale = (num18 * (max_step_len - min_step_len) + min_dist) * inv_len;
+                        double scale = (num18 * step_span + min_dist) * inv_len;
                         const dsp_vec3d_t base_pt = drunk[i];
                         dsp_vec3d_t pt{
                             base_pt.x + xd * scale,
                             base_pt.y + yd * scale,
                             base_pt.z + zd * scale};
 
-                        if (!CheckCollision(poses, poses_count, pt, min_dist, collision_fp64))
+                        if (!CheckCollisionFast(poses, poses_count, pt, min_dist, min_dist_f, min2_fp64, min2_f32, collision_fp64))
                         {
                             drunk[i] = pt;
                             poses[poses_count++] = pt;
                             if (poses_count >= max_count)
                             {
-                                if (profile != nullptr)
+                                if (CollectProfile)
                                 {
                                     phase2_cycles = clock64() - phase2_begin;
                                     profile->phase1_cycles = phase1_cycles;
@@ -597,22 +633,25 @@ __device__ int GenerateRandomPosesParamsFp64(
                             }
                             break;
                         }
-                        ++collision_rejects;
+                        if (CollectProfile)
+                            ++collision_rejects;
                     }
                     else
                     {
-                        ++sphere_rejects;
+                        if (CollectProfile)
+                            ++sphere_rejects;
                     }
                 }
             }
             else
             {
-                ++gate_skips;
+                if (CollectProfile)
+                    ++gate_skips;
             }
         }
     }
 
-    if (profile != nullptr)
+    if (CollectProfile)
     {
         phase2_cycles = clock64() - phase2_begin;
         profile->phase1_cycles = phase1_cycles;
@@ -646,17 +685,35 @@ __global__ void GenerateTempPosesParamsFp64BatchKernel(
 
     dsp_vec3d_t* poses_seg = out_poses + static_cast<long long>(idx) * out_stride;
     dsp_vec3d_t* drunk_seg = out_drunk + static_cast<long long>(idx) * out_stride;
-    int count = GenerateRandomPosesParamsFp64(
-        seeds[idx],
-        max_count,
-        min_dist,
-        min_step_len,
-        max_step_len,
-        flatten,
-        collision_fp64 != 0,
-        poses_seg,
-        drunk_seg,
-        out_profiles != nullptr ? (out_profiles + idx) : nullptr);
+    int count = 0;
+    if (out_profiles != nullptr)
+    {
+        count = GenerateRandomPosesParamsFp64Impl<true>(
+            seeds[idx],
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64 != 0,
+            poses_seg,
+            drunk_seg,
+            out_profiles + idx);
+    }
+    else
+    {
+        count = GenerateRandomPosesParamsFp64Impl<false>(
+            seeds[idx],
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64 != 0,
+            poses_seg,
+            drunk_seg,
+            nullptr);
+    }
     out_counts[idx] = count;
 }
 
