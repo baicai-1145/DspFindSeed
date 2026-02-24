@@ -19,10 +19,13 @@ struct BatchDeviceBuffers
     int* d_counts;
     dsp_vec3d_t* d_poses;
     dsp_vec3d_t* d_drunk;
+    dsp_vec3d_t* d_head_poses;
+    cudaStream_t stream;
     size_t seeds_capacity_bytes;
     size_t counts_capacity_bytes;
     size_t poses_capacity_bytes;
     size_t drunk_capacity_bytes;
+    size_t head_poses_capacity_bytes;
 
     BatchDeviceBuffers()
         : device_id(-2),
@@ -30,10 +33,13 @@ struct BatchDeviceBuffers
           d_counts(nullptr),
           d_poses(nullptr),
           d_drunk(nullptr),
+          d_head_poses(nullptr),
+          stream(nullptr),
           seeds_capacity_bytes(0),
           counts_capacity_bytes(0),
           poses_capacity_bytes(0),
-          drunk_capacity_bytes(0)
+          drunk_capacity_bytes(0),
+          head_poses_capacity_bytes(0)
     {
     }
 };
@@ -102,6 +108,16 @@ thread_local PlanetCoreBatchDeviceBuffers g_planet_core_batch_buffers;
 
 void ReleaseBatchDeviceBuffers(BatchDeviceBuffers& buffers)
 {
+    if (buffers.stream != nullptr)
+    {
+        cudaStreamDestroy(buffers.stream);
+        buffers.stream = nullptr;
+    }
+    if (buffers.d_head_poses != nullptr)
+    {
+        cudaFree(buffers.d_head_poses);
+        buffers.d_head_poses = nullptr;
+    }
     if (buffers.d_drunk != nullptr)
     {
         cudaFree(buffers.d_drunk);
@@ -126,6 +142,7 @@ void ReleaseBatchDeviceBuffers(BatchDeviceBuffers& buffers)
     buffers.counts_capacity_bytes = 0;
     buffers.poses_capacity_bytes = 0;
     buffers.drunk_capacity_bytes = 0;
+    buffers.head_poses_capacity_bytes = 0;
 }
 
 void ReleasePlanetCoreBatchDeviceBuffers(PlanetCoreBatchDeviceBuffers& buffers)
@@ -190,16 +207,25 @@ cudaError_t EnsureBatchBuffers(
     size_t seeds_bytes,
     size_t counts_bytes,
     size_t poses_bytes,
+    size_t head_poses_bytes,
     int** d_seeds,
     int** d_counts,
     dsp_vec3d_t** d_poses,
-    dsp_vec3d_t** d_drunk)
+    dsp_vec3d_t** d_drunk,
+    dsp_vec3d_t** d_head_poses,
+    cudaStream_t* stream)
 {
     BatchDeviceBuffers& buffers = g_batch_buffers;
     if (buffers.device_id != device_id)
     {
         ReleaseBatchDeviceBuffers(buffers);
         buffers.device_id = device_id;
+    }
+    if (buffers.stream == nullptr)
+    {
+        cudaError_t rc_stream = cudaStreamCreateWithFlags(&buffers.stream, cudaStreamNonBlocking);
+        if (rc_stream != cudaSuccess)
+            return rc_stream;
     }
 
     cudaError_t rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_seeds), &buffers.seeds_capacity_bytes, seeds_bytes);
@@ -214,11 +240,21 @@ cudaError_t EnsureBatchBuffers(
     rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_drunk), &buffers.drunk_capacity_bytes, poses_bytes);
     if (rc != cudaSuccess)
         return rc;
+    if (head_poses_bytes > 0)
+    {
+        rc = EnsureCudaBuffer(reinterpret_cast<void**>(&buffers.d_head_poses), &buffers.head_poses_capacity_bytes, head_poses_bytes);
+        if (rc != cudaSuccess)
+            return rc;
+    }
 
     *d_seeds = buffers.d_seeds;
     *d_counts = buffers.d_counts;
     *d_poses = buffers.d_poses;
     *d_drunk = buffers.d_drunk;
+    if (d_head_poses != nullptr)
+        *d_head_poses = buffers.d_head_poses;
+    if (stream != nullptr)
+        *stream = buffers.stream;
     return cudaSuccess;
 }
 
@@ -1226,16 +1262,20 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
+    cudaStream_t stream = nullptr;
 
     cudaError_t rc = EnsureBatchBuffers(
         device_id,
         seeds_bytes,
         counts_bytes,
         poses_bytes,
+        0,
         &d_seeds,
         &d_counts,
         &d_poses,
-        &d_drunk);
+        &d_drunk,
+        nullptr,
+        &stream);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -1243,7 +1283,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         return DSP_CUDA_ERR_CUDA;
     }
 
-    rc = cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice);
+    rc = cudaMemcpyAsync(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -1253,7 +1293,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
 
     int block_size = 128;
     int grid_size = (seed_count + block_size - 1) / block_size;
-    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size>>>(
+    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
         d_seeds,
         seed_count,
         max_count,
@@ -1269,9 +1309,11 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
 
     rc = cudaGetLastError();
     if (rc == cudaSuccess)
-        rc = cudaMemcpy(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost);
+        rc = cudaMemcpyAsync(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
     if (rc == cudaSuccess)
-        rc = cudaMemcpy(out_poses, d_poses, poses_bytes, cudaMemcpyDeviceToHost);
+        rc = cudaMemcpyAsync(out_poses, d_poses, poses_bytes, cudaMemcpyDeviceToHost, stream);
+    if (rc == cudaSuccess)
+        rc = cudaStreamSynchronize(stream);
 
     if (rc != cudaSuccess)
     {
@@ -1325,22 +1367,27 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     const size_t seeds_bytes = static_cast<size_t>(seed_count) * sizeof(int);
     const size_t counts_bytes = static_cast<size_t>(seed_count) * sizeof(int);
     const size_t poses_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(device_stride) * sizeof(dsp_vec3d_t);
+    const size_t head_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(out_stride) * sizeof(dsp_vec3d_t);
 
     int* d_seeds = nullptr;
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
     dsp_vec3d_t* d_head_poses = nullptr;
+    cudaStream_t stream = nullptr;
 
     cudaError_t rc = EnsureBatchBuffers(
         device_id,
         seeds_bytes,
         counts_bytes,
         poses_bytes,
+        head_bytes,
         &d_seeds,
         &d_counts,
         &d_poses,
-        &d_drunk);
+        &d_drunk,
+        &d_head_poses,
+        &stream);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -1348,7 +1395,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         return DSP_CUDA_ERR_CUDA;
     }
 
-    rc = cudaMemcpy(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice);
+    rc = cudaMemcpyAsync(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -1358,7 +1405,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
 
     int block_size = 128;
     int grid_size = (seed_count + block_size - 1) / block_size;
-    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size>>>(
+    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
         d_seeds,
         seed_count,
         max_count,
@@ -1374,29 +1421,25 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
 
     rc = cudaGetLastError();
     if (rc == cudaSuccess)
-        rc = cudaMemcpy(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost);
+        rc = cudaMemcpyAsync(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
     if (rc == cudaSuccess)
     {
-        const size_t head_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(out_stride) * sizeof(dsp_vec3d_t);
-        rc = cudaMalloc(reinterpret_cast<void**>(&d_head_poses), head_bytes);
+        int block = 128;
+        int grid = (seed_count * head_count + block - 1) / block;
+        GatherTempPosesHeadKernel<<<grid, block, 0, stream>>>(
+            d_poses,
+            seed_count,
+            device_stride,
+            head_count,
+            sample_step,
+            d_head_poses,
+            out_stride);
+        rc = cudaGetLastError();
         if (rc == cudaSuccess)
-        {
-            int block = 128;
-            int grid = (seed_count * head_count + block - 1) / block;
-            GatherTempPosesHeadKernel<<<grid, block>>>(
-                d_poses,
-                seed_count,
-                device_stride,
-                head_count,
-                sample_step,
-                d_head_poses,
-                out_stride);
-            rc = cudaGetLastError();
-            if (rc == cudaSuccess)
-                rc = cudaMemcpy(out_poses, d_head_poses, head_bytes, cudaMemcpyDeviceToHost);
-        }
+            rc = cudaMemcpyAsync(out_poses, d_head_poses, head_bytes, cudaMemcpyDeviceToHost, stream);
+        if (rc == cudaSuccess)
+            rc = cudaStreamSynchronize(stream);
     }
-    cudaFree(d_head_poses);
 
     if (rc != cudaSuccess)
     {
