@@ -31,6 +31,7 @@ namespace SeedCli
             bool dumpCompareMixVeinsF32 = HasFlag(args, "--dump-compare-mix-veins-f32");
             bool debugVeinBranch = HasFlag(args, "--debug-vein-branch");
             bool mixCollisionFp64 = HasFlag(args, "--mix-collision-fp64");
+            bool mixSpeedOnly = HasFlag(args, "--mix-speed-only");
             bool compareF32 = HasFlag(args, "--compare-f32");
             bool compareF32Pt64 = HasFlag(args, "--compare-f32-pt64");
             bool compareF32Pt64Coll64 = HasFlag(args, "--compare-f32-pt64-coll64");
@@ -69,6 +70,7 @@ namespace SeedCli
                 Console.WriteLine("端到端 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-f32");
                 Console.WriteLine("端到端 Mix 实验（星系 0 mismatch 变体）：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix [--cpu-threads 10] [--gpu-chunk-seeds 4096]");
                 Console.WriteLine("端到端 Mix+矿 FP32 实验：SeedCli.exe --seed <起始种子> --stars <星区数量> --count <个数> --compare-pipeline-mix-veins-f32 [--cpu-threads 10] [--gpu-chunk-seeds 4096]");
+                Console.WriteLine("Mix 纯测速（不做 FP64 对比）：追加 --mix-speed-only（建议配合 --compare-pipeline-mix-veins-f32）。");
                 Console.WriteLine("CPU 线程数：追加 --cpu-threads <N>（兼容 --threads）");
                 Console.WriteLine("GPU 真批大小：追加 --gpu-chunk-seeds <N>");
                 Console.WriteLine("Mix 行星 core 分组大小：追加 --mix-core-group-seeds <N>（默认 0=自动按 chunk 大小）");
@@ -122,6 +124,8 @@ namespace SeedCli
                         Console.WriteLine("参数 --threads 已兼容映射到 --cpu-threads。");
                     if ((HasFlag(args, "--batch-per-thread") || hasLegacySeedBatchArg) && !HasFlag(args, "--gpu-chunk-seeds"))
                         Console.WriteLine("参数 --batch-per-thread/--seed-batch-size 仅用于推导 --gpu-chunk-seeds（未显式设置时）。");
+                    if (mixSpeedOnly && showMismatches > 0)
+                        Console.WriteLine("参数 --mix-speed-only 已启用：--show-mismatches 将被忽略。");
 
                     ComparePipelineMix(
                         seed,
@@ -135,6 +139,7 @@ namespace SeedCli
                         gpuChunkSeeds: gpuChunkSeeds,
                         gpuStreams: gpuStreams,
                         mixCoreGroupSeeds: mixCoreGroupSeeds,
+                        mixSpeedOnly: mixSpeedOnly,
                         timingDebug: timingDebug,
                         cpuCacheFile: cpuCacheFile,
                         useCpuCache: !noCpuCache);
@@ -758,6 +763,7 @@ namespace SeedCli
             int gpuChunkSeeds,
             int gpuStreams,
             int mixCoreGroupSeeds,
+            bool mixSpeedOnly,
             bool timingDebug,
             string cpuCacheFile,
             bool useCpuCache)
@@ -806,12 +812,12 @@ namespace SeedCli
                 CudaPlanetNative.ResetPerfStats();
             }
 
-            var cpuRows = new CpuFp64SigRow[count];
+            CpuFp64SigRow[] cpuRows = mixSpeedOnly ? null : new CpuFp64SigRow[count];
             string resolvedCpuCacheFile = null;
             bool cpuCacheLoaded = false;
             bool cpuCacheSaved = false;
 
-            if (useCpuCache)
+            if (!mixSpeedOnly && useCpuCache)
             {
                 long t0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 resolvedCpuCacheFile = ResolveCpuFp64CacheFile(cpuCacheFile, startSeed, starCount, count);
@@ -820,7 +826,7 @@ namespace SeedCli
                     tCacheLoad += Stopwatch.GetTimestamp() - t0;
             }
 
-            if (!cpuCacheLoaded)
+            if (!mixSpeedOnly && !cpuCacheLoaded)
             {
                 long tCpuStart = timingDebug ? Stopwatch.GetTimestamp() : 0;
                 if (cpuThreads > 1)
@@ -897,10 +903,17 @@ namespace SeedCli
 
             var chunkBuffers = new GpuChunkBuffers();
             var chunkRunner = new GpuChunkRunner(starCount, mixCollisionFp64, mixThreads);
-            long tMixStart = timingDebug ? Stopwatch.GetTimestamp() : 0;
+            int nativeInFlightLimit = 0;
+            long tMixStart = (timingDebug || mixSpeedOnly) ? Stopwatch.GetTimestamp() : 0;
             bool prevSkipNameGeneration = global::DspFindSeed.StarGen.SkipNameGeneration;
+            string prevNativeSpeedOnly = null;
             MixRuntimeFlags.SignatureOnlyFastPath = true;
             global::DspFindSeed.StarGen.SkipNameGeneration = true;
+            if (mixSpeedOnly)
+            {
+                prevNativeSpeedOnly = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY", "1");
+            }
             try
             {
                 ulong[] CopySigSlice(ulong[] src, int len)
@@ -933,7 +946,7 @@ namespace SeedCli
                     if (timingDebug)
                         result.submitTicks = Stopwatch.GetTimestamp() - ts0;
                     result.useNativeSeedSigs = ok;
-                    if (ok)
+                    if (ok && !mixSpeedOnly)
                     {
                         result.galaxySigs = CopySigSlice(chunkNativeGalaxySig, chunk);
                         result.planetSigs = CopySigSlice(chunkNativePlanetSig, chunk);
@@ -948,6 +961,11 @@ namespace SeedCli
                     int seedBase = chunkResult.seedBase;
                     int chunk = chunkResult.chunkSize;
                     mixChunkNativeSeedSigOk++;
+                    if (mixSpeedOnly)
+                    {
+                        total += chunk;
+                        return;
+                    }
                     long tc0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                     for (int i = 0; i < chunk; i++)
                     {
@@ -1005,6 +1023,12 @@ namespace SeedCli
                     var chunkRun = chunkRunner.RunChunk(seedBase, chunk, enableBatchPrefetch: false, timingDebug, chunkBuffers);
                     if (timingDebug)
                         tMixCreateGalaxy += chunkRun.CreateGalaxyTicks;
+                    if (mixSpeedOnly)
+                    {
+                        total += chunk;
+                        MixObjectPool.ReleaseGalaxies(chunkBuffers.GalaxyBuffer, chunk);
+                        return;
+                    }
 
                     long tv0 = timingDebug ? Stopwatch.GetTimestamp() : 0;
                     bool useChunkCudaCounts = TryGetCudaPlanetCountsBatch(
@@ -1101,13 +1125,43 @@ namespace SeedCli
                     MixObjectPool.ReleaseGalaxies(chunkBuffers.GalaxyBuffer, chunk);
                 }
 
-                int nativeInFlightLimit = gpuStreams < 2 ? 2 : gpuStreams;
-                var nativeInFlight = new Queue<Task<NativeSeedSigChunkResult>>();
+                nativeInFlightLimit = gpuStreams < 1 ? 1 : gpuStreams;
+                int envNativeInFlight = GetIntEnv("DSP_MIX_NATIVE_INFLIGHT", 0);
+                if (envNativeInFlight > 0)
+                    nativeInFlightLimit = envNativeInFlight;
+                else
+                    nativeInFlightLimit = nativeInFlightLimit * 2;
+                if (nativeInFlightLimit < 2)
+                    nativeInFlightLimit = 2;
+                var nativeInFlight = new List<Task<NativeSeedSigChunkResult>>(nativeInFlightLimit);
                 bool nativeSeedSigDisabled = false;
 
                 void DrainOneNativeTask()
                 {
-                    var task = nativeInFlight.Dequeue();
+                    if (nativeInFlight.Count <= 0)
+                        return;
+
+                    Task<NativeSeedSigChunkResult> task = null;
+                    int completedIdx = -1;
+                    for (int i = 0; i < nativeInFlight.Count; i++)
+                    {
+                        if (nativeInFlight[i].IsCompleted)
+                        {
+                            completedIdx = i;
+                            break;
+                        }
+                    }
+                    if (completedIdx >= 0)
+                    {
+                        task = nativeInFlight[completedIdx];
+                        nativeInFlight.RemoveAt(completedIdx);
+                    }
+                    else
+                    {
+                        task = Task.WhenAny(nativeInFlight).GetAwaiter().GetResult();
+                        nativeInFlight.Remove(task);
+                    }
+
                     var chunkResult = task.GetAwaiter().GetResult();
                     if (timingDebug)
                         tMixChunkSubmit += chunkResult.submitTicks;
@@ -1135,7 +1189,7 @@ namespace SeedCli
 
                     int chunkSeedBase = seedBase;
                     int chunkSize = chunk;
-                    nativeInFlight.Enqueue(Task.Run(() => RunNativeSeedSigChunk(chunkSeedBase, chunkSize)));
+                    nativeInFlight.Add(Task.Run(() => RunNativeSeedSigChunk(chunkSeedBase, chunkSize)));
                     if (nativeInFlight.Count >= nativeInFlightLimit)
                         DrainOneNativeTask();
                 }
@@ -1145,32 +1199,50 @@ namespace SeedCli
             }
             finally
             {
+                if (mixSpeedOnly)
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY", prevNativeSpeedOnly);
                 global::DspFindSeed.StarGen.SkipNameGeneration = prevSkipNameGeneration;
                 MixRuntimeFlags.SignatureOnlyFastPath = false;
             }
-            if (timingDebug)
+            if (timingDebug || mixSpeedOnly)
                 tMixTotal += Stopwatch.GetTimestamp() - tMixStart;
 
             var label = useFp32Veins ? "compare-pipeline-mix-veins-f32" : "compare-pipeline-mix";
             Console.WriteLine($"{label} startSeed={startSeed} stars={starCount} count={count}");
+            Console.WriteLine($"mixSpeedOnly={mixSpeedOnly}");
             Console.WriteLine($"mixCollisionFp64={mixCollisionFp64}");
             Console.WriteLine($"cpuThreads={cpuThreads} mixThreads={mixThreads} gpuChunkSeeds={seedBatchSize} gpuStreams={gpuStreams} cpuParallel={(cpuThreads > 1 ? "True" : "False")}");
             Console.WriteLine($"mixCoreGroupSeeds={mixCoreGroupSeeds}");
-            if (useCpuCache)
+            if (mixSpeedOnly)
+                Console.WriteLine("cpuFp64Cache=skipped (mix-speed-only)");
+            else if (useCpuCache)
                 Console.WriteLine($"cpuFp64Cache={(cpuCacheLoaded ? "loaded" : (cpuCacheSaved ? "saved" : "built-no-save"))} file={resolvedCpuCacheFile}");
             else
                 Console.WriteLine("cpuFp64Cache=disabled");
             Console.WriteLine($"mixChunkSeeds={seedBatchSize} mixRunChunkSeeds={mixRunChunkSeeds} (derivedFromCpuThreads*batchPerThread={(gpuChunkSeeds > 0 ? "False" : "True")}) mixCudaPlanetBatchChunks={mixChunkCudaCountsOk}/{mixChunkTotal}");
             Console.WriteLine($"mixNativeSigChunks={mixChunkNativeSigOk}/{mixChunkTotal}");
             Console.WriteLine($"mixNativeSeedSigChunks={mixChunkNativeSeedSigOk}/{mixChunkTotal} mixObjectFallbackChunks={mixChunkObjectFallback}/{mixChunkTotal}");
+            Console.WriteLine($"mixNativeInFlight={nativeInFlightLimit}");
             if (mixChunkCount > 0)
                 Console.WriteLine($"mixChunkCount={mixChunkCount} mixChunkSizeAvg={mixChunkSeedTotal / (double)mixChunkCount:F2}");
             Console.WriteLine($"seedBatchSize={seedBatchSize} prefetchChunks=0/0");
-            Console.WriteLine($"galaxyMismatch={mismatchGalaxy}/{total} ({(total > 0 ? (mismatchGalaxy * 100.0 / total) : 0):F6}%)");
-            Console.WriteLine($"planetMismatch={mismatchPlanets}/{total} ({(total > 0 ? (mismatchPlanets * 100.0 / total) : 0):F6}%)");
-            Console.WriteLine($"veinMismatch={mismatchVeins}/{total} ({(total > 0 ? (mismatchVeins * 100.0 / total) : 0):F6}%)");
-            Console.WriteLine($"pipelineMismatch={mismatchPipeline}/{total} ({(total > 0 ? (mismatchPipeline * 100.0 / total) : 0):F6}%)");
-            Console.WriteLine("说明：先全量生成 CPU FP64 签名（可缓存复用），再全量生成 Mix 并对比。");
+            if (mixSpeedOnly)
+            {
+                double mixMs = tMixTotal * 1000.0 / Stopwatch.Frequency;
+                double seedsPerSec = mixMs > 0.0 ? total * 1000.0 / mixMs : 0.0;
+                Console.WriteLine($"speedOnlyTotalSeeds={total}");
+                Console.WriteLine($"speedOnlyMixMs={mixMs:F3}");
+                Console.WriteLine($"speedOnlySeedsPerSec={seedsPerSec:F2}");
+                Console.WriteLine("说明：仅执行 Mix/GPU 路线用于测速，不生成 CPU FP64，不做正确率对比。");
+            }
+            else
+            {
+                Console.WriteLine($"galaxyMismatch={mismatchGalaxy}/{total} ({(total > 0 ? (mismatchGalaxy * 100.0 / total) : 0):F6}%)");
+                Console.WriteLine($"planetMismatch={mismatchPlanets}/{total} ({(total > 0 ? (mismatchPlanets * 100.0 / total) : 0):F6}%)");
+                Console.WriteLine($"veinMismatch={mismatchVeins}/{total} ({(total > 0 ? (mismatchVeins * 100.0 / total) : 0):F6}%)");
+                Console.WriteLine($"pipelineMismatch={mismatchPipeline}/{total} ({(total > 0 ? (mismatchPipeline * 100.0 / total) : 0):F6}%)");
+                Console.WriteLine("说明：先全量生成 CPU FP64 签名（可缓存复用），再全量生成 Mix 并对比。");
+            }
             if (timingDebug)
             {
                 double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
