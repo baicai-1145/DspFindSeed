@@ -110,6 +110,22 @@ int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     int out_stride,
     int* out_counts);
 
+int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
+    const int* seeds,
+    int seed_count,
+    int max_count,
+    int head_count,
+    int sample_step,
+    double min_dist,
+    double min_step_len,
+    double max_step_len,
+    double flatten,
+    int collision_fp64,
+    int device_id,
+    dsp_vec3d_t* out_poses_device,
+    int out_stride,
+    int* out_counts);
+
 int dsp_cuda_get_last_pose_batch_head_timing(
     dsp_cuda_pose_batch_head_timing_t* out_timing);
 

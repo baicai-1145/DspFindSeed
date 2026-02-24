@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -20,6 +21,253 @@ constexpr int kMSeed = 161803398;
 constexpr int kStarPlanMaxPlanets = 6;
 constexpr unsigned long long kFnvOffset = 14695981039346656037ull;
 constexpr unsigned long long kFnvPrime = 1099511628211ull;
+inline int ResolveSigBlockSize();
+
+inline unsigned long long HashBytesFnv64(unsigned long long h, const void* data, size_t bytes)
+{
+    if (data == nullptr || bytes == 0)
+        return h;
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        h ^= static_cast<unsigned long long>(p[i]);
+        h *= kFnvPrime;
+    }
+    return h;
+}
+
+struct ThemeDeviceCacheEntry
+{
+    int device_id = -1;
+    int theme_count = 0;
+    int max_planet_type = 0;
+    int theme_vein_total = 0;
+    int theme_rare_total = 0;
+    int theme_settings_total = 0;
+    int type_theme_offsets_count = 0;
+    int type_theme_values_count = 0;
+    unsigned long long host_hash = 0;
+
+    int* d_theme_ids = nullptr;
+    int* d_theme_planet_types = nullptr;
+    float* d_theme_temperatures = nullptr;
+    int* d_theme_distributes = nullptr;
+    int* d_theme_water_item_ids = nullptr;
+    int* d_theme_vein_spot_offsets = nullptr;
+    int* d_theme_vein_spot_values = nullptr;
+    int* d_theme_rare_vein_offsets = nullptr;
+    int* d_theme_rare_vein_values = nullptr;
+    int* d_theme_rare_settings_offsets = nullptr;
+    float* d_theme_rare_settings_values = nullptr;
+    int* d_type_theme_offsets = nullptr;
+    int* d_type_theme_values = nullptr;
+};
+
+struct ThemeDeviceCacheStore
+{
+    std::mutex mu;
+    std::vector<ThemeDeviceCacheEntry> entries;
+};
+
+inline ThemeDeviceCacheStore& GetThemeDeviceCacheStore()
+{
+    static ThemeDeviceCacheStore store;
+    return store;
+}
+
+inline void FreeThemeDeviceCacheEntryBuffers(ThemeDeviceCacheEntry& e)
+{
+    cudaFree(e.d_type_theme_values);
+    cudaFree(e.d_type_theme_offsets);
+    cudaFree(e.d_theme_rare_settings_values);
+    cudaFree(e.d_theme_rare_settings_offsets);
+    cudaFree(e.d_theme_rare_vein_values);
+    cudaFree(e.d_theme_rare_vein_offsets);
+    cudaFree(e.d_theme_vein_spot_values);
+    cudaFree(e.d_theme_vein_spot_offsets);
+    cudaFree(e.d_theme_water_item_ids);
+    cudaFree(e.d_theme_distributes);
+    cudaFree(e.d_theme_temperatures);
+    cudaFree(e.d_theme_planet_types);
+    cudaFree(e.d_theme_ids);
+    e = ThemeDeviceCacheEntry{};
+}
+
+inline bool EnsureThemeDeviceCache(
+    int device_id,
+    int theme_count,
+    int max_planet_type,
+    const int* theme_ids,
+    const int* theme_planet_types,
+    const float* theme_temperatures,
+    const int* theme_distributes,
+    const int* theme_water_item_ids,
+    const int* theme_vein_spot_offsets,
+    const int* theme_vein_spot_values,
+    const int* theme_rare_vein_offsets,
+    const int* theme_rare_vein_values,
+    const int* theme_rare_settings_offsets,
+    const float* theme_rare_settings_values,
+    const std::vector<int>& type_theme_offsets,
+    const std::vector<int>& type_theme_values,
+    const ThemeDeviceCacheEntry** out_cache)
+{
+    if (out_cache == nullptr || theme_count <= 0 || theme_ids == nullptr || theme_planet_types == nullptr ||
+        theme_temperatures == nullptr || theme_distributes == nullptr || theme_water_item_ids == nullptr ||
+        theme_vein_spot_offsets == nullptr || theme_rare_vein_offsets == nullptr || theme_rare_settings_offsets == nullptr)
+        return false;
+
+    const int theme_vein_total = theme_vein_spot_offsets[theme_count];
+    const int theme_rare_total = theme_rare_vein_offsets[theme_count];
+    const int theme_settings_total = theme_rare_settings_offsets[theme_count];
+    if (theme_vein_total < 0 || theme_rare_total < 0 || theme_settings_total < 0)
+        return false;
+
+    unsigned long long host_hash = kFnvOffset;
+    host_hash = HashBytesFnv64(host_hash, &theme_count, sizeof(theme_count));
+    host_hash = HashBytesFnv64(host_hash, &max_planet_type, sizeof(max_planet_type));
+    host_hash = HashBytesFnv64(host_hash, theme_ids, static_cast<size_t>(theme_count) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_planet_types, static_cast<size_t>(theme_count) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_temperatures, static_cast<size_t>(theme_count) * sizeof(float));
+    host_hash = HashBytesFnv64(host_hash, theme_distributes, static_cast<size_t>(theme_count) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_water_item_ids, static_cast<size_t>(theme_count) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_vein_spot_values, static_cast<size_t>(theme_vein_total) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_rare_vein_values, static_cast<size_t>(theme_rare_total) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, theme_rare_settings_values, static_cast<size_t>(theme_settings_total) * sizeof(float));
+    host_hash = HashBytesFnv64(host_hash, type_theme_offsets.data(), type_theme_offsets.size() * sizeof(int));
+    host_hash = HashBytesFnv64(host_hash, type_theme_values.data(), type_theme_values.size() * sizeof(int));
+
+    ThemeDeviceCacheStore& store = GetThemeDeviceCacheStore();
+    std::lock_guard<std::mutex> lock(store.mu);
+    for (const ThemeDeviceCacheEntry& e : store.entries)
+    {
+        if (e.device_id == device_id &&
+            e.theme_count == theme_count &&
+            e.max_planet_type == max_planet_type &&
+            e.theme_vein_total == theme_vein_total &&
+            e.theme_rare_total == theme_rare_total &&
+            e.theme_settings_total == theme_settings_total &&
+            e.type_theme_offsets_count == static_cast<int>(type_theme_offsets.size()) &&
+            e.type_theme_values_count == static_cast<int>(type_theme_values.size()) &&
+            e.host_hash == host_hash)
+        {
+            *out_cache = &e;
+            return true;
+        }
+    }
+
+    if (device_id >= 0 && cudaSetDevice(device_id) != cudaSuccess)
+        return false;
+
+    ThemeDeviceCacheEntry fresh{};
+    fresh.device_id = device_id;
+    fresh.theme_count = theme_count;
+    fresh.max_planet_type = max_planet_type;
+    fresh.theme_vein_total = theme_vein_total;
+    fresh.theme_rare_total = theme_rare_total;
+    fresh.theme_settings_total = theme_settings_total;
+    fresh.type_theme_offsets_count = static_cast<int>(type_theme_offsets.size());
+    fresh.type_theme_values_count = static_cast<int>(type_theme_values.size());
+    fresh.host_hash = host_hash;
+
+    auto alloc_int = [&](int** p, size_t count) -> bool {
+        size_t bytes = count > 0 ? count * sizeof(int) : sizeof(int);
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
+    auto alloc_float = [&](float** p, size_t count) -> bool {
+        size_t bytes = count > 0 ? count * sizeof(float) : sizeof(float);
+        return cudaMalloc(reinterpret_cast<void**>(p), bytes) == cudaSuccess;
+    };
+    auto h2d_raw = [&](void* dst, const void* src, size_t bytes) -> bool {
+        if (bytes == 0)
+            return true;
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+
+    if (!alloc_int(&fresh.d_theme_ids, static_cast<size_t>(theme_count)) ||
+        !alloc_int(&fresh.d_theme_planet_types, static_cast<size_t>(theme_count)) ||
+        !alloc_float(&fresh.d_theme_temperatures, static_cast<size_t>(theme_count)) ||
+        !alloc_int(&fresh.d_theme_distributes, static_cast<size_t>(theme_count)) ||
+        !alloc_int(&fresh.d_theme_water_item_ids, static_cast<size_t>(theme_count)) ||
+        !alloc_int(&fresh.d_theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1)) ||
+        !alloc_int(&fresh.d_theme_vein_spot_values, static_cast<size_t>(theme_vein_total)) ||
+        !alloc_int(&fresh.d_theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1)) ||
+        !alloc_int(&fresh.d_theme_rare_vein_values, static_cast<size_t>(theme_rare_total)) ||
+        !alloc_int(&fresh.d_theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1)) ||
+        !alloc_float(&fresh.d_theme_rare_settings_values, static_cast<size_t>(theme_settings_total)) ||
+        !alloc_int(&fresh.d_type_theme_offsets, type_theme_offsets.size()) ||
+        !alloc_int(&fresh.d_type_theme_values, type_theme_values.size()) ||
+        !h2d_raw(fresh.d_theme_ids, theme_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_planet_types, theme_planet_types, static_cast<size_t>(theme_count) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_temperatures, theme_temperatures, static_cast<size_t>(theme_count) * sizeof(float)) ||
+        !h2d_raw(fresh.d_theme_distributes, theme_distributes, static_cast<size_t>(theme_count) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_water_item_ids, theme_water_item_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_vein_spot_offsets, theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_vein_spot_values, theme_vein_spot_values, static_cast<size_t>(theme_vein_total) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_rare_vein_offsets, theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_rare_vein_values, theme_rare_vein_values, static_cast<size_t>(theme_rare_total) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_rare_settings_offsets, theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
+        !h2d_raw(fresh.d_theme_rare_settings_values, theme_rare_settings_values, static_cast<size_t>(theme_settings_total) * sizeof(float)) ||
+        !h2d_raw(fresh.d_type_theme_offsets, type_theme_offsets.data(), type_theme_offsets.size() * sizeof(int)) ||
+        !h2d_raw(fresh.d_type_theme_values, type_theme_values.data(), type_theme_values.size() * sizeof(int)))
+    {
+        FreeThemeDeviceCacheEntryBuffers(fresh);
+        return false;
+    }
+
+    store.entries.push_back(fresh);
+    *out_cache = &store.entries.back();
+    return true;
+}
+
+inline bool AcquireSigThreadStream(int device_id, cudaStream_t* out_stream)
+{
+    if (out_stream == nullptr)
+        return false;
+    struct SigThreadStream
+    {
+        int device_id = -1;
+        cudaStream_t stream = nullptr;
+        ~SigThreadStream()
+        {
+            if (stream != nullptr)
+            {
+                if (device_id >= 0)
+                    cudaSetDevice(device_id);
+                cudaStreamDestroy(stream);
+                stream = nullptr;
+            }
+        }
+    };
+    thread_local SigThreadStream tls;
+
+    int resolved_device = device_id;
+    if (resolved_device < 0)
+    {
+        if (cudaGetDevice(&resolved_device) != cudaSuccess)
+            resolved_device = 0;
+    }
+    if (tls.stream == nullptr || tls.device_id != resolved_device)
+    {
+        if (tls.stream != nullptr)
+        {
+            if (tls.device_id >= 0)
+                cudaSetDevice(tls.device_id);
+            cudaStreamDestroy(tls.stream);
+            tls.stream = nullptr;
+        }
+        if (resolved_device >= 0 && cudaSetDevice(resolved_device) != cudaSuccess)
+            return false;
+        if (cudaStreamCreateWithFlags(&tls.stream, cudaStreamNonBlocking) != cudaSuccess)
+            return false;
+        tls.device_id = resolved_device;
+    }
+    *out_stream = tls.stream;
+    return true;
+}
 
 inline int AddWrapI32(int a, int b)
 {
@@ -2353,7 +2601,7 @@ inline bool TryBuildStarPlanetPlansCuda(
     if (timing_out != nullptr)
         timing_out->h2d_ms += (now_ms_local() - t_h2d_begin);
 
-    const int block = 128;
+    const int block = ResolveSigBlockSize();
     const int grid = (star_count + block - 1) / block;
     if (timing_out != nullptr)
     {
@@ -3573,6 +3821,7 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
     int iter_count,
     const std::vector<int>& pose_raw_counts,
     const std::vector<dsp_vec3d_t>& pose_raw,
+    const dsp_vec3d_t* pose_raw_device,
     int vein_len,
     int use_fp32_prob_compare,
     int star_type_white_dwarf,
@@ -3593,6 +3842,7 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
     const float* theme_rare_settings_values,
     const std::vector<int>& type_theme_offsets,
     const std::vector<int>& type_theme_values,
+    bool speed_only,
     unsigned long long* out_galaxy_sigs,
     unsigned long long* out_planet_sigs,
     unsigned long long* out_vein_sigs,
@@ -3602,7 +3852,8 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return false;
     if (static_cast<int>(pose_raw_counts.size()) < seed_count)
         return false;
-    if (pose_raw.size() < static_cast<size_t>(seed_count) * static_cast<size_t>(star_count))
+    if (pose_raw_device == nullptr &&
+        pose_raw.size() < static_cast<size_t>(seed_count) * static_cast<size_t>(star_count))
         return false;
     if (device_id >= 0)
     {
@@ -3634,7 +3885,8 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
     int* d_galaxy_seeds = nullptr;
     int* d_seed_star_counts = nullptr;
     int* d_seed_star_offsets = nullptr;
-    dsp_vec3d_t* d_pose_raw = nullptr;
+    bool owns_d_pose_raw = pose_raw_device == nullptr;
+    dsp_vec3d_t* d_pose_raw = owns_d_pose_raw ? nullptr : const_cast<dsp_vec3d_t*>(pose_raw_device);
 
     int* d_star_ids = nullptr;
     int* d_star_seeds = nullptr;
@@ -3673,19 +3925,7 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
     double* d_planet_core_num14 = nullptr;
     double* d_planet_core_rand1 = nullptr;
 
-    int* d_theme_ids = nullptr;
-    int* d_theme_planet_types = nullptr;
-    float* d_theme_temperatures = nullptr;
-    int* d_theme_distributes = nullptr;
-    int* d_theme_water_item_ids = nullptr;
-    int* d_theme_vein_spot_offsets = nullptr;
-    int* d_theme_vein_spot_values = nullptr;
-    int* d_theme_rare_vein_offsets = nullptr;
-    int* d_theme_rare_vein_values = nullptr;
-    int* d_theme_rare_settings_offsets = nullptr;
-    float* d_theme_rare_settings_values = nullptr;
-    int* d_type_theme_offsets = nullptr;
-    int* d_type_theme_values = nullptr;
+    const ThemeDeviceCacheEntry* theme_cache = nullptr;
 
     unsigned long long* d_out_galaxy_sigs = nullptr;
     unsigned long long* d_out_planet_sigs = nullptr;
@@ -3694,24 +3934,10 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
 
     cudaStream_t stream = nullptr;
     auto cleanup = [&]() {
-        if (stream != nullptr) cudaStreamDestroy(stream);
         cudaFree(d_out_pipeline_sigs);
         cudaFree(d_out_vein_sigs);
         cudaFree(d_out_planet_sigs);
         cudaFree(d_out_galaxy_sigs);
-        cudaFree(d_type_theme_values);
-        cudaFree(d_type_theme_offsets);
-        cudaFree(d_theme_rare_settings_values);
-        cudaFree(d_theme_rare_settings_offsets);
-        cudaFree(d_theme_rare_vein_values);
-        cudaFree(d_theme_rare_vein_offsets);
-        cudaFree(d_theme_vein_spot_values);
-        cudaFree(d_theme_vein_spot_offsets);
-        cudaFree(d_theme_water_item_ids);
-        cudaFree(d_theme_distributes);
-        cudaFree(d_theme_temperatures);
-        cudaFree(d_theme_planet_types);
-        cudaFree(d_theme_ids);
         cudaFree(d_planet_core_rand1);
         cudaFree(d_planet_core_num14);
         cudaFree(d_planet_core_num13);
@@ -3746,7 +3972,8 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         cudaFree(d_star_types);
         cudaFree(d_star_seeds);
         cudaFree(d_star_ids);
-        cudaFree(d_pose_raw);
+        if (owns_d_pose_raw)
+            cudaFree(d_pose_raw);
         cudaFree(d_seed_star_offsets);
         cudaFree(d_seed_star_counts);
         cudaFree(d_galaxy_seeds);
@@ -3787,13 +4014,35 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream) == cudaSuccess;
     };
 
-    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+    if (!AcquireSigThreadStream(device_id, &stream))
         return false;
+    if (!EnsureThemeDeviceCache(
+            device_id,
+            theme_count,
+            max_planet_type,
+            theme_ids,
+            theme_planet_types,
+            theme_temperatures,
+            theme_distributes,
+            theme_water_item_ids,
+            theme_vein_spot_offsets,
+            theme_vein_spot_values,
+            theme_rare_vein_offsets,
+            theme_rare_vein_values,
+            theme_rare_settings_offsets,
+            theme_rare_settings_values,
+            type_theme_offsets,
+            type_theme_values,
+            &theme_cache))
+    {
+        cleanup();
+        return false;
+    }
 
     if (!alloc_int(&d_galaxy_seeds, static_cast<size_t>(seed_count)) ||
         !alloc_int(&d_seed_star_counts, static_cast<size_t>(seed_count)) ||
         !alloc_int(&d_seed_star_offsets, static_cast<size_t>(seed_count + 1)) ||
-        !alloc_pose(&d_pose_raw, static_cast<size_t>(seed_count) * static_cast<size_t>(star_count)) ||
+        (owns_d_pose_raw && !alloc_pose(&d_pose_raw, static_cast<size_t>(seed_count) * static_cast<size_t>(star_count))) ||
         !alloc_int(&d_star_ids, static_cast<size_t>(total_stars)) ||
         !alloc_int(&d_star_seeds, static_cast<size_t>(total_stars)) ||
         !alloc_int(&d_star_types, static_cast<size_t>(total_stars)) ||
@@ -3816,19 +4065,6 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         !alloc_int(&d_out_gen_seeds, plans_n) ||
         !alloc_core(&d_out_core, plans_n) ||
         !alloc_int(&d_star_planet_offsets, static_cast<size_t>(total_stars + 1)) ||
-        !alloc_int(&d_theme_ids, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_planet_types, static_cast<size_t>(theme_count)) ||
-        !alloc_float(&d_theme_temperatures, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_distributes, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_water_item_ids, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_int(&d_theme_vein_spot_values, static_cast<size_t>(theme_vein_spot_offsets[theme_count])) ||
-        !alloc_int(&d_theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_int(&d_theme_rare_vein_values, static_cast<size_t>(theme_rare_vein_offsets[theme_count])) ||
-        !alloc_int(&d_theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_float(&d_theme_rare_settings_values, static_cast<size_t>(theme_rare_settings_offsets[theme_count])) ||
-        !alloc_int(&d_type_theme_offsets, type_theme_offsets.size()) ||
-        !alloc_int(&d_type_theme_values, type_theme_values.size()) ||
         !alloc_u64(&d_out_galaxy_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_planet_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_vein_sigs, static_cast<size_t>(seed_count)) ||
@@ -3838,32 +4074,17 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return false;
     }
 
-    const int theme_vein_total = theme_vein_spot_offsets[theme_count];
-    const int theme_rare_total = theme_rare_vein_offsets[theme_count];
-    const int theme_settings_total = theme_rare_settings_offsets[theme_count];
     if (!h2d_raw(d_galaxy_seeds, galaxy_seeds, static_cast<size_t>(seed_count) * sizeof(int)) ||
         !h2d_raw(d_seed_star_counts, seed_star_counts.data(), static_cast<size_t>(seed_count) * sizeof(int)) ||
         !h2d_raw(d_seed_star_offsets, seed_star_offsets.data(), static_cast<size_t>(seed_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_pose_raw, pose_raw.data(), static_cast<size_t>(seed_count) * static_cast<size_t>(star_count) * sizeof(dsp_vec3d_t)) ||
-        !h2d_raw(d_theme_ids, theme_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_planet_types, theme_planet_types, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_temperatures, theme_temperatures, static_cast<size_t>(theme_count) * sizeof(float)) ||
-        !h2d_raw(d_theme_distributes, theme_distributes, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_water_item_ids, theme_water_item_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_vein_spot_offsets, theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_vein_spot_values, theme_vein_spot_values, static_cast<size_t>(theme_vein_total) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_vein_offsets, theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_vein_values, theme_rare_vein_values, static_cast<size_t>(theme_rare_total) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_settings_offsets, theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_settings_values, theme_rare_settings_values, static_cast<size_t>(theme_settings_total) * sizeof(float)) ||
-        !h2d_raw(d_type_theme_offsets, type_theme_offsets.data(), type_theme_offsets.size() * sizeof(int)) ||
-        !h2d_raw(d_type_theme_values, type_theme_values.data(), type_theme_values.size() * sizeof(int)))
+        (owns_d_pose_raw &&
+         !h2d_raw(d_pose_raw, pose_raw.data(), static_cast<size_t>(seed_count) * static_cast<size_t>(star_count) * sizeof(dsp_vec3d_t))))
     {
         cleanup();
         return false;
     }
 
-    const int block_seed = 128;
+    const int block_seed = ResolveSigBlockSize();
     const int grid_seed = (seed_count + block_seed - 1) / block_seed;
     BuildStarsFromPoseKernel<<<grid_seed, block_seed, 0, stream>>>(
         d_galaxy_seeds,
@@ -3892,108 +4113,142 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return false;
     }
 
-    // NOTE: GPU-star build introduces tiny numeric deltas vs host std:: math that can amplify in theme branches.
-    // For correctness-critical direct path, override star fields with host-precise values.
-    std::vector<int> h_star_ids(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_seeds(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_types_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_spectrs_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_indexes_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_counts_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_pos_qx_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_pos_qy_host(static_cast<size_t>(total_stars), 0);
-    std::vector<int> h_star_pos_qz_host(static_cast<size_t>(total_stars), 0);
-    std::vector<float> h_star_orbit_host(static_cast<size_t>(total_stars), 0.0f);
-    std::vector<double> h_star_mass_host(static_cast<size_t>(total_stars), 0.0);
-    std::vector<float> h_star_hab_host(static_cast<size_t>(total_stars), 0.0f);
-    std::vector<float> h_star_light_host(static_cast<size_t>(total_stars), 0.0f);
-    for (int seed_idx = 0; seed_idx < seed_count; ++seed_idx)
-    {
-        const int cnt = seed_star_counts[seed_idx];
-        const int base = seed_star_offsets[seed_idx];
-        if (cnt <= 0)
-            continue;
-        DotNet35RandomHost galaxy_rng(galaxy_seeds[seed_idx]);
-        galaxy_rng.Next(); // consumed by pose seed
-        float num1 = static_cast<float>(galaxy_rng.NextDouble());
-        float num2 = static_cast<float>(galaxy_rng.NextDouble());
-        float num3 = static_cast<float>(galaxy_rng.NextDouble());
-        float num4 = static_cast<float>(galaxy_rng.NextDouble());
-        int num5 = static_cast<int>(std::ceil(0.01 * cnt + num1 * 0.300000011920929));
-        int num6 = static_cast<int>(std::ceil(0.01 * cnt + num2 * 0.300000011920929));
-        int num7 = static_cast<int>(std::ceil(0.0160000007599592 * cnt + num3 * 0.400000005960464));
-        int num8 = static_cast<int>(std::ceil(0.0130000002682209 * cnt + num4 * 1.39999997615814));
-        int num9 = cnt - num5;
-        int num10 = num9 - num6;
-        int num11 = num10 - num7;
-        int num12 = (num11 - 1) / num8;
-        int num13 = num12 / 2;
-
-        for (int si = 0; si < cnt; ++si)
-        {
-            const int flat = base + si;
-            const int star_seed = galaxy_rng.Next();
-            StarLite st{};
-            if (si == 0)
-            {
-                st = CreateBirthStarLite(cnt, star_seed, em);
-            }
-            else
-            {
-                int need_spectr = em.spectr_x;
-                if (si == 3) need_spectr = em.spectr_m;
-                else if (si == num11 - 1) need_spectr = em.spectr_o;
-
-                int need_type = em.star_type_main_seq;
-                if (num12 != 0 && si % num12 == num13)
-                    need_type = em.star_type_giant;
-                if (si >= num9)
-                    need_type = em.star_type_black_hole;
-                else if (si >= num10)
-                    need_type = em.star_type_neutron_star;
-                else if (si >= num11)
-                    need_type = em.star_type_white_dwarf;
-
-                const dsp_vec3d_t pos = pose_raw[static_cast<size_t>(seed_idx) * static_cast<size_t>(star_count) + static_cast<size_t>(si)];
-                st = CreateStarLite(cnt, pos, si + 1, star_seed, need_type, need_spectr, em);
-            }
-            h_star_ids[flat] = si + 1;
-            h_star_seeds[flat] = star_seed;
-            h_star_types_host[flat] = st.type;
-            h_star_spectrs_host[flat] = st.spectr;
-            h_star_indexes_host[flat] = si;
-            h_star_counts_host[flat] = cnt;
-            h_star_pos_qx_host[flat] = st.pos_qx;
-            h_star_pos_qy_host[flat] = st.pos_qy;
-            h_star_pos_qz_host[flat] = st.pos_qz;
-            h_star_orbit_host[flat] = st.orbit_scaler;
-            h_star_mass_host[flat] = static_cast<double>(st.mass);
-            h_star_hab_host[flat] = st.habitable_radius;
-            h_star_light_host[flat] = st.light_balance_radius;
-        }
-    }
-    if (!h2d_raw(d_star_ids, h_star_ids.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_seeds, h_star_seeds.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_types, h_star_types_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_spectrs, h_star_spectrs_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_indexes, h_star_indexes_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_counts_in_galaxy, h_star_counts_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_pos_qx, h_star_pos_qx_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_pos_qy, h_star_pos_qy_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_pos_qz, h_star_pos_qz_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
-        !h2d_raw(d_star_orbit_scalers, h_star_orbit_host.data(), static_cast<size_t>(total_stars) * sizeof(float)) ||
-        !h2d_raw(d_star_masses, h_star_mass_host.data(), static_cast<size_t>(total_stars) * sizeof(double)) ||
-        !h2d_raw(d_star_habitable_radiuses, h_star_hab_host.data(), static_cast<size_t>(total_stars) * sizeof(float)) ||
-        !h2d_raw(d_star_light_balance_radiuses, h_star_light_host.data(), static_cast<size_t>(total_stars) * sizeof(float)))
+    bool debug_direct_star = false;
+    if (const char* ds = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_STAR"))
+        debug_direct_star = std::atoi(ds) != 0;
+    bool debug_direct_plan = false;
+    if (const char* dp = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_PLAN"))
+        debug_direct_plan = std::atoi(dp) != 0;
+    bool debug_direct_core = false;
+    if (const char* dc = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_CORE"))
+        debug_direct_core = std::atoi(dc) != 0;
+    bool strict_direct_star_override = !speed_only;
+    if (const char* ss = std::getenv("DSP_NATIVE_SIG_DIRECT_STRICT_STARS"))
+        strict_direct_star_override = std::atoi(ss) != 0;
+    const bool need_host_star_reference = strict_direct_star_override || debug_direct_star || debug_direct_plan || debug_direct_core;
+    if (need_host_star_reference &&
+        pose_raw.size() < static_cast<size_t>(seed_count) * static_cast<size_t>(star_count))
     {
         cleanup();
         return false;
     }
 
-    bool debug_direct_star = false;
-    if (const char* ds = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_STAR"))
-        debug_direct_star = std::atoi(ds) != 0;
-    if (debug_direct_star && seed_count > 0)
+    // NOTE: GPU-star build introduces tiny numeric deltas vs host std:: math that can amplify in theme branches.
+    // Keep host-precise override for correctness path; speed-only can skip it to reduce host bottleneck.
+    std::vector<int> h_star_ids;
+    std::vector<int> h_star_seeds;
+    std::vector<int> h_star_types_host;
+    std::vector<int> h_star_spectrs_host;
+    std::vector<int> h_star_indexes_host;
+    std::vector<int> h_star_counts_host;
+    std::vector<int> h_star_pos_qx_host;
+    std::vector<int> h_star_pos_qy_host;
+    std::vector<int> h_star_pos_qz_host;
+    std::vector<float> h_star_orbit_host;
+    std::vector<double> h_star_mass_host;
+    std::vector<float> h_star_hab_host;
+    std::vector<float> h_star_light_host;
+    if (need_host_star_reference)
+    {
+        h_star_ids.assign(static_cast<size_t>(total_stars), 0);
+        h_star_seeds.assign(static_cast<size_t>(total_stars), 0);
+        h_star_types_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_spectrs_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_indexes_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_counts_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_pos_qx_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_pos_qy_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_pos_qz_host.assign(static_cast<size_t>(total_stars), 0);
+        h_star_orbit_host.assign(static_cast<size_t>(total_stars), 0.0f);
+        h_star_mass_host.assign(static_cast<size_t>(total_stars), 0.0);
+        h_star_hab_host.assign(static_cast<size_t>(total_stars), 0.0f);
+        h_star_light_host.assign(static_cast<size_t>(total_stars), 0.0f);
+        for (int seed_idx = 0; seed_idx < seed_count; ++seed_idx)
+        {
+            const int cnt = seed_star_counts[seed_idx];
+            const int base = seed_star_offsets[seed_idx];
+            if (cnt <= 0)
+                continue;
+            DotNet35RandomHost galaxy_rng(galaxy_seeds[seed_idx]);
+            galaxy_rng.Next(); // consumed by pose seed
+            float num1 = static_cast<float>(galaxy_rng.NextDouble());
+            float num2 = static_cast<float>(galaxy_rng.NextDouble());
+            float num3 = static_cast<float>(galaxy_rng.NextDouble());
+            float num4 = static_cast<float>(galaxy_rng.NextDouble());
+            int num5 = static_cast<int>(std::ceil(0.01 * cnt + num1 * 0.300000011920929));
+            int num6 = static_cast<int>(std::ceil(0.01 * cnt + num2 * 0.300000011920929));
+            int num7 = static_cast<int>(std::ceil(0.0160000007599592 * cnt + num3 * 0.400000005960464));
+            int num8 = static_cast<int>(std::ceil(0.0130000002682209 * cnt + num4 * 1.39999997615814));
+            int num9 = cnt - num5;
+            int num10 = num9 - num6;
+            int num11 = num10 - num7;
+            int num12 = (num11 - 1) / num8;
+            int num13 = num12 / 2;
+
+            for (int si = 0; si < cnt; ++si)
+            {
+                const int flat = base + si;
+                const int star_seed = galaxy_rng.Next();
+                StarLite st{};
+                if (si == 0)
+                {
+                    st = CreateBirthStarLite(cnt, star_seed, em);
+                }
+                else
+                {
+                    int need_spectr = em.spectr_x;
+                    if (si == 3) need_spectr = em.spectr_m;
+                    else if (si == num11 - 1) need_spectr = em.spectr_o;
+
+                    int need_type = em.star_type_main_seq;
+                    if (num12 != 0 && si % num12 == num13)
+                        need_type = em.star_type_giant;
+                    if (si >= num9)
+                        need_type = em.star_type_black_hole;
+                    else if (si >= num10)
+                        need_type = em.star_type_neutron_star;
+                    else if (si >= num11)
+                        need_type = em.star_type_white_dwarf;
+
+                    const dsp_vec3d_t pos = pose_raw[static_cast<size_t>(seed_idx) * static_cast<size_t>(star_count) + static_cast<size_t>(si)];
+                    st = CreateStarLite(cnt, pos, si + 1, star_seed, need_type, need_spectr, em);
+                }
+                h_star_ids[flat] = si + 1;
+                h_star_seeds[flat] = star_seed;
+                h_star_types_host[flat] = st.type;
+                h_star_spectrs_host[flat] = st.spectr;
+                h_star_indexes_host[flat] = si;
+                h_star_counts_host[flat] = cnt;
+                h_star_pos_qx_host[flat] = st.pos_qx;
+                h_star_pos_qy_host[flat] = st.pos_qy;
+                h_star_pos_qz_host[flat] = st.pos_qz;
+                h_star_orbit_host[flat] = st.orbit_scaler;
+                h_star_mass_host[flat] = static_cast<double>(st.mass);
+                h_star_hab_host[flat] = st.habitable_radius;
+                h_star_light_host[flat] = st.light_balance_radius;
+            }
+        }
+    }
+    if (strict_direct_star_override &&
+        (!h2d_raw(d_star_ids, h_star_ids.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_seeds, h_star_seeds.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_types, h_star_types_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_spectrs, h_star_spectrs_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_indexes, h_star_indexes_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_counts_in_galaxy, h_star_counts_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_pos_qx, h_star_pos_qx_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_pos_qy, h_star_pos_qy_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_pos_qz, h_star_pos_qz_host.data(), static_cast<size_t>(total_stars) * sizeof(int)) ||
+         !h2d_raw(d_star_orbit_scalers, h_star_orbit_host.data(), static_cast<size_t>(total_stars) * sizeof(float)) ||
+         !h2d_raw(d_star_masses, h_star_mass_host.data(), static_cast<size_t>(total_stars) * sizeof(double)) ||
+         !h2d_raw(d_star_habitable_radiuses, h_star_hab_host.data(), static_cast<size_t>(total_stars) * sizeof(float)) ||
+         !h2d_raw(d_star_light_balance_radiuses, h_star_light_host.data(), static_cast<size_t>(total_stars) * sizeof(float))))
+    {
+        cleanup();
+        return false;
+    }
+
+    if (debug_direct_star && seed_count > 0 && need_host_star_reference)
     {
         std::vector<int> h_star_types(static_cast<size_t>(total_stars));
         std::vector<int> h_star_spectrs(static_cast<size_t>(total_stars));
@@ -4096,7 +4351,7 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         std::fflush(stderr);
     }
 
-    const int block_star = 128;
+    const int block_star = ResolveSigBlockSize();
     const int grid_star = (total_stars + block_star - 1) / block_star;
     BuildStarPlanetPlansKernel<<<grid_star, block_star, 0, stream>>>(
         d_star_seeds,
@@ -4129,9 +4384,6 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return false;
     }
 
-    bool debug_direct_plan = false;
-    if (const char* dp = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_PLAN"))
-        debug_direct_plan = std::atoi(dp) != 0;
     if (debug_direct_plan && seed_count > 0)
     {
         std::vector<int> h_planet_counts_dbg(static_cast<size_t>(total_stars), 0);
@@ -4241,9 +4493,6 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         return false;
     }
 
-    bool debug_direct_core = false;
-    if (const char* dc = std::getenv("DSP_NATIVE_SIG_DEBUG_DIRECT_CORE"))
-        debug_direct_core = std::atoi(dc) != 0;
     if (debug_direct_core && seed_count > 0)
     {
         std::vector<int> h_planet_counts_dbg(static_cast<size_t>(total_stars), 0);
@@ -4578,20 +4827,20 @@ inline bool TryEvalThemeVeinHashGpuDirectFromPose(
         d_planet_core_num14,
         d_planet_core_rand1,
         theme_count,
-        d_theme_ids,
-        d_theme_planet_types,
-        d_theme_temperatures,
-        d_theme_distributes,
-        d_theme_water_item_ids,
-        d_theme_vein_spot_offsets,
-        d_theme_vein_spot_values,
-        d_theme_rare_vein_offsets,
-        d_theme_rare_vein_values,
-        d_theme_rare_settings_offsets,
-        d_theme_rare_settings_values,
+        theme_cache->d_theme_ids,
+        theme_cache->d_theme_planet_types,
+        theme_cache->d_theme_temperatures,
+        theme_cache->d_theme_distributes,
+        theme_cache->d_theme_water_item_ids,
+        theme_cache->d_theme_vein_spot_offsets,
+        theme_cache->d_theme_vein_spot_values,
+        theme_cache->d_theme_rare_vein_offsets,
+        theme_cache->d_theme_rare_vein_values,
+        theme_cache->d_theme_rare_settings_offsets,
+        theme_cache->d_theme_rare_settings_values,
         max_planet_type,
-        d_type_theme_offsets,
-        d_type_theme_values,
+        theme_cache->d_type_theme_offsets,
+        theme_cache->d_type_theme_values,
         d_out_galaxy_sigs,
         d_out_planet_sigs,
         d_out_vein_sigs,
@@ -4685,19 +4934,7 @@ inline bool TryEvalThemeVeinHashGpu(
     double* d_planet_core_num13 = nullptr;
     double* d_planet_core_num14 = nullptr;
     double* d_planet_core_rand1 = nullptr;
-    int* d_theme_ids = nullptr;
-    int* d_theme_planet_types = nullptr;
-    float* d_theme_temperatures = nullptr;
-    int* d_theme_distributes = nullptr;
-    int* d_theme_water_item_ids = nullptr;
-    int* d_theme_vein_spot_offsets = nullptr;
-    int* d_theme_vein_spot_values = nullptr;
-    int* d_theme_rare_vein_offsets = nullptr;
-    int* d_theme_rare_vein_values = nullptr;
-    int* d_theme_rare_settings_offsets = nullptr;
-    float* d_theme_rare_settings_values = nullptr;
-    int* d_type_theme_offsets = nullptr;
-    int* d_type_theme_values = nullptr;
+    const ThemeDeviceCacheEntry* theme_cache = nullptr;
     unsigned long long* d_out_galaxy_sigs = nullptr;
     unsigned long long* d_out_planet_sigs = nullptr;
     unsigned long long* d_out_vein_sigs = nullptr;
@@ -4715,19 +4952,6 @@ inline bool TryEvalThemeVeinHashGpu(
         cudaFree(d_out_vein_sigs);
         cudaFree(d_out_planet_sigs);
         cudaFree(d_out_galaxy_sigs);
-        cudaFree(d_type_theme_values);
-        cudaFree(d_type_theme_offsets);
-        cudaFree(d_theme_rare_settings_values);
-        cudaFree(d_theme_rare_settings_offsets);
-        cudaFree(d_theme_rare_vein_values);
-        cudaFree(d_theme_rare_vein_offsets);
-        cudaFree(d_theme_vein_spot_values);
-        cudaFree(d_theme_vein_spot_offsets);
-        cudaFree(d_theme_water_item_ids);
-        cudaFree(d_theme_distributes);
-        cudaFree(d_theme_temperatures);
-        cudaFree(d_theme_planet_types);
-        cudaFree(d_theme_ids);
         cudaFree(d_planet_core_rand1);
         cudaFree(d_planet_core_num14);
         cudaFree(d_planet_core_num13);
@@ -4751,8 +4975,6 @@ inline bool TryEvalThemeVeinHashGpu(
         cudaFree(d_star_ids);
         cudaFree(d_star_planet_offsets);
         cudaFree(d_seed_star_offsets);
-        if (stream != nullptr)
-            cudaStreamDestroy(stream);
     };
 
     auto alloc_int = [&](int** p, size_t count) -> bool {
@@ -4786,13 +5008,29 @@ inline bool TryEvalThemeVeinHashGpu(
             return true;
         return cudaMemcpyAsync(dst, src.data(), src.size() * sizeof(double), cudaMemcpyHostToDevice, stream) == cudaSuccess;
     };
-    auto h2d_raw = [&](void* dst, const void* src, size_t bytes) -> bool {
-        if (bytes == 0)
-            return true;
-        return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream) == cudaSuccess;
-    };
-
-    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+    if (!AcquireSigThreadStream(device_id, &stream))
+    {
+        cleanup();
+        return false;
+    }
+    if (!EnsureThemeDeviceCache(
+            device_id,
+            theme_count,
+            max_planet_type,
+            theme_ids,
+            theme_planet_types,
+            theme_temperatures,
+            theme_distributes,
+            theme_water_item_ids,
+            theme_vein_spot_offsets,
+            theme_vein_spot_values,
+            theme_rare_vein_offsets,
+            theme_rare_vein_values,
+            theme_rare_settings_offsets,
+            theme_rare_settings_values,
+            type_theme_offsets,
+            type_theme_values,
+            &theme_cache))
     {
         cleanup();
         return false;
@@ -4821,19 +5059,6 @@ inline bool TryEvalThemeVeinHashGpu(
         !alloc_double(&d_planet_core_num13, flat.planet_core_num13.size()) ||
         !alloc_double(&d_planet_core_num14, flat.planet_core_num14.size()) ||
         !alloc_double(&d_planet_core_rand1, flat.planet_core_rand1.size()) ||
-        !alloc_int(&d_theme_ids, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_planet_types, static_cast<size_t>(theme_count)) ||
-        !alloc_float(&d_theme_temperatures, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_distributes, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_water_item_ids, static_cast<size_t>(theme_count)) ||
-        !alloc_int(&d_theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_int(&d_theme_vein_spot_values, static_cast<size_t>(theme_vein_spot_offsets[theme_count])) ||
-        !alloc_int(&d_theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_int(&d_theme_rare_vein_values, static_cast<size_t>(theme_rare_vein_offsets[theme_count])) ||
-        !alloc_int(&d_theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1)) ||
-        !alloc_float(&d_theme_rare_settings_values, static_cast<size_t>(theme_rare_settings_offsets[theme_count])) ||
-        !alloc_int(&d_type_theme_offsets, type_theme_offsets.size()) ||
-        !alloc_int(&d_type_theme_values, type_theme_values.size()) ||
         !alloc_u64(&d_out_galaxy_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_planet_sigs, static_cast<size_t>(seed_count)) ||
         !alloc_u64(&d_out_vein_sigs, static_cast<size_t>(seed_count)) ||
@@ -4846,9 +5071,6 @@ inline bool TryEvalThemeVeinHashGpu(
         return false;
     }
 
-    const int theme_vein_total = theme_vein_spot_offsets[theme_count];
-    const int theme_rare_total = theme_rare_vein_offsets[theme_count];
-    const int theme_settings_total = theme_rare_settings_offsets[theme_count];
     if (!h2d_int(d_seed_star_offsets, flat.seed_star_offsets) ||
         !h2d_int(d_star_planet_offsets, flat.star_planet_offsets) ||
         !h2d_int(d_star_ids, flat.star_ids) ||
@@ -4871,26 +5093,13 @@ inline bool TryEvalThemeVeinHashGpu(
         !h2d_float(d_planet_core_temperature_bias, flat.planet_core_temperature_bias) ||
         !h2d_double(d_planet_core_num13, flat.planet_core_num13) ||
         !h2d_double(d_planet_core_num14, flat.planet_core_num14) ||
-        !h2d_double(d_planet_core_rand1, flat.planet_core_rand1) ||
-        !h2d_raw(d_theme_ids, theme_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_planet_types, theme_planet_types, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_temperatures, theme_temperatures, static_cast<size_t>(theme_count) * sizeof(float)) ||
-        !h2d_raw(d_theme_distributes, theme_distributes, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_water_item_ids, theme_water_item_ids, static_cast<size_t>(theme_count) * sizeof(int)) ||
-        !h2d_raw(d_theme_vein_spot_offsets, theme_vein_spot_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_vein_spot_values, theme_vein_spot_values, static_cast<size_t>(theme_vein_total) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_vein_offsets, theme_rare_vein_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_vein_values, theme_rare_vein_values, static_cast<size_t>(theme_rare_total) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_settings_offsets, theme_rare_settings_offsets, static_cast<size_t>(theme_count + 1) * sizeof(int)) ||
-        !h2d_raw(d_theme_rare_settings_values, theme_rare_settings_values, static_cast<size_t>(theme_settings_total) * sizeof(float)) ||
-        !h2d_int(d_type_theme_offsets, type_theme_offsets) ||
-        !h2d_int(d_type_theme_values, type_theme_values))
+        !h2d_double(d_planet_core_rand1, flat.planet_core_rand1))
     {
         cleanup();
         return false;
     }
 
-    const int block = 128;
+    const int block = ResolveSigBlockSize();
     const int grid = (seed_count + block - 1) / block;
     if (out_debug_theme_indexes != nullptr)
     {
@@ -4944,20 +5153,20 @@ inline bool TryEvalThemeVeinHashGpu(
         d_planet_core_num14,
         d_planet_core_rand1,
         theme_count,
-        d_theme_ids,
-        d_theme_planet_types,
-        d_theme_temperatures,
-        d_theme_distributes,
-        d_theme_water_item_ids,
-        d_theme_vein_spot_offsets,
-        d_theme_vein_spot_values,
-        d_theme_rare_vein_offsets,
-        d_theme_rare_vein_values,
-        d_theme_rare_settings_offsets,
-        d_theme_rare_settings_values,
+        theme_cache->d_theme_ids,
+        theme_cache->d_theme_planet_types,
+        theme_cache->d_theme_temperatures,
+        theme_cache->d_theme_distributes,
+        theme_cache->d_theme_water_item_ids,
+        theme_cache->d_theme_vein_spot_offsets,
+        theme_cache->d_theme_vein_spot_values,
+        theme_cache->d_theme_rare_vein_offsets,
+        theme_cache->d_theme_rare_vein_values,
+        theme_cache->d_theme_rare_settings_offsets,
+        theme_cache->d_theme_rare_settings_values,
         max_planet_type,
-        d_type_theme_offsets,
-        d_type_theme_values,
+        theme_cache->d_type_theme_offsets,
+        theme_cache->d_type_theme_values,
         d_out_galaxy_sigs,
         d_out_planet_sigs,
         d_out_vein_sigs,
@@ -5031,6 +5240,24 @@ inline int ResolveGroupSize(int seed_count, int star_count, int iter_count)
     if (v < 1)
         v = 1;
     return v;
+}
+
+inline int ResolveSigBlockSize()
+{
+    const char* env = std::getenv("DSP_NATIVE_SIG_BLOCK_SIZE");
+    if (env != nullptr && env[0] != '\0')
+    {
+        int v = std::atoi(env);
+        if (v < 64)
+            v = 64;
+        if (v > 512)
+            v = 512;
+        v = (v / 32) * 32;
+        if (v < 32)
+            v = 32;
+        return v;
+    }
+    return 256;
 }
 } // namespace
 
@@ -5267,13 +5494,64 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     bool debug_theme_compare = false;
     if (const char* dc = std::getenv("DSP_NATIVE_SIG_DEBUG_THEME_COMPARE"))
         debug_theme_compare = std::atoi(dc) != 0;
+    struct PoseFastBuffer
+    {
+        int device_id = -1;
+        dsp_vec3d_t* ptr = nullptr;
+        size_t cap = 0;
+
+        ~PoseFastBuffer()
+        {
+            if (ptr != nullptr)
+            {
+                if (device_id >= 0)
+                    cudaSetDevice(device_id);
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        }
+
+        bool Ensure(int dev, size_t count)
+        {
+            if (count == 0)
+                count = 1;
+            if (ptr != nullptr && device_id != dev)
+            {
+                if (device_id >= 0)
+                    cudaSetDevice(device_id);
+                cudaFree(ptr);
+                ptr = nullptr;
+                cap = 0;
+            }
+            if (ptr != nullptr && cap >= count)
+                return true;
+            if (dev >= 0 && cudaSetDevice(dev) != cudaSuccess)
+                return false;
+            if (ptr != nullptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+                cap = 0;
+            }
+            if (cudaMalloc(reinterpret_cast<void**>(&ptr), count * sizeof(dsp_vec3d_t)) != cudaSuccess)
+                return false;
+            cap = count;
+            device_id = dev;
+            return true;
+        }
+    } pose_fast_buffer;
 
     for (int group_base = 0; group_base < seed_count; group_base += group_cap)
     {
         int group_count = std::min(group_cap, seed_count - group_base);
         std::vector<int> pose_seeds(group_count);
         std::vector<int> pose_raw_counts(group_count, 0);
-        std::vector<dsp_vec3d_t> pose_raw(static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count));
+        const bool gpu_sig_direct_pose_path =
+            use_gpu_pose_direct && use_gpu_seedbuild_plan && use_gpu_theme_vein_hash && trust_gpu_theme_vein_hash && !debug_theme_compare;
+        bool use_pose_device_fast = gpu_sig_direct_pose_path && speed_only;
+        std::vector<dsp_vec3d_t> pose_raw;
+        if (!use_pose_device_fast)
+            pose_raw.resize(static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count));
 
         for (int gi = 0; gi < group_count; ++gi)
         {
@@ -5281,26 +5559,10 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             pose_seeds[gi] = rng.Next();
         }
 
-        double stage0 = stage_timing ? now_ms() : 0.0;
-        int rc = dsp_cuda_generate_temp_poses_params_fp64_batch_head(
-            pose_seeds.data(),
-            group_count,
-            max_pose_count,
-            pose_copy_count,
-            iter_count,
-            2.0,
-            2.3,
-            3.5,
-            0.18,
-            collision_fp64,
-            cuda_device_id,
-            pose_raw.data(),
-            pose_copy_count,
-            pose_raw_counts.data());
-        if (stage_timing)
-            stage_pose_ms += now_ms() - stage0;
-        if (stage_timing)
-        {
+        dsp_vec3d_t* d_pose_raw_fast = nullptr;
+        auto collect_pose_timing = [&]() {
+            if (!stage_timing)
+                return;
             dsp_cuda_pose_batch_head_timing_t pose_timing{};
             if (dsp_cuda_get_last_pose_batch_head_timing(&pose_timing) == DSP_CUDA_OK)
             {
@@ -5323,7 +5585,53 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 stage_pose_d2h_head_sync_wait_ms += pose_timing.d2h_head_sync_wait_ms;
                 stage_pose_d2h_head_bytes_mb += pose_timing.d2h_head_bytes_mb;
             }
-        }
+        };
+        auto run_pose_host = [&]() -> int {
+            if (pose_raw.size() != static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count))
+                pose_raw.resize(static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count));
+            return dsp_cuda_generate_temp_poses_params_fp64_batch_head(
+                pose_seeds.data(),
+                group_count,
+                max_pose_count,
+                pose_copy_count,
+                iter_count,
+                2.0,
+                2.3,
+                3.5,
+                0.18,
+                collision_fp64,
+                cuda_device_id,
+                pose_raw.data(),
+                pose_copy_count,
+                pose_raw_counts.data());
+        };
+        auto run_pose_device = [&]() -> int {
+            const size_t pose_n = static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count);
+            if (!pose_fast_buffer.Ensure(cuda_device_id, pose_n))
+                return DSP_CUDA_ERR_CUDA;
+            d_pose_raw_fast = pose_fast_buffer.ptr;
+            return dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
+                pose_seeds.data(),
+                group_count,
+                max_pose_count,
+                pose_copy_count,
+                iter_count,
+                2.0,
+                2.3,
+                3.5,
+                0.18,
+                collision_fp64,
+                cuda_device_id,
+                d_pose_raw_fast,
+                pose_copy_count,
+                pose_raw_counts.data());
+        };
+
+        double stage0 = stage_timing ? now_ms() : 0.0;
+        int rc = use_pose_device_fast ? run_pose_device() : run_pose_host();
+        if (stage_timing)
+            stage_pose_ms += now_ms() - stage0;
+        collect_pose_timing();
         if (rc != DSP_CUDA_OK)
         {
             if (stage_timing || debug_dump || debug_enter)
@@ -5334,8 +5642,6 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             return rc;
         }
 
-        const bool gpu_sig_direct_pose_path =
-            use_gpu_pose_direct && use_gpu_seedbuild_plan && use_gpu_theme_vein_hash && trust_gpu_theme_vein_hash && !debug_theme_compare;
         if (gpu_sig_direct_pose_path)
         {
             double t_direct_begin = stage_timing ? now_ms() : 0.0;
@@ -5348,6 +5654,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 iter_count,
                 pose_raw_counts,
                 pose_raw,
+                use_pose_device_fast ? d_pose_raw_fast : nullptr,
                 vein_len,
                 use_fp32_prob_compare,
                 star_type_white_dwarf,
@@ -5368,6 +5675,7 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 theme_rare_settings_values,
                 type_theme_offsets,
                 type_theme_values,
+                speed_only,
                 out_galaxy_sigs + group_base,
                 out_planet_sigs + group_base,
                 out_vein_sigs + group_base,
@@ -5380,6 +5688,24 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             }
             if (direct_ok)
                 continue;
+            if (use_pose_device_fast)
+            {
+                use_pose_device_fast = false;
+                stage0 = stage_timing ? now_ms() : 0.0;
+                rc = run_pose_host();
+                if (stage_timing)
+                    stage_pose_ms += now_ms() - stage0;
+                collect_pose_timing();
+                if (rc != DSP_CUDA_OK)
+                {
+                    if (stage_timing || debug_dump || debug_enter)
+                    {
+                        std::fprintf(stderr, "[native-sig-error] pose-batch-fallback rc=%d group_count=%d max_pose_count=%d\n", rc, group_count, max_pose_count);
+                        std::fflush(stderr);
+                    }
+                    return rc;
+                }
+            }
             if (stage_timing || debug_dump || debug_enter)
             {
                 std::fprintf(stderr, "[native-sig-info] direct-pose-gpu path fallback-to-host group_count=%d\n", group_count);
