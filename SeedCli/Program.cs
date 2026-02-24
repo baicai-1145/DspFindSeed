@@ -907,12 +907,24 @@ namespace SeedCli
             long tMixStart = (timingDebug || mixSpeedOnly) ? Stopwatch.GetTimestamp() : 0;
             bool prevSkipNameGeneration = global::DspFindSeed.StarGen.SkipNameGeneration;
             string prevNativeSpeedOnly = null;
+            string prevNativePoseDirect = null;
+            string prevNativeThemeExperimental = null;
+            string prevNativeThemeTrust = null;
+            string prevNativeThemeUnsafe = null;
             MixRuntimeFlags.SignatureOnlyFastPath = true;
             global::DspFindSeed.StarGen.SkipNameGeneration = true;
             if (mixSpeedOnly)
             {
                 prevNativeSpeedOnly = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY");
+                prevNativePoseDirect = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_GPU_POSE_DIRECT");
+                prevNativeThemeExperimental = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_EXPERIMENTAL");
+                prevNativeThemeTrust = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST");
+                prevNativeThemeUnsafe = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE");
                 Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY", "1");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_POSE_DIRECT", "1");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_EXPERIMENTAL", "1");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST", "1");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE", "1");
             }
             try
             {
@@ -1128,9 +1140,15 @@ namespace SeedCli
                 nativeInFlightLimit = gpuStreams < 1 ? 1 : gpuStreams;
                 int envNativeInFlight = GetIntEnv("DSP_MIX_NATIVE_INFLIGHT", 0);
                 if (envNativeInFlight > 0)
+                {
                     nativeInFlightLimit = envNativeInFlight;
+                }
                 else
+                {
                     nativeInFlightLimit = nativeInFlightLimit * 2;
+                    if (nativeInFlightLimit > 20)
+                        nativeInFlightLimit = 20;
+                }
                 if (nativeInFlightLimit < 2)
                     nativeInFlightLimit = 2;
                 var nativeInFlight = new List<Task<NativeSeedSigChunkResult>>(nativeInFlightLimit);
@@ -1200,7 +1218,13 @@ namespace SeedCli
             finally
             {
                 if (mixSpeedOnly)
+                {
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY", prevNativeSpeedOnly);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_POSE_DIRECT", prevNativePoseDirect);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_EXPERIMENTAL", prevNativeThemeExperimental);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST", prevNativeThemeTrust);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE", prevNativeThemeUnsafe);
+                }
                 global::DspFindSeed.StarGen.SkipNameGeneration = prevSkipNameGeneration;
                 MixRuntimeFlags.SignatureOnlyFastPath = false;
             }
