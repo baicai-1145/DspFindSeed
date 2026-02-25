@@ -12,6 +12,17 @@ namespace SeedCli
 {
     internal static class Program
     {
+        private enum TimingDebugMode
+        {
+            None = 0,
+            All = 1,
+            Overall = 2,
+            Gpu = 3,
+            Pose = 4,
+            PoseGenK = 5,
+            Residual = 6
+        }
+
         // 用法示例：
         //   SeedCli.exe --seed 12345678 --stars 64
         //   SeedCli.exe --seed 12345678 --stars 32 --resource 1
@@ -58,7 +69,7 @@ namespace SeedCli
             int planetId = GetIntArg(args, "--planet-id", 0);
             string cpuCacheFile = GetStringArg(args, "--cpu-cache-file", null);
             bool noCpuCache = HasFlag(args, "--no-cpu-cache");
-            bool timingDebug = HasFlag(args, "--timing-debug");
+            TimingDebugMode timingDebugMode = ResolveTimingDebugMode(args);
 
             if (seed <= 0)
             {
@@ -76,7 +87,7 @@ namespace SeedCli
                 Console.WriteLine("Mix 行星 core 分组大小：追加 --mix-core-group-seeds <N>（默认 0=自动按 chunk 大小）");
                 Console.WriteLine("GPU 流数量：追加 --gpu-streams <N>（用于 native seed 签名双缓冲/多流并发，默认 1）");
                 Console.WriteLine("兼容别名：--batch-per-thread / --seed-batch-size 仅用于推导 gpu-chunk-seeds（当未显式设置 --gpu-chunk-seeds）");
-                Console.WriteLine("耗时统计：追加 --timing-debug（打印各阶段耗时与 native 调用统计）");
+                Console.WriteLine("耗时统计：追加 --timing-debug [all|overall|gpu|pose|posegenk|residual]（默认 all）");
                 Console.WriteLine("CPU FP64 缓存文件：追加 --cpu-cache-file <路径>（默认 logs/cpu_fp64_cache 自动命名）");
                 Console.WriteLine("禁用 CPU FP64 缓存：追加 --no-cpu-cache");
                 Console.WriteLine("Mix 路线强制星系碰撞 FP64：追加 --mix-collision-fp64");
@@ -140,7 +151,7 @@ namespace SeedCli
                         gpuStreams: gpuStreams,
                         mixCoreGroupSeeds: mixCoreGroupSeeds,
                         mixSpeedOnly: mixSpeedOnly,
-                        timingDebug: timingDebug,
+                        timingDebugMode: timingDebugMode,
                         cpuCacheFile: cpuCacheFile,
                         useCpuCache: !noCpuCache);
                 }
@@ -764,7 +775,7 @@ namespace SeedCli
             int gpuStreams,
             int mixCoreGroupSeeds,
             bool mixSpeedOnly,
-            bool timingDebug,
+            TimingDebugMode timingDebugMode,
             string cpuCacheFile,
             bool useCpuCache)
         {
@@ -805,9 +816,24 @@ namespace SeedCli
             int mixChunkCount = 0;
             long mixChunkSeedTotal = 0;
 
-            if (timingDebug)
+            bool timingAny = timingDebugMode != TimingDebugMode.None;
+            bool timingManaged = timingDebugMode == TimingDebugMode.All
+                || timingDebugMode == TimingDebugMode.Overall
+                || timingDebugMode == TimingDebugMode.Gpu;
+            bool timingNeedCudaPerf = timingDebugMode == TimingDebugMode.All
+                || timingDebugMode == TimingDebugMode.Gpu;
+            bool timingNeedNativeStage = timingDebugMode == TimingDebugMode.All
+                || timingDebugMode == TimingDebugMode.Pose
+                || timingDebugMode == TimingDebugMode.PoseGenK
+                || timingDebugMode == TimingDebugMode.Residual;
+            bool timingDebug = timingManaged;
+
+            if (timingManaged)
             {
                 tAllStart = Stopwatch.GetTimestamp();
+            }
+            if (timingNeedCudaPerf)
+            {
                 CudaGalaxyNative.ResetPerfStats();
                 CudaPlanetNative.ResetPerfStats();
             }
@@ -911,8 +937,31 @@ namespace SeedCli
             string prevNativeThemeExperimental = null;
             string prevNativeThemeTrust = null;
             string prevNativeThemeUnsafe = null;
+            string prevNativeStageTiming = null;
+            string prevNativeOpTiming = null;
+            string prevNativeTimingMode = null;
+            bool nativeTimingConfigured = false;
             MixRuntimeFlags.SignatureOnlyFastPath = true;
             global::DspFindSeed.StarGen.SkipNameGeneration = true;
+            if (timingAny)
+            {
+                prevNativeStageTiming = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_STAGE_TIMING");
+                prevNativeOpTiming = Environment.GetEnvironmentVariable("DSP_NATIVE_OP_TIMING");
+                prevNativeTimingMode = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_TIMING_MODE");
+                if (timingNeedNativeStage)
+                {
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_STAGE_TIMING", "1");
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_OP_TIMING", "1");
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_TIMING_MODE", ToNativeTimingMode(timingDebugMode));
+                }
+                else
+                {
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_STAGE_TIMING", "0");
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_OP_TIMING", "0");
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_TIMING_MODE", null);
+                }
+                nativeTimingConfigured = true;
+            }
             if (mixSpeedOnly)
             {
                 prevNativeSpeedOnly = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_SPEED_ONLY");
@@ -1225,10 +1274,16 @@ namespace SeedCli
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST", prevNativeThemeTrust);
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE", prevNativeThemeUnsafe);
                 }
+                if (nativeTimingConfigured)
+                {
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_STAGE_TIMING", prevNativeStageTiming);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_OP_TIMING", prevNativeOpTiming);
+                    Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_TIMING_MODE", prevNativeTimingMode);
+                }
                 global::DspFindSeed.StarGen.SkipNameGeneration = prevSkipNameGeneration;
                 MixRuntimeFlags.SignatureOnlyFastPath = false;
             }
-            if (timingDebug || mixSpeedOnly)
+            if (timingManaged || mixSpeedOnly)
                 tMixTotal += Stopwatch.GetTimestamp() - tMixStart;
 
             var label = useFp32Veins ? "compare-pipeline-mix-veins-f32" : "compare-pipeline-mix";
@@ -1267,22 +1322,32 @@ namespace SeedCli
                 Console.WriteLine($"pipelineMismatch={mismatchPipeline}/{total} ({(total > 0 ? (mismatchPipeline * 100.0 / total) : 0):F6}%)");
                 Console.WriteLine("说明：先全量生成 CPU FP64 签名（可缓存复用），再全量生成 Mix 并对比。");
             }
-            if (timingDebug)
+            if (timingAny)
             {
                 double Ms(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
-                var cudaGalaxyPerf = CudaGalaxyNative.GetPerfStats();
-                var cudaPlanetPerf = CudaPlanetNative.GetPerfStats();
-                long tAll = Stopwatch.GetTimestamp() - tAllStart;
-                Console.WriteLine("timingDebug=True");
-                Console.WriteLine($"timing.totalMs={Ms(tAll):F3}");
-                Console.WriteLine($"timing.cacheLoadMs={Ms(tCacheLoad):F3} cpuGenMs={Ms(tCpuGen):F3} cacheSaveMs={Ms(tCacheSave):F3}");
-                Console.WriteLine($"timing.mixTotalMs={Ms(tMixTotal):F3} chunkSubmitMs={Ms(tMixChunkSubmit):F3} prefetchMs={Ms(tMixPrefetch):F3} createGalaxyMs={Ms(tMixCreateGalaxy):F3} veinBatchMs={Ms(tMixVeinBatch):F3} compareMs={Ms(tMixCompare):F3} detailMs={Ms(tMixDetail):F3}");
-                Console.WriteLine($"timing.cudaGalaxy.singleCalls={cudaGalaxyPerf.singleCalls} singleMs={cudaGalaxyPerf.singleMs:F3} batchCalls={cudaGalaxyPerf.batchCalls} batchSeeds={cudaGalaxyPerf.batchSeeds} batchMs={cudaGalaxyPerf.batchMs:F3} fail={cudaGalaxyPerf.failCalls}");
-                Console.WriteLine($"timing.cudaGalaxy.mixSeedSigCalls={cudaGalaxyPerf.mixSeedSigCalls} mixSeedSigSeeds={cudaGalaxyPerf.mixSeedSigSeeds} mixSeedSigMs={cudaGalaxyPerf.mixSeedSigMs:F3} mixSeedSigFail={cudaGalaxyPerf.mixSeedSigFailCalls}");
-                Console.WriteLine($"timing.cudaPlanet.coreReq={cudaPlanetPerf.coreReqCount} coreReqWaitMs={cudaPlanetPerf.coreReqWaitMs:F3} coreBatchCalls={cudaPlanetPerf.coreBatchCalls} coreBatchItems={cudaPlanetPerf.coreBatchItems} coreBatchMs={cudaPlanetPerf.coreBatchMs:F3} coreBatchFallback={cudaPlanetPerf.coreBatchFallbackCalls} coreSingleCalls={cudaPlanetPerf.coreSingleCalls} coreSingleMs={cudaPlanetPerf.coreSingleMs:F3}");
-                Console.WriteLine($"timing.cudaPlanet.veinBatchCalls={cudaPlanetPerf.veinBatchCalls} veinBatchPlanets={cudaPlanetPerf.veinBatchPlanets} veinBatchMs={cudaPlanetPerf.veinBatchMs:F3} fail={cudaPlanetPerf.veinBatchFailCalls}");
-                double gpuApproxMs = cudaGalaxyPerf.singleMs + cudaGalaxyPerf.batchMs + cudaGalaxyPerf.mixSeedSigMs + cudaPlanetPerf.coreBatchMs + cudaPlanetPerf.coreSingleMs + cudaPlanetPerf.veinBatchMs;
-                Console.WriteLine($"timing.gpuApproxMs={gpuApproxMs:F3} timing.gpuFallbackApprox={cudaGalaxyPerf.failCalls + cudaGalaxyPerf.mixSeedSigFailCalls + cudaPlanetPerf.veinBatchFailCalls + cudaPlanetPerf.coreBatchFallbackCalls}");
+                Console.WriteLine($"timingDebugMode={TimingDebugModeToString(timingDebugMode)}");
+                if (timingDebugMode == TimingDebugMode.All || timingDebugMode == TimingDebugMode.Overall)
+                {
+                    long tAll = Stopwatch.GetTimestamp() - tAllStart;
+                    Console.WriteLine($"timing.totalMs={Ms(tAll):F3}");
+                    Console.WriteLine($"timing.cacheLoadMs={Ms(tCacheLoad):F3} cpuGenMs={Ms(tCpuGen):F3} cacheSaveMs={Ms(tCacheSave):F3}");
+                    Console.WriteLine($"timing.mixTotalMs={Ms(tMixTotal):F3} chunkSubmitMs={Ms(tMixChunkSubmit):F3} prefetchMs={Ms(tMixPrefetch):F3} createGalaxyMs={Ms(tMixCreateGalaxy):F3} veinBatchMs={Ms(tMixVeinBatch):F3} compareMs={Ms(tMixCompare):F3} detailMs={Ms(tMixDetail):F3}");
+                }
+                if (timingDebugMode == TimingDebugMode.All || timingDebugMode == TimingDebugMode.Gpu)
+                {
+                    var cudaGalaxyPerf = CudaGalaxyNative.GetPerfStats();
+                    var cudaPlanetPerf = CudaPlanetNative.GetPerfStats();
+                    Console.WriteLine($"timing.cudaGalaxy.singleCalls={cudaGalaxyPerf.singleCalls} singleMs={cudaGalaxyPerf.singleMs:F3} batchCalls={cudaGalaxyPerf.batchCalls} batchSeeds={cudaGalaxyPerf.batchSeeds} batchMs={cudaGalaxyPerf.batchMs:F3} fail={cudaGalaxyPerf.failCalls}");
+                    Console.WriteLine($"timing.cudaGalaxy.mixSeedSigCalls={cudaGalaxyPerf.mixSeedSigCalls} mixSeedSigSeeds={cudaGalaxyPerf.mixSeedSigSeeds} mixSeedSigMs={cudaGalaxyPerf.mixSeedSigMs:F3} mixSeedSigFail={cudaGalaxyPerf.mixSeedSigFailCalls}");
+                    Console.WriteLine($"timing.cudaPlanet.coreReq={cudaPlanetPerf.coreReqCount} coreReqWaitMs={cudaPlanetPerf.coreReqWaitMs:F3} coreBatchCalls={cudaPlanetPerf.coreBatchCalls} coreBatchItems={cudaPlanetPerf.coreBatchItems} coreBatchMs={cudaPlanetPerf.coreBatchMs:F3} coreBatchFallback={cudaPlanetPerf.coreBatchFallbackCalls} coreSingleCalls={cudaPlanetPerf.coreSingleCalls} coreSingleMs={cudaPlanetPerf.coreSingleMs:F3}");
+                    Console.WriteLine($"timing.cudaPlanet.veinBatchCalls={cudaPlanetPerf.veinBatchCalls} veinBatchPlanets={cudaPlanetPerf.veinBatchPlanets} veinBatchMs={cudaPlanetPerf.veinBatchMs:F3} fail={cudaPlanetPerf.veinBatchFailCalls}");
+                    double gpuApproxMs = cudaGalaxyPerf.singleMs + cudaGalaxyPerf.batchMs + cudaGalaxyPerf.mixSeedSigMs + cudaPlanetPerf.coreBatchMs + cudaPlanetPerf.coreSingleMs + cudaPlanetPerf.veinBatchMs;
+                    Console.WriteLine($"timing.gpuApproxMs={gpuApproxMs:F3} timing.gpuFallbackApprox={cudaGalaxyPerf.failCalls + cudaGalaxyPerf.mixSeedSigFailCalls + cudaPlanetPerf.veinBatchFailCalls + cudaPlanetPerf.coreBatchFallbackCalls}");
+                }
+                if (timingDebugMode == TimingDebugMode.Pose || timingDebugMode == TimingDebugMode.PoseGenK || timingDebugMode == TimingDebugMode.Residual)
+                {
+                    Console.WriteLine("timing.nativePoseOnly=1 (详细项由 native 输出 [native-sig-*] 行)");
+                }
             }
         }
 
@@ -2422,6 +2487,75 @@ namespace SeedCli
             return defaultValue;
         }
 
+        private static TimingDebugMode ResolveTimingDebugMode(string[] args)
+        {
+            if (!TryGetOptionalArgValue(args, "--timing-debug", out string raw))
+                return TimingDebugMode.None;
+            if (string.IsNullOrEmpty(raw))
+                return TimingDebugMode.All;
+            string v = raw.Trim().ToLowerInvariant();
+            switch (v)
+            {
+                case "all":
+                case "full":
+                    return TimingDebugMode.All;
+                case "overall":
+                case "total":
+                    return TimingDebugMode.Overall;
+                case "gpu":
+                    return TimingDebugMode.Gpu;
+                case "pose":
+                    return TimingDebugMode.Pose;
+                case "posegenk":
+                case "pose-genk":
+                case "genk":
+                    return TimingDebugMode.PoseGenK;
+                case "residual":
+                    return TimingDebugMode.Residual;
+                default:
+                    Console.WriteLine($"未知 --timing-debug 模式：{raw}，回退为 all");
+                    return TimingDebugMode.All;
+            }
+        }
+
+        private static string TimingDebugModeToString(TimingDebugMode mode)
+        {
+            switch (mode)
+            {
+                case TimingDebugMode.All:
+                    return "all";
+                case TimingDebugMode.Overall:
+                    return "overall";
+                case TimingDebugMode.Gpu:
+                    return "gpu";
+                case TimingDebugMode.Pose:
+                    return "pose";
+                case TimingDebugMode.PoseGenK:
+                    return "posegenk";
+                case TimingDebugMode.Residual:
+                    return "residual";
+                default:
+                    return "none";
+            }
+        }
+
+        private static string ToNativeTimingMode(TimingDebugMode mode)
+        {
+            switch (mode)
+            {
+                case TimingDebugMode.Pose:
+                    return "pose";
+                case TimingDebugMode.PoseGenK:
+                    return "posegenk";
+                case TimingDebugMode.Residual:
+                    return "residual";
+                case TimingDebugMode.All:
+                    return "full";
+                default:
+                    return "full";
+            }
+        }
+
         private static string GetStringArg(string[] args, string key, string defaultValue)
         {
             for (int i = 0; i < args.Length; i++)
@@ -2433,6 +2567,31 @@ namespace SeedCli
                 return args[i + 1];
             }
             return defaultValue;
+        }
+
+        private static bool TryGetOptionalArgValue(string[] args, string key, out string value)
+        {
+            value = null;
+            if (args == null || args.Length == 0 || string.IsNullOrEmpty(key))
+                return false;
+            string prefix = key + "=";
+            for (int i = 0; i < args.Length; i++)
+            {
+                string arg = args[i];
+                if (arg == null)
+                    continue;
+                if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    value = arg.Substring(prefix.Length);
+                    return true;
+                }
+                if (!string.Equals(arg, key, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    value = args[i + 1];
+                return true;
+            }
+            return false;
         }
 
         private static bool HasFlag(string[] args, string flag)

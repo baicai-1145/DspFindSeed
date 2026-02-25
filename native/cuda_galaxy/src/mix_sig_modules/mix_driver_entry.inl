@@ -154,6 +154,29 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     bool stage_timing = false;
     if (const char* st = std::getenv("DSP_NATIVE_SIG_STAGE_TIMING"))
         stage_timing = std::atoi(st) != 0;
+    enum
+    {
+        kStageTimingModeFull = 0,
+        kStageTimingModePose = 1,
+        kStageTimingModePoseGenK = 2,
+        kStageTimingModeResidual = 3
+    };
+    int stage_timing_mode = kStageTimingModeFull;
+    if (stage_timing)
+    {
+        std::string timing_mode = "full";
+        if (const char* tm = std::getenv("DSP_NATIVE_SIG_TIMING_MODE"))
+        {
+            if (tm[0] != '\0')
+                timing_mode = tm;
+        }
+        if (timing_mode == "pose")
+            stage_timing_mode = kStageTimingModePose;
+        else if (timing_mode == "posegenk")
+            stage_timing_mode = kStageTimingModePoseGenK;
+        else if (timing_mode == "residual")
+            stage_timing_mode = kStageTimingModeResidual;
+    }
     auto now_ms = []() -> double {
         using clock = std::chrono::steady_clock;
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
@@ -1487,6 +1510,11 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     if (stage_timing)
     {
         const double total_ms = now_ms() - stage_total_begin_ms;
+        const double pose_known_ms = stage_pose_h2d_ms + stage_pose_gen_kernel_ms + stage_pose_d2h_counts_ms + stage_pose_gather_kernel_ms + stage_pose_d2h_head_ms;
+        double pose_residual_ms = stage_pose_ms - pose_known_ms;
+        if (pose_residual_ms < 0.0)
+            pose_residual_ms = 0.0;
+        const double pose_residual_pct = stage_pose_ms > 1e-9 ? (pose_residual_ms * 100.0 / stage_pose_ms) : 0.0;
         const double pose_gen_seed_p50_ms =
             (stage_pose_gen_seed_profile_weight > 0.0)
                 ? (stage_pose_gen_seed_p50_ms / stage_pose_gen_seed_profile_weight)
@@ -1503,27 +1531,52 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             (stage_pose_d2h_head_ms > 1e-9)
                 ? (stage_pose_d2h_head_bytes_mb * 1024.0 * 1024.0) / (stage_pose_d2h_head_ms * 1.0e6)
                 : 0.0;
-        std::printf(
-            "[native-sig-timing] seeds=%d stars=%d groupCap=%d totalMs=%.3f "
-            "poseMs=%.3f seedBuildMs=%.3f corePackMs=%.3f coreKernelMs=%.3f coreUnpackMs=%.3f "
-            "themeMs=%.3f veinPackMs=%.3f veinKernelMs=%.3f hashMs=%.3f "
-            "poseH2D=%.3f poseGenK=%.3f poseD2HCounts=%.3f poseGatherK=%.3f poseD2HHead=%.3f "
-            "poseGenPhase1Avg=%.3f poseGenPhase2Avg=%.3f poseGenSeedP50=%.3f poseGenSeedP95=%.3f poseGenSeedMax=%.3f "
-            "poseGenAttempts=%.0f poseGenCollisionRejects=%.0f poseGenSphereRejects=%.0f poseGenGateSkips=%.0f "
-            "poseD2HHeadSubmit=%.3f poseD2HHeadWait=%.3f poseD2HHeadMB=%.3f poseD2HHeadBW=%.3f "
-            "seedBuildHostCtx=%.3f seedBuildHostMerge=%.3f seedBuildGpuCall=%.3f seedBuildFallbackHost=%.3f "
-            "seedBuildH2D=%.3f seedBuildPlanK=%.3f seedBuildCoreK=%.3f seedBuildD2H=%.3f "
-            "seedBuildHostPack=%.3f seedBuildAlloc=%.3f seedBuildScatter=%.3f\n",
-            seed_count, star_count, group_cap, total_ms,
-            stage_pose_ms, stage_seed_build_ms, stage_core_pack_ms, stage_core_kernel_ms, stage_core_unpack_ms,
-            stage_theme_ms, stage_vein_pack_ms, stage_vein_kernel_ms, stage_hash_ms,
-            stage_pose_h2d_ms, stage_pose_gen_kernel_ms, stage_pose_d2h_counts_ms, stage_pose_gather_kernel_ms, stage_pose_d2h_head_ms,
-            pose_gen_phase1_avg_ms, pose_gen_phase2_avg_ms, pose_gen_seed_p50_ms, stage_pose_gen_seed_p95_ms, stage_pose_gen_seed_max_ms,
-            stage_pose_gen_attempts_total, stage_pose_gen_collision_total, stage_pose_gen_sphere_total, stage_pose_gen_gate_total,
-            stage_pose_d2h_head_submit_ms, stage_pose_d2h_head_sync_wait_ms, stage_pose_d2h_head_bytes_mb, pose_d2h_head_bw_gbps,
-            stage_seed_build_host_ctx_ms, stage_seed_build_host_merge_ms, stage_seed_build_gpu_plan_call_ms, stage_seed_build_fallback_host_ms,
-            stage_seed_build_h2d_ms, stage_seed_build_plan_kernel_ms, stage_seed_build_core_kernel_ms, stage_seed_build_d2h_ms,
-            stage_seed_build_host_pack_ms, stage_seed_build_alloc_ms, stage_seed_build_scatter_ms);
+        if (stage_timing_mode == kStageTimingModePose)
+        {
+            std::printf(
+                "[native-sig-pose] seeds=%d stars=%d groupCap=%d totalMs=%.3f poseMs=%.3f "
+                "poseH2D=%.3f poseGenK=%.3f poseD2HCounts=%.3f poseGatherK=%.3f poseD2HHead=%.3f "
+                "poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f\n",
+                seed_count, star_count, group_cap, total_ms, stage_pose_ms,
+                stage_pose_h2d_ms, stage_pose_gen_kernel_ms, stage_pose_d2h_counts_ms, stage_pose_gather_kernel_ms, stage_pose_d2h_head_ms,
+                pose_known_ms, pose_residual_ms, pose_residual_pct);
+        }
+        else if (stage_timing_mode == kStageTimingModePoseGenK)
+        {
+            std::printf(
+                "[native-sig-poseGenK] seeds=%d stars=%d groupCap=%d poseGenK=%.3f\n",
+                seed_count, star_count, group_cap, stage_pose_gen_kernel_ms);
+        }
+        else if (stage_timing_mode == kStageTimingModeResidual)
+        {
+            std::printf(
+                "[native-sig-residual] seeds=%d stars=%d groupCap=%d poseMs=%.3f poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f\n",
+                seed_count, star_count, group_cap, stage_pose_ms, pose_known_ms, pose_residual_ms, pose_residual_pct);
+        }
+        else
+        {
+            std::printf(
+                "[native-sig-timing] seeds=%d stars=%d groupCap=%d totalMs=%.3f "
+                "poseMs=%.3f seedBuildMs=%.3f corePackMs=%.3f coreKernelMs=%.3f coreUnpackMs=%.3f "
+                "themeMs=%.3f veinPackMs=%.3f veinKernelMs=%.3f hashMs=%.3f "
+                "poseH2D=%.3f poseGenK=%.3f poseD2HCounts=%.3f poseGatherK=%.3f poseD2HHead=%.3f "
+                "poseGenPhase1Avg=%.3f poseGenPhase2Avg=%.3f poseGenSeedP50=%.3f poseGenSeedP95=%.3f poseGenSeedMax=%.3f "
+                "poseGenAttempts=%.0f poseGenCollisionRejects=%.0f poseGenSphereRejects=%.0f poseGenGateSkips=%.0f "
+                "poseD2HHeadSubmit=%.3f poseD2HHeadWait=%.3f poseD2HHeadMB=%.3f poseD2HHeadBW=%.3f "
+                "seedBuildHostCtx=%.3f seedBuildHostMerge=%.3f seedBuildGpuCall=%.3f seedBuildFallbackHost=%.3f "
+                "seedBuildH2D=%.3f seedBuildPlanK=%.3f seedBuildCoreK=%.3f seedBuildD2H=%.3f "
+                "seedBuildHostPack=%.3f seedBuildAlloc=%.3f seedBuildScatter=%.3f\n",
+                seed_count, star_count, group_cap, total_ms,
+                stage_pose_ms, stage_seed_build_ms, stage_core_pack_ms, stage_core_kernel_ms, stage_core_unpack_ms,
+                stage_theme_ms, stage_vein_pack_ms, stage_vein_kernel_ms, stage_hash_ms,
+                stage_pose_h2d_ms, stage_pose_gen_kernel_ms, stage_pose_d2h_counts_ms, stage_pose_gather_kernel_ms, stage_pose_d2h_head_ms,
+                pose_gen_phase1_avg_ms, pose_gen_phase2_avg_ms, pose_gen_seed_p50_ms, stage_pose_gen_seed_p95_ms, stage_pose_gen_seed_max_ms,
+                stage_pose_gen_attempts_total, stage_pose_gen_collision_total, stage_pose_gen_sphere_total, stage_pose_gen_gate_total,
+                stage_pose_d2h_head_submit_ms, stage_pose_d2h_head_sync_wait_ms, stage_pose_d2h_head_bytes_mb, pose_d2h_head_bw_gbps,
+                stage_seed_build_host_ctx_ms, stage_seed_build_host_merge_ms, stage_seed_build_gpu_plan_call_ms, stage_seed_build_fallback_host_ms,
+                stage_seed_build_h2d_ms, stage_seed_build_plan_kernel_ms, stage_seed_build_core_kernel_ms, stage_seed_build_d2h_ms,
+                stage_seed_build_host_pack_ms, stage_seed_build_alloc_ms, stage_seed_build_scatter_ms);
+        }
         std::fflush(stdout);
     }
 
