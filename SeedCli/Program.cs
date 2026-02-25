@@ -937,6 +937,7 @@ namespace SeedCli
             string prevNativeThemeExperimental = null;
             string prevNativeThemeTrust = null;
             string prevNativeThemeUnsafe = null;
+            string prevNativeFastBufPoolSlots = null;
             string prevNativeStageTiming = null;
             string prevNativeOpTiming = null;
             string prevNativeTimingMode = null;
@@ -1194,42 +1195,50 @@ namespace SeedCli
                 }
                 else
                 {
-                    nativeInFlightLimit = nativeInFlightLimit * 2;
-                    if (nativeInFlightLimit > 20)
-                        nativeInFlightLimit = 20;
+                    // Auto policy: too high in-flight amplifies CUDA runtime/context contention.
+                    // Keep a conservative default that is faster on current native seed-signature path.
+                    if (nativeInFlightLimit < 2)
+                        nativeInFlightLimit = 2;
+                    if (nativeInFlightLimit > 4)
+                        nativeInFlightLimit = 4;
                 }
                 if (nativeInFlightLimit < 2)
                     nativeInFlightLimit = 2;
-                var nativeInFlight = new List<Task<NativeSeedSigChunkResult>>(nativeInFlightLimit);
+                prevNativeFastBufPoolSlots = Environment.GetEnvironmentVariable("DSP_NATIVE_SIG_FASTBUF_POOL_SLOTS");
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_FASTBUF_POOL_SLOTS", nativeInFlightLimit.ToString());
+                var nativeWorkQueue = new BlockingCollection<NativeSeedSigChunkWorkItem>(nativeInFlightLimit);
+                var nativeResultQueue = new BlockingCollection<NativeSeedSigChunkResult>(nativeInFlightLimit * 2);
+                var nativeWorkers = new List<Task>(nativeInFlightLimit);
                 bool nativeSeedSigDisabled = false;
 
-                void DrainOneNativeTask()
+                for (int wi = 0; wi < nativeInFlightLimit; wi++)
                 {
-                    if (nativeInFlight.Count <= 0)
-                        return;
-
-                    Task<NativeSeedSigChunkResult> task = null;
-                    int completedIdx = -1;
-                    for (int i = 0; i < nativeInFlight.Count; i++)
+                    nativeWorkers.Add(Task.Factory.StartNew(() =>
                     {
-                        if (nativeInFlight[i].IsCompleted)
+                        foreach (var work in nativeWorkQueue.GetConsumingEnumerable())
                         {
-                            completedIdx = i;
-                            break;
+                            NativeSeedSigChunkResult chunkResult;
+                            try
+                            {
+                                chunkResult = RunNativeSeedSigChunk(work.seedBase, work.chunkSize);
+                            }
+                            catch
+                            {
+                                chunkResult = new NativeSeedSigChunkResult
+                                {
+                                    seedBase = work.seedBase,
+                                    chunkSize = work.chunkSize,
+                                    useNativeSeedSigs = false,
+                                    submitTicks = 0
+                                };
+                            }
+                            nativeResultQueue.Add(chunkResult);
                         }
-                    }
-                    if (completedIdx >= 0)
-                    {
-                        task = nativeInFlight[completedIdx];
-                        nativeInFlight.RemoveAt(completedIdx);
-                    }
-                    else
-                    {
-                        task = Task.WhenAny(nativeInFlight).GetAwaiter().GetResult();
-                        nativeInFlight.Remove(task);
-                    }
+                    }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
+                }
 
-                    var chunkResult = task.GetAwaiter().GetResult();
+                void ProcessNativeQueueResult(NativeSeedSigChunkResult chunkResult)
+                {
                     if (timingDebug)
                         tMixChunkSubmit += chunkResult.submitTicks;
                     if (chunkResult.useNativeSeedSigs)
@@ -1239,6 +1248,22 @@ namespace SeedCli
                     }
                     nativeSeedSigDisabled = true;
                     ProcessObjectFallbackChunk(chunkResult.seedBase, chunkResult.chunkSize);
+                }
+
+                int pendingNativeCount = 0;
+                void DrainNativeResults(bool waitAtLeastOne)
+                {
+                    if (waitAtLeastOne && pendingNativeCount > 0)
+                    {
+                        var first = nativeResultQueue.Take();
+                        pendingNativeCount--;
+                        ProcessNativeQueueResult(first);
+                    }
+                    while (pendingNativeCount > 0 && nativeResultQueue.TryTake(out var ready))
+                    {
+                        pendingNativeCount--;
+                        ProcessNativeQueueResult(ready);
+                    }
                 }
 
                 for (int seedBase = startSeed; seedBase < endSeed; seedBase += mixRunChunkSeeds)
@@ -1254,15 +1279,22 @@ namespace SeedCli
                         continue;
                     }
 
-                    int chunkSeedBase = seedBase;
-                    int chunkSize = chunk;
-                    nativeInFlight.Add(Task.Run(() => RunNativeSeedSigChunk(chunkSeedBase, chunkSize)));
-                    if (nativeInFlight.Count >= nativeInFlightLimit)
-                        DrainOneNativeTask();
+                    while (pendingNativeCount >= nativeInFlightLimit)
+                        DrainNativeResults(waitAtLeastOne: true);
+
+                    nativeWorkQueue.Add(new NativeSeedSigChunkWorkItem
+                    {
+                        seedBase = seedBase,
+                        chunkSize = chunk
+                    });
+                    pendingNativeCount++;
+                    DrainNativeResults(waitAtLeastOne: false);
                 }
 
-                while (nativeInFlight.Count > 0)
-                    DrainOneNativeTask();
+                nativeWorkQueue.CompleteAdding();
+                while (pendingNativeCount > 0)
+                    DrainNativeResults(waitAtLeastOne: true);
+                Task.WaitAll(nativeWorkers.ToArray());
             }
             finally
             {
@@ -1274,6 +1306,7 @@ namespace SeedCli
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST", prevNativeThemeTrust);
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE", prevNativeThemeUnsafe);
                 }
+                Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_FASTBUF_POOL_SLOTS", prevNativeFastBufPoolSlots);
                 if (nativeTimingConfigured)
                 {
                     Environment.SetEnvironmentVariable("DSP_NATIVE_SIG_STAGE_TIMING", prevNativeStageTiming);
@@ -2350,6 +2383,12 @@ namespace SeedCli
             public ulong[] planetSigs;
             public ulong[] veinSigs;
             public ulong[] pipelineSigs;
+        }
+
+        private struct NativeSeedSigChunkWorkItem
+        {
+            public int seedBase;
+            public int chunkSize;
         }
 
         private static string ResolveCpuFp64CacheFile(string cliPath, int startSeed, int starCount, int count)

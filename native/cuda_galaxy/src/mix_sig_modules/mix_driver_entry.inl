@@ -14,9 +14,30 @@ struct MixPoseFastBufferLease
     dsp_vec3d_t* ptr = nullptr;
 };
 
+struct MixPoseFastBufferTiming
+{
+    double acquire_total_ms = 0.0;
+    double acquire_lock_wait_ms = 0.0;
+    double acquire_lock_hold_ms = 0.0;
+    double acquire_set_device_ms = 0.0;
+    double acquire_free_ms = 0.0;
+    double acquire_malloc_ms = 0.0;
+    double release_total_ms = 0.0;
+    double release_lock_wait_ms = 0.0;
+    double release_lock_hold_ms = 0.0;
+};
+
+inline double MixPoseFastBufferNowMs()
+{
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
 struct MixPoseFastBufferStore
 {
     std::mutex mu;
+    std::condition_variable cv;
+    bool prewarm_in_progress = false;
     std::vector<MixPoseFastBufferEntry> entries;
 
     ~MixPoseFastBufferStore()
@@ -41,7 +62,89 @@ inline MixPoseFastBufferStore& GetMixPoseFastBufferStore()
     return store;
 }
 
-inline bool AcquireMixPoseFastBuffer(int device_id, size_t count, MixPoseFastBufferLease* out_lease)
+inline int ResolveFastBufferPoolSlots()
+{
+    static std::atomic<int> cached_slots{ -1 };
+    int cached = cached_slots.load(std::memory_order_relaxed);
+    if (cached >= 0)
+        return cached;
+    int slots = 0;
+    if (const char* s = std::getenv("DSP_NATIVE_SIG_FASTBUF_POOL_SLOTS"))
+        slots = std::atoi(s);
+    if (slots < 0)
+        slots = 0;
+    cached_slots.store(slots, std::memory_order_relaxed);
+    return slots;
+}
+
+inline bool SetCudaDeviceIfNeeded(int device_id, MixPoseFastBufferTiming* timing)
+{
+    if (device_id < 0)
+        return true;
+    thread_local int tls_device_id = -2147483647;
+    if (tls_device_id == device_id)
+        return true;
+    const bool profile = timing != nullptr;
+    const double t0 = profile ? MixPoseFastBufferNowMs() : 0.0;
+    const cudaError_t rc = cudaSetDevice(device_id);
+    if (profile)
+        timing->acquire_set_device_ms += (MixPoseFastBufferNowMs() - t0);
+    if (rc != cudaSuccess)
+        return false;
+    tls_device_id = device_id;
+    return true;
+}
+
+inline void EnsureMixPoseFastBufferPool(int device_id, size_t count, int target_slots, MixPoseFastBufferTiming* timing)
+{
+    if (target_slots <= 0)
+        return;
+    MixPoseFastBufferStore& store = GetMixPoseFastBufferStore();
+
+    std::unique_lock<std::mutex> lk(store.mu);
+    if (store.prewarm_in_progress)
+        return;
+
+    int ready = 0;
+    for (size_t i = 0; i < store.entries.size(); ++i)
+    {
+        const MixPoseFastBufferEntry& e = store.entries[i];
+        if (e.device_id == device_id && e.ptr != nullptr && e.cap >= count)
+            ready++;
+    }
+    if (ready >= target_slots)
+        return;
+
+    store.prewarm_in_progress = true;
+    lk.unlock();
+
+    int need = target_slots - ready;
+    std::vector<MixPoseFastBufferEntry> prepared;
+    prepared.reserve(static_cast<size_t>(need));
+    for (int i = 0; i < need; ++i)
+    {
+        MixPoseFastBufferEntry e{};
+        e.device_id = device_id;
+        if (!SetCudaDeviceIfNeeded(device_id, timing))
+            break;
+        const bool profile = timing != nullptr;
+        const double tm = profile ? MixPoseFastBufferNowMs() : 0.0;
+        if (cudaMalloc(reinterpret_cast<void**>(&e.ptr), count * sizeof(dsp_vec3d_t)) != cudaSuccess)
+            break;
+        if (profile)
+            timing->acquire_malloc_ms += (MixPoseFastBufferNowMs() - tm);
+        e.cap = count;
+        e.in_use = false;
+        prepared.push_back(e);
+    }
+
+    lk.lock();
+    for (size_t i = 0; i < prepared.size(); ++i)
+        store.entries.push_back(prepared[i]);
+    store.prewarm_in_progress = false;
+}
+
+inline bool AcquireMixPoseFastBuffer(int device_id, size_t count, MixPoseFastBufferLease* out_lease, MixPoseFastBufferTiming* timing)
 {
     if (out_lease == nullptr)
         return false;
@@ -49,72 +152,181 @@ inline bool AcquireMixPoseFastBuffer(int device_id, size_t count, MixPoseFastBuf
         count = 1;
 
     MixPoseFastBufferStore& store = GetMixPoseFastBufferStore();
-    std::lock_guard<std::mutex> lock(store.mu);
+    const bool profile = timing != nullptr;
+    const double t_total_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+    const int prewarm_slots = ResolveFastBufferPoolSlots();
+    if (prewarm_slots > 0)
+        EnsureMixPoseFastBufferPool(device_id, count, prewarm_slots, timing);
+    auto add_lock_wait = [&](double begin, double end) {
+        if (profile)
+            timing->acquire_lock_wait_ms += (end - begin);
+    };
+    auto add_lock_hold = [&](double begin, double end) {
+        if (profile)
+            timing->acquire_lock_hold_ms += (end - begin);
+    };
+    auto finish = [&](bool ok) -> bool {
+        if (profile)
+            timing->acquire_total_ms += (MixPoseFastBufferNowMs() - t_total_begin);
+        return ok;
+    };
+
     int pick_idx = -1;
-    for (size_t i = 0; i < store.entries.size(); ++i)
+    int old_device = -2;
+    dsp_vec3d_t* old_ptr = nullptr;
+    size_t old_cap = 0;
+    bool need_resize = false;
+
     {
-        MixPoseFastBufferEntry& e = store.entries[i];
-        if (e.in_use || e.device_id != device_id)
-            continue;
-        if (e.cap >= count)
+        const double t_lock_wait_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+        std::unique_lock<std::mutex> lock(store.mu);
+        const double t_lock_hold_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+        add_lock_wait(t_lock_wait_begin, t_lock_hold_begin);
+
+        for (size_t i = 0; i < store.entries.size(); ++i)
         {
-            pick_idx = static_cast<int>(i);
-            break;
+            MixPoseFastBufferEntry& e = store.entries[i];
+            if (e.in_use || e.device_id != device_id)
+                continue;
+            if (e.cap >= count)
+            {
+                pick_idx = static_cast<int>(i);
+                break;
+            }
+            if (pick_idx < 0)
+                pick_idx = static_cast<int>(i);
         }
         if (pick_idx < 0)
-            pick_idx = static_cast<int>(i);
-    }
-    if (pick_idx < 0)
-    {
-        store.entries.push_back(MixPoseFastBufferEntry{});
-        pick_idx = static_cast<int>(store.entries.size() - 1);
+        {
+            for (size_t i = 0; i < store.entries.size(); ++i)
+            {
+                MixPoseFastBufferEntry& e = store.entries[i];
+                if (!e.in_use)
+                {
+                    pick_idx = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (pick_idx < 0)
+        {
+            store.entries.push_back(MixPoseFastBufferEntry{});
+            pick_idx = static_cast<int>(store.entries.size() - 1);
+        }
+
+        MixPoseFastBufferEntry& entry = store.entries[static_cast<size_t>(pick_idx)];
+        entry.in_use = true;
+        old_device = entry.device_id;
+        old_ptr = entry.ptr;
+        old_cap = entry.cap;
+        need_resize = (entry.device_id != device_id) || (entry.cap < count) || (entry.ptr == nullptr);
+
+        add_lock_hold(t_lock_hold_begin, profile ? MixPoseFastBufferNowMs() : t_lock_hold_begin);
     }
 
-    MixPoseFastBufferEntry& entry = store.entries[static_cast<size_t>(pick_idx)];
-    if (entry.device_id != device_id)
+    if (!need_resize)
     {
-        if (entry.ptr != nullptr)
-        {
-            if (entry.device_id >= 0)
-                cudaSetDevice(entry.device_id);
-            cudaFree(entry.ptr);
-            entry.ptr = nullptr;
-            entry.cap = 0;
-        }
-        entry.device_id = device_id;
-    }
-    if (entry.cap < count)
-    {
-        if (device_id >= 0 && cudaSetDevice(device_id) != cudaSuccess)
-            return false;
-        if (entry.ptr != nullptr)
-        {
-            cudaFree(entry.ptr);
-            entry.ptr = nullptr;
-            entry.cap = 0;
-        }
-        if (cudaMalloc(reinterpret_cast<void**>(&entry.ptr), count * sizeof(dsp_vec3d_t)) != cudaSuccess)
-            return false;
-        entry.cap = count;
+        out_lease->entry_idx = pick_idx;
+        out_lease->ptr = old_ptr;
+        return finish(true);
     }
 
-    entry.in_use = true;
-    out_lease->entry_idx = pick_idx;
-    out_lease->ptr = entry.ptr;
-    return true;
+    dsp_vec3d_t* new_ptr = old_ptr;
+    size_t new_cap = old_cap;
+    int new_device = old_device;
+    bool malloc_ok = true;
+
+    if (old_device != device_id || old_cap < count || old_ptr == nullptr)
+    {
+        if (!SetCudaDeviceIfNeeded(device_id, timing))
+            return finish(false);
+        dsp_vec3d_t* alloc_ptr = nullptr;
+        const double t_malloc_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+        const cudaError_t rc_malloc = cudaMalloc(reinterpret_cast<void**>(&alloc_ptr), count * sizeof(dsp_vec3d_t));
+        if (profile)
+            timing->acquire_malloc_ms += (MixPoseFastBufferNowMs() - t_malloc_begin);
+        if (rc_malloc != cudaSuccess)
+            malloc_ok = false;
+        if (malloc_ok)
+        {
+            if (old_ptr != nullptr)
+            {
+                if (old_device >= 0 && old_device != device_id)
+                {
+                    if (!SetCudaDeviceIfNeeded(old_device, timing))
+                    {
+                        malloc_ok = false;
+                    }
+                }
+                if (malloc_ok)
+                {
+                    const double t_free_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+                    cudaFree(old_ptr);
+                    if (profile)
+                        timing->acquire_free_ms += (MixPoseFastBufferNowMs() - t_free_begin);
+                }
+            }
+            if (malloc_ok)
+            {
+                new_ptr = alloc_ptr;
+                new_cap = count;
+                new_device = device_id;
+            }
+            else
+            {
+                SetCudaDeviceIfNeeded(device_id, timing);
+                cudaFree(alloc_ptr);
+            }
+        }
+    }
+
+    {
+        const double t_lock_wait_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+        std::unique_lock<std::mutex> lock(store.mu);
+        const double t_lock_hold_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+        add_lock_wait(t_lock_wait_begin, t_lock_hold_begin);
+
+        MixPoseFastBufferEntry& entry = store.entries[static_cast<size_t>(pick_idx)];
+        if (!malloc_ok)
+        {
+            entry.in_use = false;
+            add_lock_hold(t_lock_hold_begin, profile ? MixPoseFastBufferNowMs() : t_lock_hold_begin);
+            return finish(false);
+        }
+        entry.device_id = new_device;
+        entry.ptr = new_ptr;
+        entry.cap = new_cap;
+        out_lease->entry_idx = pick_idx;
+        out_lease->ptr = entry.ptr;
+
+        add_lock_hold(t_lock_hold_begin, profile ? MixPoseFastBufferNowMs() : t_lock_hold_begin);
+    }
+    return finish(true);
 }
 
-inline void ReleaseMixPoseFastBuffer(MixPoseFastBufferLease* lease)
+inline void ReleaseMixPoseFastBuffer(MixPoseFastBufferLease* lease, MixPoseFastBufferTiming* timing)
 {
     if (lease == nullptr || lease->entry_idx < 0)
         return;
+    const bool profile = timing != nullptr;
+    const double t_total_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
     MixPoseFastBufferStore& store = GetMixPoseFastBufferStore();
-    std::lock_guard<std::mutex> lock(store.mu);
+    const double t_lock_wait_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+    std::unique_lock<std::mutex> lock(store.mu);
+    const double t_lock_hold_begin = profile ? MixPoseFastBufferNowMs() : 0.0;
+    if (profile)
+        timing->release_lock_wait_ms += (t_lock_hold_begin - t_lock_wait_begin);
     const int idx = lease->entry_idx;
     if (idx >= 0 && static_cast<size_t>(idx) < store.entries.size())
         store.entries[static_cast<size_t>(idx)].in_use = false;
     lease->entry_idx = -1;
     lease->ptr = nullptr;
+    if (profile)
+    {
+        const double t_end = MixPoseFastBufferNowMs();
+        timing->release_lock_hold_ms += (t_end - t_lock_hold_begin);
+        timing->release_total_ms += (t_end - t_total_begin);
+    }
 }
 } // namespace
 
@@ -328,6 +540,13 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     double stage_pose_event_setup_ms = 0.0;
     double stage_pose_fast_buffer_ms = 0.0;
     double stage_pose_fast_buffer_release_ms = 0.0;
+    double stage_pose_fast_buffer_acquire_lock_wait_ms = 0.0;
+    double stage_pose_fast_buffer_acquire_lock_hold_ms = 0.0;
+    double stage_pose_fast_buffer_acquire_set_device_ms = 0.0;
+    double stage_pose_fast_buffer_acquire_free_ms = 0.0;
+    double stage_pose_fast_buffer_acquire_malloc_ms = 0.0;
+    double stage_pose_fast_buffer_release_lock_wait_ms = 0.0;
+    double stage_pose_fast_buffer_release_lock_hold_ms = 0.0;
     double stage_seed_build_ms = 0.0;
     double stage_seed_build_host_ctx_ms = 0.0;
     double stage_seed_build_host_merge_ms = 0.0;
@@ -454,12 +673,19 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         };
         auto run_pose_device = [&]() -> int {
             const size_t pose_n = static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count);
-            double t_fast_buffer_begin = stage_timing ? now_ms() : 0.0;
             MixPoseFastBufferLease pose_lease{};
-            if (!AcquireMixPoseFastBuffer(cuda_device_id, pose_n, &pose_lease))
+            MixPoseFastBufferTiming fb_timing{};
+            if (!AcquireMixPoseFastBuffer(cuda_device_id, pose_n, &pose_lease, stage_timing ? &fb_timing : nullptr))
                 return DSP_CUDA_ERR_CUDA;
             if (stage_timing)
-                stage_pose_fast_buffer_ms += now_ms() - t_fast_buffer_begin;
+            {
+                stage_pose_fast_buffer_ms += fb_timing.acquire_total_ms;
+                stage_pose_fast_buffer_acquire_lock_wait_ms += fb_timing.acquire_lock_wait_ms;
+                stage_pose_fast_buffer_acquire_lock_hold_ms += fb_timing.acquire_lock_hold_ms;
+                stage_pose_fast_buffer_acquire_set_device_ms += fb_timing.acquire_set_device_ms;
+                stage_pose_fast_buffer_acquire_free_ms += fb_timing.acquire_free_ms;
+                stage_pose_fast_buffer_acquire_malloc_ms += fb_timing.acquire_malloc_ms;
+            }
             d_pose_raw_fast = pose_lease.ptr;
             int pose_rc = dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
                 pose_seeds.data(),
@@ -476,10 +702,13 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 d_pose_raw_fast,
                 pose_copy_count,
                 pose_raw_counts.data());
-            double t_release_begin = stage_timing ? now_ms() : 0.0;
-            ReleaseMixPoseFastBuffer(&pose_lease);
+            ReleaseMixPoseFastBuffer(&pose_lease, stage_timing ? &fb_timing : nullptr);
             if (stage_timing)
-                stage_pose_fast_buffer_release_ms += now_ms() - t_release_begin;
+            {
+                stage_pose_fast_buffer_release_ms += fb_timing.release_total_ms;
+                stage_pose_fast_buffer_release_lock_wait_ms += fb_timing.release_lock_wait_ms;
+                stage_pose_fast_buffer_release_lock_hold_ms += fb_timing.release_lock_hold_ms;
+            }
             return pose_rc;
         };
 
@@ -1616,6 +1845,22 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         const double pose_residual_pre_ms = stage_pose_api_pre_ms;
         const double pose_residual_post_ms = stage_pose_api_post_ms;
         const double pose_residual_fast_buffer_ms = stage_pose_fast_buffer_ms;
+        const double pose_residual_fast_buffer_release_ms = stage_pose_fast_buffer_release_ms;
+        double pose_residual_fast_buffer_acquire_rest_ms =
+            stage_pose_fast_buffer_ms
+            - stage_pose_fast_buffer_acquire_lock_wait_ms
+            - stage_pose_fast_buffer_acquire_lock_hold_ms
+            - stage_pose_fast_buffer_acquire_set_device_ms
+            - stage_pose_fast_buffer_acquire_free_ms
+            - stage_pose_fast_buffer_acquire_malloc_ms;
+        if (pose_residual_fast_buffer_acquire_rest_ms < 0.0)
+            pose_residual_fast_buffer_acquire_rest_ms = 0.0;
+        double pose_residual_fast_buffer_release_rest_ms =
+            stage_pose_fast_buffer_release_ms
+            - stage_pose_fast_buffer_release_lock_wait_ms
+            - stage_pose_fast_buffer_release_lock_hold_ms;
+        if (pose_residual_fast_buffer_release_rest_ms < 0.0)
+            pose_residual_fast_buffer_release_rest_ms = 0.0;
         double pose_residual_accounted_ms =
             pose_residual_sync_wait_ms
             + pose_residual_submit_ms
@@ -1703,13 +1948,17 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             std::printf(
                 "[native-sig-residual] seeds=%d stars=%d groupCap=%d poseMs=%.3f poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f "
                 "syncWait=%.3f submit=%.3f apiPre=%.3f(setDevice=%.3f ensureBuffers=%.3f eventSetup=%.3f) "
-                "apiPost=%.3f fastBuffer=%.3f apiTotalHost=%.3f "
+                "apiPost=%.3f fastBuffer=%.3f(acqLockWait=%.3f acqLockHold=%.3f acqSetDevice=%.3f acqFree=%.3f acqMalloc=%.3f acqRest=%.3f rel=%.3f relLockWait=%.3f relLockHold=%.3f relRest=%.3f) apiTotalHost=%.3f "
                 "other=%.3f(otherApiGap=%.3f otherOutsideApi=%.3f[release=%.3f rest=%.3f] otherUnattributed=%.3f) "
                 "otherPct=%.3f(otherApiGapPct=%.3f otherOutsideApiPct=%.3f[releasePct=%.3f restPct=%.3f] otherUnattributedPct=%.3f)\n",
                 seed_count, star_count, group_cap, stage_pose_ms, pose_known_ms, pose_residual_ms, pose_residual_pct,
                 pose_residual_sync_wait_ms, pose_residual_submit_ms, pose_residual_pre_ms,
                 stage_pose_set_device_ms, stage_pose_ensure_buffers_ms, stage_pose_event_setup_ms,
-                pose_residual_post_ms, pose_residual_fast_buffer_ms, stage_pose_api_total_host_ms,
+                pose_residual_post_ms, pose_residual_fast_buffer_ms,
+                stage_pose_fast_buffer_acquire_lock_wait_ms, stage_pose_fast_buffer_acquire_lock_hold_ms,
+                stage_pose_fast_buffer_acquire_set_device_ms, stage_pose_fast_buffer_acquire_free_ms, stage_pose_fast_buffer_acquire_malloc_ms, pose_residual_fast_buffer_acquire_rest_ms,
+                pose_residual_fast_buffer_release_ms, stage_pose_fast_buffer_release_lock_wait_ms, stage_pose_fast_buffer_release_lock_hold_ms, pose_residual_fast_buffer_release_rest_ms,
+                stage_pose_api_total_host_ms,
                 pose_residual_other_ms, pose_residual_other_api_gap_ms, pose_residual_other_outside_api_ms,
                 pose_residual_other_outside_api_release_ms, pose_residual_other_outside_api_rest_ms, pose_residual_other_unattributed_ms,
                 pose_residual_other_pct, pose_residual_other_api_gap_pct, pose_residual_other_outside_api_pct,

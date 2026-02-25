@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -410,4 +411,3 @@ inline int SubWrapI32(int a, int b)
     unsigned int ub = static_cast<unsigned int>(b);
     return static_cast<int>(ua - ub);
 }
-
