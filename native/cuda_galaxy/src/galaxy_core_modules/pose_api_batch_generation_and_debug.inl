@@ -20,15 +20,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     if (seed_count <= 0 || max_count <= 0 || out_stride < max_count)
         return DSP_CUDA_ERR_INVALID_ARGUMENT;
 
-    if (device_id >= 0)
+    int resolved_device_id = device_id;
+    cudaError_t set_device_rc = EnsurePoseApiDevice(device_id, &resolved_device_id);
+    if (set_device_rc != cudaSuccess)
     {
-        cudaError_t set_device_rc = cudaSetDevice(device_id);
-        if (set_device_rc != cudaSuccess)
-        {
-            if (debug_enter)
-                std::fprintf(stderr, "[cuda-galaxy-error] pose_batch cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
-            return DSP_CUDA_ERR_CUDA;
-        }
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
+        return DSP_CUDA_ERR_CUDA;
     }
 
     const size_t seeds_bytes = static_cast<size_t>(seed_count) * sizeof(int);
@@ -36,6 +34,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
     const size_t poses_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(out_stride) * sizeof(dsp_vec3d_t);
 
     int* d_seeds = nullptr;
+    int* d_seed_cursor = nullptr;
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
@@ -54,6 +53,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         &d_drunk,
         nullptr,
         nullptr,
+        &d_seed_cursor,
         &stream);
     if (rc != cudaSuccess)
     {
@@ -70,24 +70,63 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch(
         return DSP_CUDA_ERR_CUDA;
     }
 
-    int block_size = 128;
-    int grid_size = (seed_count + block_size - 1) / block_size;
-    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
-        d_seeds,
-        seed_count,
-        max_count,
-        min_dist,
-        min_step_len,
-        max_step_len,
-        flatten,
-        collision_fp64,
-        d_poses,
-        d_drunk,
-        out_stride,
-        d_counts,
-        nullptr);
+    const int use_spatial_hash = UsePoseSpatialHash() ? 1 : 0;
+    const int use_fast_math = UsePoseFastMath() ? 1 : 0;
+    const int use_two_stage = UsePoseTwoStagePipeline() ? 1 : 0;
+    const int candidate_batch = ResolvePoseCandidateBatch();
+    const int block_size = 128;
+    if (ShouldUsePosePersistentForSeedCount(seed_count))
+    {
+        rc = cudaMemsetAsync(d_seed_cursor, 0, sizeof(int), stream);
+        if (rc == cudaSuccess)
+        {
+            const int grid_size = ResolvePosePersistentBlocks(seed_count, resolved_device_id);
+            GenerateTempPosesParamsFp64BatchKernelPersistent<<<grid_size, block_size, 0, stream>>>(
+                d_seeds,
+                seed_count,
+                max_count,
+                min_dist,
+                min_step_len,
+                max_step_len,
+                flatten,
+                collision_fp64,
+                d_poses,
+                d_drunk,
+                out_stride,
+                d_counts,
+                nullptr,
+                d_seed_cursor,
+                use_spatial_hash,
+                use_fast_math,
+                use_two_stage,
+                candidate_batch);
+        }
+    }
+    else
+    {
+        const int grid_size = (seed_count + block_size - 1) / block_size;
+        GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
+            d_seeds,
+            seed_count,
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64,
+            d_poses,
+            d_drunk,
+            out_stride,
+            d_counts,
+            nullptr,
+            use_spatial_hash,
+            use_fast_math,
+            use_two_stage,
+            candidate_batch);
+    }
 
-    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaGetLastError();
     if (rc == cudaSuccess)
         rc = cudaMemcpyAsync(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
     if (rc == cudaSuccess)
@@ -146,15 +185,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
     };
 
-    if (device_id >= 0)
+    int resolved_device_id = device_id;
+    cudaError_t set_device_rc = EnsurePoseApiDevice(device_id, &resolved_device_id);
+    if (set_device_rc != cudaSuccess)
     {
-        cudaError_t set_device_rc = cudaSetDevice(device_id);
-        if (set_device_rc != cudaSuccess)
-        {
-            if (debug_enter)
-                std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
-            return DSP_CUDA_ERR_CUDA;
-        }
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
+        return DSP_CUDA_ERR_CUDA;
     }
 
     const int device_stride = max_count;
@@ -170,6 +207,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         use_pinned_staging = std::atoi(ps) != 0;
 
     int* d_seeds = nullptr;
+    int* d_seed_cursor = nullptr;
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
@@ -199,6 +237,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         &d_drunk,
         &d_head_poses,
         &d_gen_profiles,
+        &d_seed_cursor,
         &stream);
     if (rc != cudaSuccess)
     {
@@ -259,26 +298,65 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     if (op_timing)
         cudaEventRecord(ev1, stream);
 
-    int block_size = 128;
-    int grid_size = (seed_count + block_size - 1) / block_size;
-    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
-        d_seeds,
-        seed_count,
-        max_count,
-        min_dist,
-        min_step_len,
-        max_step_len,
-        flatten,
-        collision_fp64,
-        d_poses,
-        d_drunk,
-        device_stride,
-        d_counts,
-        collect_profile_detail ? d_gen_profiles : nullptr);
+    const int use_spatial_hash = UsePoseSpatialHash() ? 1 : 0;
+    const int use_fast_math = UsePoseFastMath() ? 1 : 0;
+    const int use_two_stage = UsePoseTwoStagePipeline() ? 1 : 0;
+    const int candidate_batch = ResolvePoseCandidateBatch();
+    const int block_size = 128;
+    if (ShouldUsePosePersistentForSeedCount(seed_count))
+    {
+        rc = cudaMemsetAsync(d_seed_cursor, 0, sizeof(int), stream);
+        if (rc == cudaSuccess)
+        {
+            const int grid_size = ResolvePosePersistentBlocks(seed_count, resolved_device_id);
+            GenerateTempPosesParamsFp64BatchKernelPersistent<<<grid_size, block_size, 0, stream>>>(
+                d_seeds,
+                seed_count,
+                max_count,
+                min_dist,
+                min_step_len,
+                max_step_len,
+                flatten,
+                collision_fp64,
+                d_poses,
+                d_drunk,
+                device_stride,
+                d_counts,
+                collect_profile_detail ? d_gen_profiles : nullptr,
+                d_seed_cursor,
+                use_spatial_hash,
+                use_fast_math,
+                use_two_stage,
+                candidate_batch);
+        }
+    }
+    else
+    {
+        int grid_size = (seed_count + block_size - 1) / block_size;
+        GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
+            d_seeds,
+            seed_count,
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64,
+            d_poses,
+            d_drunk,
+            device_stride,
+            d_counts,
+            collect_profile_detail ? d_gen_profiles : nullptr,
+            use_spatial_hash,
+            use_fast_math,
+            use_two_stage,
+            candidate_batch);
+    }
     if (op_timing)
         cudaEventRecord(ev2, stream);
 
-    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaGetLastError();
     if (rc == cudaSuccess)
         rc = cudaMemcpyAsync(h_counts_target, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
     if (rc == cudaSuccess && op_timing)
@@ -446,15 +524,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
     if (const char* ot = std::getenv("DSP_NATIVE_OP_TIMING"))
         op_timing = op_timing || (std::atoi(ot) != 0);
 
-    if (device_id >= 0)
+    int resolved_device_id = device_id;
+    cudaError_t set_device_rc = EnsurePoseApiDevice(device_id, &resolved_device_id);
+    if (set_device_rc != cudaSuccess)
     {
-        cudaError_t set_device_rc = cudaSetDevice(device_id);
-        if (set_device_rc != cudaSuccess)
-        {
-            if (debug_enter)
-                std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head_device cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
-            return DSP_CUDA_ERR_CUDA;
-        }
+        if (debug_enter)
+            std::fprintf(stderr, "[cuda-galaxy-error] pose_batch_head_device cudaSetDevice rc=%d %s\n", static_cast<int>(set_device_rc), cudaGetErrorString(set_device_rc));
+        return DSP_CUDA_ERR_CUDA;
     }
 
     const int device_stride = max_count;
@@ -463,6 +539,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
     const size_t poses_bytes = static_cast<size_t>(seed_count) * static_cast<size_t>(device_stride) * sizeof(dsp_vec3d_t);
 
     int* d_seeds = nullptr;
+    int* d_seed_cursor = nullptr;
     int* d_counts = nullptr;
     dsp_vec3d_t* d_poses = nullptr;
     dsp_vec3d_t* d_drunk = nullptr;
@@ -489,6 +566,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         &d_drunk,
         nullptr,
         nullptr,
+        &d_seed_cursor,
         &stream);
     if (rc != cudaSuccess)
     {
@@ -525,26 +603,65 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
     if (op_timing)
         cudaEventRecord(ev1, stream);
 
-    int block_size = 128;
-    int grid_size = (seed_count + block_size - 1) / block_size;
-    GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
-        d_seeds,
-        seed_count,
-        max_count,
-        min_dist,
-        min_step_len,
-        max_step_len,
-        flatten,
-        collision_fp64,
-        d_poses,
-        d_drunk,
-        device_stride,
-        d_counts,
-        nullptr);
+    const int use_spatial_hash = UsePoseSpatialHash() ? 1 : 0;
+    const int use_fast_math = UsePoseFastMath() ? 1 : 0;
+    const int use_two_stage = UsePoseTwoStagePipeline() ? 1 : 0;
+    const int candidate_batch = ResolvePoseCandidateBatch();
+    const int block_size = 128;
+    if (ShouldUsePosePersistentForSeedCount(seed_count))
+    {
+        rc = cudaMemsetAsync(d_seed_cursor, 0, sizeof(int), stream);
+        if (rc == cudaSuccess)
+        {
+            const int grid_size = ResolvePosePersistentBlocks(seed_count, resolved_device_id);
+            GenerateTempPosesParamsFp64BatchKernelPersistent<<<grid_size, block_size, 0, stream>>>(
+                d_seeds,
+                seed_count,
+                max_count,
+                min_dist,
+                min_step_len,
+                max_step_len,
+                flatten,
+                collision_fp64,
+                d_poses,
+                d_drunk,
+                device_stride,
+                d_counts,
+                nullptr,
+                d_seed_cursor,
+                use_spatial_hash,
+                use_fast_math,
+                use_two_stage,
+                candidate_batch);
+        }
+    }
+    else
+    {
+        int grid_size = (seed_count + block_size - 1) / block_size;
+        GenerateTempPosesParamsFp64BatchKernel<<<grid_size, block_size, 0, stream>>>(
+            d_seeds,
+            seed_count,
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64,
+            d_poses,
+            d_drunk,
+            device_stride,
+            d_counts,
+            nullptr,
+            use_spatial_hash,
+            use_fast_math,
+            use_two_stage,
+            candidate_batch);
+    }
     if (op_timing)
         cudaEventRecord(ev2, stream);
 
-    rc = cudaGetLastError();
+    if (rc == cudaSuccess)
+        rc = cudaGetLastError();
     if (rc == cudaSuccess)
         rc = cudaMemcpyAsync(out_counts, d_counts, counts_bytes, cudaMemcpyDeviceToHost, stream);
     if (rc == cudaSuccess && op_timing)
@@ -726,4 +843,3 @@ extern "C" int dsp_cuda_debug_rng_state_after_ctor(
         return DSP_CUDA_ERR_CUDA;
     return DSP_CUDA_OK;
 }
-

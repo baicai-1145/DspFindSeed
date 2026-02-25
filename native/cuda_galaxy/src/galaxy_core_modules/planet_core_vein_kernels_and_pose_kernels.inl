@@ -1,3 +1,55 @@
+template <bool CollectProfile>
+__device__ __forceinline__ int GenerateTempPosesForSeed(
+    int seed,
+    int max_count,
+    double min_dist,
+    double min_step_len,
+    double max_step_len,
+    double flatten,
+    int collision_fp64,
+    int use_spatial_hash,
+    int use_fast_math,
+    int use_two_stage,
+    int candidate_batch,
+    dsp_vec3d_t* poses_seg,
+    dsp_vec3d_t* drunk_seg,
+    PoseGenSeedProfile* profile)
+{
+    const bool spatial_hash = use_spatial_hash != 0;
+    const bool fast_math = use_fast_math != 0;
+    if (collision_fp64 != 0)
+    {
+        return GenerateRandomPosesParamsFp64Impl<CollectProfile, true>(
+            seed,
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            spatial_hash,
+            fast_math,
+            use_two_stage != 0,
+            candidate_batch,
+            poses_seg,
+            drunk_seg,
+            profile);
+    }
+    return GenerateRandomPosesParamsFp64Impl<CollectProfile, false>(
+        seed,
+        max_count,
+        min_dist,
+        min_step_len,
+        max_step_len,
+        flatten,
+        spatial_hash,
+        fast_math,
+        use_two_stage != 0,
+        candidate_batch,
+        poses_seg,
+        drunk_seg,
+        profile);
+}
+
 __global__ void GenerateTempPosesParamsFp64BatchKernel(
     const int* seeds,
     int seed_count,
@@ -11,7 +63,11 @@ __global__ void GenerateTempPosesParamsFp64BatchKernel(
     dsp_vec3d_t* out_drunk,
     int out_stride,
     int* out_counts,
-    PoseGenSeedProfile* out_profiles)
+    PoseGenSeedProfile* out_profiles,
+    int use_spatial_hash,
+    int use_fast_math,
+    int use_two_stage,
+    int candidate_batch)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= seed_count)
@@ -22,63 +78,110 @@ __global__ void GenerateTempPosesParamsFp64BatchKernel(
     int count = 0;
     if (out_profiles != nullptr)
     {
-        if (collision_fp64 != 0)
-        {
-            count = GenerateRandomPosesParamsFp64Impl<true, true>(
-                seeds[idx],
-                max_count,
-                min_dist,
-                min_step_len,
-                max_step_len,
-                flatten,
-                poses_seg,
-                drunk_seg,
-                out_profiles + idx);
-        }
-        else
-        {
-            count = GenerateRandomPosesParamsFp64Impl<true, false>(
-                seeds[idx],
-                max_count,
-                min_dist,
-                min_step_len,
-                max_step_len,
-                flatten,
-                poses_seg,
-                drunk_seg,
-                out_profiles + idx);
-        }
+        count = GenerateTempPosesForSeed<true>(
+            seeds[idx],
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64,
+            use_spatial_hash,
+            use_fast_math,
+            use_two_stage,
+            candidate_batch,
+            poses_seg,
+            drunk_seg,
+            out_profiles + idx);
     }
     else
     {
-        if (collision_fp64 != 0)
+        count = GenerateTempPosesForSeed<false>(
+            seeds[idx],
+            max_count,
+            min_dist,
+            min_step_len,
+            max_step_len,
+            flatten,
+            collision_fp64,
+            use_spatial_hash,
+            use_fast_math,
+            use_two_stage,
+            candidate_batch,
+            poses_seg,
+            drunk_seg,
+            nullptr);
+    }
+    out_counts[idx] = count;
+}
+
+__global__ void GenerateTempPosesParamsFp64BatchKernelPersistent(
+    const int* seeds,
+    int seed_count,
+    int max_count,
+    double min_dist,
+    double min_step_len,
+    double max_step_len,
+    double flatten,
+    int collision_fp64,
+    dsp_vec3d_t* out_poses,
+    dsp_vec3d_t* out_drunk,
+    int out_stride,
+    int* out_counts,
+    PoseGenSeedProfile* out_profiles,
+    int* seed_cursor,
+    int use_spatial_hash,
+    int use_fast_math,
+    int use_two_stage,
+    int candidate_batch)
+{
+    while (true)
+    {
+        int idx = atomicAdd(seed_cursor, 1);
+        if (idx >= seed_count)
+            return;
+
+        dsp_vec3d_t* poses_seg = out_poses + static_cast<long long>(idx) * out_stride;
+        dsp_vec3d_t* drunk_seg = out_drunk + static_cast<long long>(idx) * out_stride;
+        int count = 0;
+        if (out_profiles != nullptr)
         {
-            count = GenerateRandomPosesParamsFp64Impl<false, true>(
+            count = GenerateTempPosesForSeed<true>(
                 seeds[idx],
                 max_count,
                 min_dist,
                 min_step_len,
                 max_step_len,
                 flatten,
+                collision_fp64,
+                use_spatial_hash,
+                use_fast_math,
+                use_two_stage,
+                candidate_batch,
                 poses_seg,
                 drunk_seg,
-                nullptr);
+                out_profiles + idx);
         }
         else
         {
-            count = GenerateRandomPosesParamsFp64Impl<false, false>(
+            count = GenerateTempPosesForSeed<false>(
                 seeds[idx],
                 max_count,
                 min_dist,
                 min_step_len,
                 max_step_len,
                 flatten,
+                collision_fp64,
+                use_spatial_hash,
+                use_fast_math,
+                use_two_stage,
+                candidate_batch,
                 poses_seg,
                 drunk_seg,
                 nullptr);
         }
+        out_counts[idx] = count;
     }
-    out_counts[idx] = count;
 }
 
 __global__ void DebugRngNextDoubleKernel(int seed, int count, double* out_values)
