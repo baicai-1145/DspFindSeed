@@ -127,6 +127,12 @@ namespace SeedCli
                 }
                 else if (comparePipelineMix || comparePipelineMixVeinsF32)
                 {
+                    EnsureEnvDefault("DSP_MIX_NATIVE_INFLIGHT", "4");
+                    EnsureEnvDefault("DSP_NATIVE_SIG_GPU_POSE_DIRECT", "1");
+                    EnsureEnvDefault("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_EXPERIMENTAL", "1");
+                    EnsureEnvDefault("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_TRUST", "1");
+                    EnsureEnvDefault("DSP_NATIVE_SIG_GPU_THEME_VEIN_HASH_UNSAFE", "1");
+
                     if (hasMixThreadsArg)
                         Console.WriteLine("参数 --mix-threads 已弃用：请使用 --cpu-threads + --gpu-chunk-seeds。");
                     if (hasLegacySeedBatchArg && !HasFlag(args, "--batch-per-thread"))
@@ -2389,6 +2395,14 @@ namespace SeedCli
         {
             public int seedBase;
             public int chunkSize;
+        }
+
+        private static void EnsureEnvDefault(string key, string value)
+        {
+            if (string.IsNullOrEmpty(key))
+                return;
+            if (Environment.GetEnvironmentVariable(key) == null)
+                Environment.SetEnvironmentVariable(key, value);
         }
 
         private static string ResolveCpuFp64CacheFile(string cliPath, int startSeed, int starCount, int count)
