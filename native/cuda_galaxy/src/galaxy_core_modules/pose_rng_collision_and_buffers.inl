@@ -76,7 +76,7 @@ struct BatchDeviceBuffers
 
 thread_local BatchDeviceBuffers g_batch_buffers;
 thread_local dsp_cuda_pose_batch_head_timing_t g_last_pose_batch_head_timing =
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    {};
 
 struct PlanetCoreBatchDeviceBuffers
 {

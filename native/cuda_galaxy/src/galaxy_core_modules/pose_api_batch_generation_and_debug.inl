@@ -159,8 +159,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
     int out_stride,
     int* out_counts)
 {
-    g_last_pose_batch_head_timing =
-        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    g_last_pose_batch_head_timing = {};
     bool debug_enter = false;
     if (const char* de = std::getenv("DSP_NATIVE_SIG_DEBUG_ENTER"))
         debug_enter = std::atoi(de) != 0;
@@ -184,9 +183,14 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         using clock = std::chrono::steady_clock;
         return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
     };
+    const double t_api_begin = op_timing ? now_ms_host() : 0.0;
+    double t_post_begin = 0.0;
 
     int resolved_device_id = device_id;
+    const double t_set_device_begin = op_timing ? now_ms_host() : 0.0;
     cudaError_t set_device_rc = EnsurePoseApiDevice(device_id, &resolved_device_id);
+    if (op_timing)
+        g_last_pose_batch_head_timing.set_device_ms += (now_ms_host() - t_set_device_begin);
     if (set_device_rc != cudaSuccess)
     {
         if (debug_enter)
@@ -224,6 +228,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         if (ev0 != nullptr) cudaEventDestroy(ev0);
     };
 
+    const double t_ensure_begin = op_timing ? now_ms_host() : 0.0;
     cudaError_t rc = EnsureBatchBuffers(
         device_id,
         seeds_bytes,
@@ -239,6 +244,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         &d_gen_profiles,
         &d_seed_cursor,
         &stream);
+    if (op_timing)
+        g_last_pose_batch_head_timing.ensure_buffers_ms += (now_ms_host() - t_ensure_begin);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -270,6 +277,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         h_counts_target = host_buffers.h_counts_pinned;
         h_head_target = host_buffers.h_head_poses_pinned;
     }
+    const double t_event_setup_begin = op_timing ? now_ms_host() : 0.0;
     if (op_timing)
     {
         rc = cudaEventCreate(&ev0);
@@ -286,7 +294,11 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
         }
     }
     if (op_timing)
+        g_last_pose_batch_head_timing.event_setup_ms += (now_ms_host() - t_event_setup_begin);
+    if (op_timing)
         cudaEventRecord(ev0, stream);
+    if (op_timing)
+        g_last_pose_batch_head_timing.api_pre_ms = now_ms_host() - t_api_begin;
 
     rc = cudaMemcpyAsync(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess)
@@ -392,6 +404,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             if (rc == cudaSuccess && op_timing)
                 g_last_pose_batch_head_timing.d2h_head_sync_wait_ms += (now_ms_host() - t_sync_begin);
         }
+        if (rc == cudaSuccess && op_timing)
+            t_post_begin = now_ms_host();
         if (rc == cudaSuccess && use_pinned_staging)
         {
             std::memcpy(out_counts, h_counts_target, counts_bytes);
@@ -477,6 +491,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head(
             }
         }
     }
+    if (rc == cudaSuccess && op_timing)
+    {
+        const double t_end = now_ms_host();
+        g_last_pose_batch_head_timing.api_total_host_ms = t_end - t_api_begin;
+        if (t_post_begin > 0.0)
+            g_last_pose_batch_head_timing.api_post_ms = t_end - t_post_begin;
+    }
     destroy_events();
 
     if (rc != cudaSuccess)
@@ -504,8 +525,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
     int out_stride,
     int* out_counts)
 {
-    g_last_pose_batch_head_timing =
-        {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    g_last_pose_batch_head_timing = {};
     bool debug_enter = false;
     if (const char* de = std::getenv("DSP_NATIVE_SIG_DEBUG_ENTER"))
         debug_enter = std::atoi(de) != 0;
@@ -523,9 +543,18 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         op_timing = std::atoi(st) != 0;
     if (const char* ot = std::getenv("DSP_NATIVE_OP_TIMING"))
         op_timing = op_timing || (std::atoi(ot) != 0);
+    auto now_ms_host = []() -> double {
+        using clock = std::chrono::steady_clock;
+        return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+    };
+    const double t_api_begin = op_timing ? now_ms_host() : 0.0;
+    double t_post_begin = 0.0;
 
     int resolved_device_id = device_id;
+    const double t_set_device_begin = op_timing ? now_ms_host() : 0.0;
     cudaError_t set_device_rc = EnsurePoseApiDevice(device_id, &resolved_device_id);
+    if (op_timing)
+        g_last_pose_batch_head_timing.set_device_ms += (now_ms_host() - t_set_device_begin);
     if (set_device_rc != cudaSuccess)
     {
         if (debug_enter)
@@ -553,6 +582,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         if (ev0 != nullptr) cudaEventDestroy(ev0);
     };
 
+    const double t_ensure_begin = op_timing ? now_ms_host() : 0.0;
     cudaError_t rc = EnsureBatchBuffers(
         device_id,
         seeds_bytes,
@@ -568,6 +598,8 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         nullptr,
         &d_seed_cursor,
         &stream);
+    if (op_timing)
+        g_last_pose_batch_head_timing.ensure_buffers_ms += (now_ms_host() - t_ensure_begin);
     if (rc != cudaSuccess)
     {
         if (debug_enter)
@@ -575,6 +607,7 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         return DSP_CUDA_ERR_CUDA;
     }
 
+    const double t_event_setup_begin = op_timing ? now_ms_host() : 0.0;
     if (op_timing)
     {
         rc = cudaEventCreate(&ev0);
@@ -590,7 +623,11 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         }
     }
     if (op_timing)
+        g_last_pose_batch_head_timing.event_setup_ms += (now_ms_host() - t_event_setup_begin);
+    if (op_timing)
         cudaEventRecord(ev0, stream);
+    if (op_timing)
+        g_last_pose_batch_head_timing.api_pre_ms = now_ms_host() - t_api_begin;
 
     rc = cudaMemcpyAsync(d_seeds, seeds, seeds_bytes, cudaMemcpyHostToDevice, stream);
     if (rc != cudaSuccess)
@@ -683,7 +720,14 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
     if (rc == cudaSuccess && op_timing)
         cudaEventRecord(ev4, stream);
     if (rc == cudaSuccess)
+    {
+        double t_sync_begin = op_timing ? now_ms_host() : 0.0;
         rc = cudaStreamSynchronize(stream);
+        if (rc == cudaSuccess && op_timing)
+            g_last_pose_batch_head_timing.d2h_head_sync_wait_ms += (now_ms_host() - t_sync_begin);
+    }
+    if (rc == cudaSuccess && op_timing)
+        t_post_begin = now_ms_host();
 
     if (rc == cudaSuccess && op_timing)
     {
@@ -696,6 +740,13 @@ extern "C" int dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
         g_last_pose_batch_head_timing.d2h_head_bytes_mb = 0.0;
         g_last_pose_batch_head_timing.d2h_head_bw_gbps = 0.0;
         if (cudaEventElapsedTime(&ms, ev0, ev4) == cudaSuccess) g_last_pose_batch_head_timing.total_ms = static_cast<double>(ms);
+    }
+    if (rc == cudaSuccess && op_timing)
+    {
+        const double t_end = now_ms_host();
+        g_last_pose_batch_head_timing.api_total_host_ms = t_end - t_api_begin;
+        if (t_post_begin > 0.0)
+            g_last_pose_batch_head_timing.api_post_ms = t_end - t_post_begin;
     }
     destroy_events();
 

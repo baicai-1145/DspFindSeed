@@ -1,3 +1,123 @@
+namespace
+{
+struct MixPoseFastBufferEntry
+{
+    int device_id = -2;
+    dsp_vec3d_t* ptr = nullptr;
+    size_t cap = 0;
+    bool in_use = false;
+};
+
+struct MixPoseFastBufferLease
+{
+    int entry_idx = -1;
+    dsp_vec3d_t* ptr = nullptr;
+};
+
+struct MixPoseFastBufferStore
+{
+    std::mutex mu;
+    std::vector<MixPoseFastBufferEntry> entries;
+
+    ~MixPoseFastBufferStore()
+    {
+        for (size_t i = 0; i < entries.size(); ++i)
+        {
+            MixPoseFastBufferEntry& e = entries[i];
+            if (e.ptr != nullptr)
+            {
+                if (e.device_id >= 0)
+                    cudaSetDevice(e.device_id);
+                cudaFree(e.ptr);
+                e.ptr = nullptr;
+            }
+        }
+    }
+};
+
+inline MixPoseFastBufferStore& GetMixPoseFastBufferStore()
+{
+    static MixPoseFastBufferStore store;
+    return store;
+}
+
+inline bool AcquireMixPoseFastBuffer(int device_id, size_t count, MixPoseFastBufferLease* out_lease)
+{
+    if (out_lease == nullptr)
+        return false;
+    if (count == 0)
+        count = 1;
+
+    MixPoseFastBufferStore& store = GetMixPoseFastBufferStore();
+    std::lock_guard<std::mutex> lock(store.mu);
+    int pick_idx = -1;
+    for (size_t i = 0; i < store.entries.size(); ++i)
+    {
+        MixPoseFastBufferEntry& e = store.entries[i];
+        if (e.in_use || e.device_id != device_id)
+            continue;
+        if (e.cap >= count)
+        {
+            pick_idx = static_cast<int>(i);
+            break;
+        }
+        if (pick_idx < 0)
+            pick_idx = static_cast<int>(i);
+    }
+    if (pick_idx < 0)
+    {
+        store.entries.push_back(MixPoseFastBufferEntry{});
+        pick_idx = static_cast<int>(store.entries.size() - 1);
+    }
+
+    MixPoseFastBufferEntry& entry = store.entries[static_cast<size_t>(pick_idx)];
+    if (entry.device_id != device_id)
+    {
+        if (entry.ptr != nullptr)
+        {
+            if (entry.device_id >= 0)
+                cudaSetDevice(entry.device_id);
+            cudaFree(entry.ptr);
+            entry.ptr = nullptr;
+            entry.cap = 0;
+        }
+        entry.device_id = device_id;
+    }
+    if (entry.cap < count)
+    {
+        if (device_id >= 0 && cudaSetDevice(device_id) != cudaSuccess)
+            return false;
+        if (entry.ptr != nullptr)
+        {
+            cudaFree(entry.ptr);
+            entry.ptr = nullptr;
+            entry.cap = 0;
+        }
+        if (cudaMalloc(reinterpret_cast<void**>(&entry.ptr), count * sizeof(dsp_vec3d_t)) != cudaSuccess)
+            return false;
+        entry.cap = count;
+    }
+
+    entry.in_use = true;
+    out_lease->entry_idx = pick_idx;
+    out_lease->ptr = entry.ptr;
+    return true;
+}
+
+inline void ReleaseMixPoseFastBuffer(MixPoseFastBufferLease* lease)
+{
+    if (lease == nullptr || lease->entry_idx < 0)
+        return;
+    MixPoseFastBufferStore& store = GetMixPoseFastBufferStore();
+    std::lock_guard<std::mutex> lock(store.mu);
+    const int idx = lease->entry_idx;
+    if (idx >= 0 && static_cast<size_t>(idx) < store.entries.size())
+        store.entries[static_cast<size_t>(idx)].in_use = false;
+    lease->entry_idx = -1;
+    lease->ptr = nullptr;
+}
+} // namespace
+
 extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     const int* galaxy_seeds,
     int seed_count,
@@ -200,6 +320,14 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     double stage_pose_d2h_head_submit_ms = 0.0;
     double stage_pose_d2h_head_sync_wait_ms = 0.0;
     double stage_pose_d2h_head_bytes_mb = 0.0;
+    double stage_pose_api_pre_ms = 0.0;
+    double stage_pose_api_post_ms = 0.0;
+    double stage_pose_api_total_host_ms = 0.0;
+    double stage_pose_set_device_ms = 0.0;
+    double stage_pose_ensure_buffers_ms = 0.0;
+    double stage_pose_event_setup_ms = 0.0;
+    double stage_pose_fast_buffer_ms = 0.0;
+    double stage_pose_fast_buffer_release_ms = 0.0;
     double stage_seed_build_ms = 0.0;
     double stage_seed_build_host_ctx_ms = 0.0;
     double stage_seed_build_host_merge_ms = 0.0;
@@ -254,53 +382,6 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
     bool debug_theme_compare = false;
     if (const char* dc = std::getenv("DSP_NATIVE_SIG_DEBUG_THEME_COMPARE"))
         debug_theme_compare = std::atoi(dc) != 0;
-    struct PoseFastBuffer
-    {
-        int device_id = -1;
-        dsp_vec3d_t* ptr = nullptr;
-        size_t cap = 0;
-
-        ~PoseFastBuffer()
-        {
-            if (ptr != nullptr)
-            {
-                if (device_id >= 0)
-                    cudaSetDevice(device_id);
-                cudaFree(ptr);
-                ptr = nullptr;
-            }
-        }
-
-        bool Ensure(int dev, size_t count)
-        {
-            if (count == 0)
-                count = 1;
-            if (ptr != nullptr && device_id != dev)
-            {
-                if (device_id >= 0)
-                    cudaSetDevice(device_id);
-                cudaFree(ptr);
-                ptr = nullptr;
-                cap = 0;
-            }
-            if (ptr != nullptr && cap >= count)
-                return true;
-            if (dev >= 0 && cudaSetDevice(dev) != cudaSuccess)
-                return false;
-            if (ptr != nullptr)
-            {
-                cudaFree(ptr);
-                ptr = nullptr;
-                cap = 0;
-            }
-            if (cudaMalloc(reinterpret_cast<void**>(&ptr), count * sizeof(dsp_vec3d_t)) != cudaSuccess)
-                return false;
-            cap = count;
-            device_id = dev;
-            return true;
-        }
-    } pose_fast_buffer;
-
     for (int group_base = 0; group_base < seed_count; group_base += group_cap)
     {
         int group_count = std::min(group_cap, seed_count - group_base);
@@ -344,6 +425,12 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 stage_pose_d2h_head_submit_ms += pose_timing.d2h_head_submit_ms;
                 stage_pose_d2h_head_sync_wait_ms += pose_timing.d2h_head_sync_wait_ms;
                 stage_pose_d2h_head_bytes_mb += pose_timing.d2h_head_bytes_mb;
+                stage_pose_api_pre_ms += pose_timing.api_pre_ms;
+                stage_pose_api_post_ms += pose_timing.api_post_ms;
+                stage_pose_api_total_host_ms += pose_timing.api_total_host_ms;
+                stage_pose_set_device_ms += pose_timing.set_device_ms;
+                stage_pose_ensure_buffers_ms += pose_timing.ensure_buffers_ms;
+                stage_pose_event_setup_ms += pose_timing.event_setup_ms;
             }
         };
         auto run_pose_host = [&]() -> int {
@@ -367,10 +454,14 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         };
         auto run_pose_device = [&]() -> int {
             const size_t pose_n = static_cast<size_t>(group_count) * static_cast<size_t>(pose_copy_count);
-            if (!pose_fast_buffer.Ensure(cuda_device_id, pose_n))
+            double t_fast_buffer_begin = stage_timing ? now_ms() : 0.0;
+            MixPoseFastBufferLease pose_lease{};
+            if (!AcquireMixPoseFastBuffer(cuda_device_id, pose_n, &pose_lease))
                 return DSP_CUDA_ERR_CUDA;
-            d_pose_raw_fast = pose_fast_buffer.ptr;
-            return dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
+            if (stage_timing)
+                stage_pose_fast_buffer_ms += now_ms() - t_fast_buffer_begin;
+            d_pose_raw_fast = pose_lease.ptr;
+            int pose_rc = dsp_cuda_generate_temp_poses_params_fp64_batch_head_device(
                 pose_seeds.data(),
                 group_count,
                 max_pose_count,
@@ -385,6 +476,11 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
                 d_pose_raw_fast,
                 pose_copy_count,
                 pose_raw_counts.data());
+            double t_release_begin = stage_timing ? now_ms() : 0.0;
+            ReleaseMixPoseFastBuffer(&pose_lease);
+            if (stage_timing)
+                stage_pose_fast_buffer_release_ms += now_ms() - t_release_begin;
+            return pose_rc;
         };
 
         double stage0 = stage_timing ? now_ms() : 0.0;
@@ -1515,6 +1611,59 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         if (pose_residual_ms < 0.0)
             pose_residual_ms = 0.0;
         const double pose_residual_pct = stage_pose_ms > 1e-9 ? (pose_residual_ms * 100.0 / stage_pose_ms) : 0.0;
+        const double pose_residual_sync_wait_ms = stage_pose_d2h_head_sync_wait_ms;
+        const double pose_residual_submit_ms = stage_pose_d2h_head_submit_ms;
+        const double pose_residual_pre_ms = stage_pose_api_pre_ms;
+        const double pose_residual_post_ms = stage_pose_api_post_ms;
+        const double pose_residual_fast_buffer_ms = stage_pose_fast_buffer_ms;
+        double pose_residual_accounted_ms =
+            pose_residual_sync_wait_ms
+            + pose_residual_submit_ms
+            + pose_residual_pre_ms
+            + pose_residual_post_ms
+            + pose_residual_fast_buffer_ms;
+        double pose_residual_other_ms = pose_residual_ms - pose_residual_accounted_ms;
+        if (pose_residual_other_ms < 0.0)
+            pose_residual_other_ms = 0.0;
+        const double pose_residual_other_pct = pose_residual_ms > 1e-9 ? (pose_residual_other_ms * 100.0 / pose_residual_ms) : 0.0;
+        double pose_api_residual_ms = stage_pose_api_total_host_ms - pose_known_ms;
+        if (pose_api_residual_ms < 0.0)
+            pose_api_residual_ms = 0.0;
+        const double pose_api_residual_accounted_ms =
+            pose_residual_pre_ms + pose_residual_submit_ms + pose_residual_sync_wait_ms + pose_residual_post_ms;
+        double pose_residual_other_api_gap_candidate_ms = pose_api_residual_ms - pose_api_residual_accounted_ms;
+        if (pose_residual_other_api_gap_candidate_ms < 0.0)
+            pose_residual_other_api_gap_candidate_ms = 0.0;
+        double pose_residual_other_outside_api_candidate_ms =
+            stage_pose_ms - stage_pose_api_total_host_ms - pose_residual_fast_buffer_ms;
+        if (pose_residual_other_outside_api_candidate_ms < 0.0)
+            pose_residual_other_outside_api_candidate_ms = 0.0;
+        double pose_residual_other_outside_api_release_candidate_ms = stage_pose_fast_buffer_release_ms;
+        if (pose_residual_other_outside_api_release_candidate_ms < 0.0)
+            pose_residual_other_outside_api_release_candidate_ms = 0.0;
+        if (pose_residual_other_outside_api_release_candidate_ms > pose_residual_other_outside_api_candidate_ms)
+            pose_residual_other_outside_api_release_candidate_ms = pose_residual_other_outside_api_candidate_ms;
+
+        double pose_other_budget_ms = pose_residual_other_ms;
+        double pose_residual_other_api_gap_ms = std::min(pose_other_budget_ms, pose_residual_other_api_gap_candidate_ms);
+        pose_other_budget_ms -= pose_residual_other_api_gap_ms;
+        double pose_residual_other_outside_api_ms = std::min(pose_other_budget_ms, pose_residual_other_outside_api_candidate_ms);
+        pose_other_budget_ms -= pose_residual_other_outside_api_ms;
+        double pose_residual_other_outside_api_release_ms =
+            std::min(pose_residual_other_outside_api_ms, pose_residual_other_outside_api_release_candidate_ms);
+        double pose_residual_other_outside_api_rest_ms =
+            pose_residual_other_outside_api_ms - pose_residual_other_outside_api_release_ms;
+        double pose_residual_other_unattributed_ms = pose_other_budget_ms;
+        const double pose_residual_other_api_gap_pct =
+            pose_residual_ms > 1e-9 ? (pose_residual_other_api_gap_ms * 100.0 / pose_residual_ms) : 0.0;
+        const double pose_residual_other_outside_api_pct =
+            pose_residual_ms > 1e-9 ? (pose_residual_other_outside_api_ms * 100.0 / pose_residual_ms) : 0.0;
+        const double pose_residual_other_outside_api_release_pct =
+            pose_residual_ms > 1e-9 ? (pose_residual_other_outside_api_release_ms * 100.0 / pose_residual_ms) : 0.0;
+        const double pose_residual_other_outside_api_rest_pct =
+            pose_residual_ms > 1e-9 ? (pose_residual_other_outside_api_rest_ms * 100.0 / pose_residual_ms) : 0.0;
+        const double pose_residual_other_unattributed_pct =
+            pose_residual_ms > 1e-9 ? (pose_residual_other_unattributed_ms * 100.0 / pose_residual_ms) : 0.0;
         const double pose_gen_seed_p50_ms =
             (stage_pose_gen_seed_profile_weight > 0.0)
                 ? (stage_pose_gen_seed_p50_ms / stage_pose_gen_seed_profile_weight)
@@ -1536,10 +1685,12 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
             std::printf(
                 "[native-sig-pose] seeds=%d stars=%d groupCap=%d totalMs=%.3f poseMs=%.3f "
                 "poseH2D=%.3f poseGenK=%.3f poseD2HCounts=%.3f poseGatherK=%.3f poseD2HHead=%.3f "
-                "poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f\n",
+                "poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f "
+                "poseResidualSyncWait=%.3f poseResidualApiPre=%.3f poseResidualApiPost=%.3f poseResidualFastBuffer=%.3f poseResidualOther=%.3f\n",
                 seed_count, star_count, group_cap, total_ms, stage_pose_ms,
                 stage_pose_h2d_ms, stage_pose_gen_kernel_ms, stage_pose_d2h_counts_ms, stage_pose_gather_kernel_ms, stage_pose_d2h_head_ms,
-                pose_known_ms, pose_residual_ms, pose_residual_pct);
+                pose_known_ms, pose_residual_ms, pose_residual_pct,
+                pose_residual_sync_wait_ms, pose_residual_pre_ms, pose_residual_post_ms, pose_residual_fast_buffer_ms, pose_residual_other_ms);
         }
         else if (stage_timing_mode == kStageTimingModePoseGenK)
         {
@@ -1550,8 +1701,19 @@ extern "C" int dsp_cuda_mix_signatures_from_seeds_f32(
         else if (stage_timing_mode == kStageTimingModeResidual)
         {
             std::printf(
-                "[native-sig-residual] seeds=%d stars=%d groupCap=%d poseMs=%.3f poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f\n",
-                seed_count, star_count, group_cap, stage_pose_ms, pose_known_ms, pose_residual_ms, pose_residual_pct);
+                "[native-sig-residual] seeds=%d stars=%d groupCap=%d poseMs=%.3f poseKnown=%.3f poseResidual=%.3f poseResidualPct=%.3f "
+                "syncWait=%.3f submit=%.3f apiPre=%.3f(setDevice=%.3f ensureBuffers=%.3f eventSetup=%.3f) "
+                "apiPost=%.3f fastBuffer=%.3f apiTotalHost=%.3f "
+                "other=%.3f(otherApiGap=%.3f otherOutsideApi=%.3f[release=%.3f rest=%.3f] otherUnattributed=%.3f) "
+                "otherPct=%.3f(otherApiGapPct=%.3f otherOutsideApiPct=%.3f[releasePct=%.3f restPct=%.3f] otherUnattributedPct=%.3f)\n",
+                seed_count, star_count, group_cap, stage_pose_ms, pose_known_ms, pose_residual_ms, pose_residual_pct,
+                pose_residual_sync_wait_ms, pose_residual_submit_ms, pose_residual_pre_ms,
+                stage_pose_set_device_ms, stage_pose_ensure_buffers_ms, stage_pose_event_setup_ms,
+                pose_residual_post_ms, pose_residual_fast_buffer_ms, stage_pose_api_total_host_ms,
+                pose_residual_other_ms, pose_residual_other_api_gap_ms, pose_residual_other_outside_api_ms,
+                pose_residual_other_outside_api_release_ms, pose_residual_other_outside_api_rest_ms, pose_residual_other_unattributed_ms,
+                pose_residual_other_pct, pose_residual_other_api_gap_pct, pose_residual_other_outside_api_pct,
+                pose_residual_other_outside_api_release_pct, pose_residual_other_outside_api_rest_pct, pose_residual_other_unattributed_pct);
         }
         else
         {

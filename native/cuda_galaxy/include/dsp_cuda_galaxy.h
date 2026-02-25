@@ -59,6 +59,12 @@ typedef struct dsp_cuda_pose_batch_head_timing_t {
     double d2h_head_bytes_mb;
     double d2h_head_bw_gbps;
     double total_ms;
+    double api_pre_ms;
+    double api_post_ms;
+    double api_total_host_ms;
+    double set_device_ms;
+    double ensure_buffers_ms;
+    double event_setup_ms;
 } dsp_cuda_pose_batch_head_timing_t;
 
 enum {
